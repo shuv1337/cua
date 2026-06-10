@@ -43,16 +43,19 @@ tools, or the friendlier `cua-driver recording` subcommand group
 (wraps both with human-readable output).
 
 ```
-cua-driver recording start ~/cua-trajectories/run-1
+cua-driver recording start ~/cua-trajectories/run-1 --video
 # … run the workflow …
 cua-driver recording status    # -> enabled / disabled, next_turn, output_dir
 cua-driver recording stop      # -> "Recording stopped. (video → recording.mp4)"
 ```
 
+`--video` opts in to display capture (video is off by default); omit
+it for per-turn screenshots + JSON only.
+
 Raw-tool equivalent:
 
 ```
-cua-driver start_recording '{"output_dir":"~/cua-trajectories/run-1"}'
+cua-driver start_recording '{"output_dir":"~/cua-trajectories/run-1","record_video":true}'
 cua-driver get_recording_state
 cua-driver stop_recording '{}'
 ```
@@ -77,7 +80,9 @@ Each action writes to `turn-NNNNN/` (five-digit zero-padded counter):
   target pid. On Linux the snapshot is the AT-SPI tree (same shape as
   macOS); editable / text widgets surface their Text-interface
   content as `value="…"` even when the widget has a name, so typed /
-  set text is verifiable from the tree.
+  set text is verifiable from the tree. Expect it to be **absent on
+  `launch_app` turns**: the snapshot hook needs a mapped window, and
+  launch returns before the new window maps.
 - `screenshot.png` — post-action capture of the target window.
   Omitted when the pid has no visible window.
 - `action.json` — the tool name, full input arguments, result

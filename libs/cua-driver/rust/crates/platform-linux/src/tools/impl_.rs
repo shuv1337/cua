@@ -334,7 +334,9 @@ impl Tool for GetWindowStateTool {
                 "window_id":{"type":"integer","description":"X11 XID from list_windows."},
                 "capture_mode":{"type":"string","enum":["som","vision","ax"],
                     "description":"som=tree+screenshot (default), vision=screenshot only, ax=tree only."},
-                "query":{"type":"string"}
+                "query":{"type":"string"},
+                "screenshot_out_file":{"type":"string",
+                    "description":"When set, write the PNG to this file path (~ expanded) instead of embedding base64 in the response. The structured output will contain screenshot_file_path instead."}
             },"additionalProperties":false}),
             read_only: true, destructive: false, idempotent: true, open_world: false,
         })
@@ -350,6 +352,15 @@ impl Tool for GetWindowStateTool {
         };
         let capture_mode = args.str_or("capture_mode", &default_mode);
         let query = args.opt_str("query");
+        let screenshot_out_file = args.opt_str("screenshot_out_file").map(|s| {
+            // Expand ~ prefix.
+            if s.starts_with("~/") {
+                let home = std::env::var("HOME").unwrap_or_default();
+                format!("{home}/{}", &s[2..])
+            } else {
+                s
+            }
+        });
 
         let requested_pid = pid;
         let requested_xid = xid;
@@ -370,6 +381,7 @@ impl Tool for GetWindowStateTool {
         let do_tree = capture_mode != "vision";
         let do_shot = capture_mode != "ax";
         let state = self.state.clone();
+        let out_file = screenshot_out_file;
 
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let tree_result = if do_tree {
@@ -390,11 +402,19 @@ impl Tool for GetWindowStateTool {
                         let orig_w = crate::capture::png_dimensions_pub(&raw).map(|(w, _)| w).unwrap_or(0);
                         let png = crate::capture::resize_png_if_needed(&raw, max_dim)?;
                         let (w, h) = crate::capture::png_dimensions_pub(&png)?;
-                        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
                         let original_w = if w < orig_w { Some(orig_w) } else { None };
                         let region_crop =
                             method == Some(crate::hyprland::CaptureMethod::RegionCrop);
-                        Some((B64.encode(&png), w, h, original_w, region_crop))
+                        // (b64, file_path) — exactly one is Some, depending on
+                        // whether the caller asked for an on-disk PNG.
+                        let payload = if let Some(ref path) = out_file {
+                            std::fs::write(path, &png)?;
+                            (None, Some(path.clone()))
+                        } else {
+                            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+                            (Some(B64.encode(&png)), None)
+                        };
+                        Some((payload, w, h, original_w, region_crop))
                     }
                     Err(_) => None,
                 }
@@ -443,13 +463,21 @@ impl Tool for GetWindowStateTool {
                     structured["elements"] = json!(elements);
                 }
 
-                if let Some((b64, w, h, orig_w, region_crop)) = shot_opt {
+                if let Some(((b64, file_path), w, h, orig_w, region_crop)) = shot_opt {
                     if let Some(ow) = orig_w {
                         if w > 0 { state.resize_registry.set_ratio(pid, ow as f64 / w as f64); }
                     } else {
                         state.resize_registry.clear_ratio(pid);
                     }
-                    content.push(cua_driver_core::protocol::Content::image_png(b64));
+                    if let Some(b64) = b64 {
+                        content.push(cua_driver_core::protocol::Content::image_png(b64));
+                    }
+                    if let Some(path) = file_path {
+                        content.push(cua_driver_core::protocol::Content::text(
+                            format!("Screenshot written to {path}"),
+                        ));
+                        structured["screenshot_file_path"] = json!(path);
+                    }
                     if region_crop {
                         // Mirrors the Windows occluded-capture contract: a
                         // screen-region crop is indistinguishable from a real
@@ -491,6 +519,7 @@ impl Tool for LaunchAppTool {
             input_schema: json!({"type":"object","properties":{
                 "launch_path":{"type":"string","description":"Round-trip the `launch_path` returned by `list_apps` — the Exec= command from the .desktop file with XDG field codes already stripped. Highest precedence on Linux; spawned directly via the system shell."},
                 "name":{"type":"string","description":"App name or command to launch."},
+                "args":{"type":"array","items":{"type":"string"},"description":"Extra argv appended to the launch_path/name command (each element passed verbatim, no shell splitting)."},
                 "bundle_id":{"type":"string","description":"Ignored on Linux (macOS/Windows concept)."},
                 "urls":{"type":"array","items":{"type":"string"},"description":"URLs to open via xdg-open."}
             },"additionalProperties":false}),
@@ -502,6 +531,7 @@ impl Tool for LaunchAppTool {
         use cua_driver_core::tool_args::ArgsExt;
         let launch_path_opt = args.opt_str("launch_path");
         let name_opt = args.opt_str("name");
+        let extra_args: Vec<String> = args.str_array("args");
         let urls: Vec<String> = args.str_array("urls");
 
         if launch_path_opt.is_none() && name_opt.is_none() && urls.is_empty() {
@@ -531,14 +561,27 @@ impl Tool for LaunchAppTool {
                 let rest: Vec<&str> = parts.collect();
                 let mut command = std::process::Command::new(prog);
                 command.args(&rest);
+                // `args` elements are appended verbatim (no whitespace
+                // splitting), so values with spaces survive intact.
+                command.args(&extra_args);
                 prefer_xwayland_for_launched_apps(&mut command);
                 match command.spawn() {
-                    Ok(child) => return Ok(format!("Launched '{}' with pid {}.", cmd, child.id())),
-                    Err(_) => {
+                    Ok(child) => {
+                        let shown = if extra_args.is_empty() {
+                            cmd.to_owned()
+                        } else {
+                            format!("{cmd} {}", extra_args.join(" "))
+                        };
+                        return Ok(format!("Launched '{}' with pid {}.", shown, child.id()));
+                    }
+                    Err(_) if extra_args.is_empty() => {
                         // Fall back to xdg-open for .desktop app names.
                         std::process::Command::new("xdg-open").arg(cmd).spawn()?;
                         return Ok(format!("Opened '{}' via xdg-open.", cmd));
                     }
+                    // xdg-open can't carry argv — surfacing the exec failure
+                    // beats silently launching the app without its args.
+                    Err(e) => anyhow::bail!("failed to exec '{cmd}' with args {extra_args:?}: {e}"),
                 }
             }
             unreachable!()

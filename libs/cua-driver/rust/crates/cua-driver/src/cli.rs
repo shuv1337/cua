@@ -295,7 +295,29 @@ pub fn parse_command() -> Command {
         Some("status") => Command::Status { socket },
         Some("recording") => {
             let subcommand = pos.next().unwrap_or("status").to_string();
-            let rest: Vec<String> = pos.map(str::to_owned).collect();
+            // Recording subcommands take their own bare flags (`start
+            // --video`, `render --no-zoom --scale N`), which the global
+            // positional pass above strips. Rebuild the tail from raw argv —
+            // everything after the subcommand token, minus the value-flags
+            // already consumed globally (--socket et al).
+            let rest: Vec<String> = {
+                let start = args
+                    .iter()
+                    .position(|a| a == &subcommand)
+                    .map(|i| i + 1)
+                    .unwrap_or(args.len());
+                let mut out = Vec::new();
+                let mut i = start;
+                while i < args.len() {
+                    if VALUE_FLAGS.contains(&args[i].as_str()) {
+                        i += 2; // skip flag + value
+                        continue;
+                    }
+                    out.push(args[i].clone());
+                    i += 1;
+                }
+                out
+            };
             Command::Recording { subcommand, args: rest, socket }
         }
         Some("dump-docs") => {
@@ -1229,7 +1251,11 @@ pub fn run_recording_cmd(subcommand: &str, args: &[String], socket: Option<&str>
 
     match subcommand {
         "start" => {
-            let output_dir = match args.first() {
+            // `--video` opts in to display capture (the start_recording
+            // tool defaults record_video to false); everything else is
+            // the output dir.
+            let record_video = args.iter().any(|a| a == "--video");
+            let output_dir = match args.iter().find(|a| !a.starts_with("--")) {
                 Some(d) => {
                     // Expand ~ manually.
                     if d.starts_with('~') {
@@ -1240,7 +1266,7 @@ pub fn run_recording_cmd(subcommand: &str, args: &[String], socket: Option<&str>
                     }
                 }
                 None => {
-                    eprintln!("Usage: cua-driver recording start <output-dir>");
+                    eprintln!("Usage: cua-driver recording start <output-dir> [--video]");
                     process::exit(64);
                 }
             };
@@ -1255,7 +1281,8 @@ pub fn run_recording_cmd(subcommand: &str, args: &[String], socket: Option<&str>
                 method: "call".into(),
                 name: Some("start_recording".into()),
                 args: Some(serde_json::json!({
-                    "output_dir": output_dir
+                    "output_dir": output_dir,
+                    "record_video": record_video
                 })),
                 // CLI `recording start` is anonymous — the recording is owned by
                 // nobody, so only an unconditional stop (CLI / manual) reaps it.
@@ -1263,7 +1290,8 @@ pub fn run_recording_cmd(subcommand: &str, args: &[String], socket: Option<&str>
             };
             match crate::serve::send_request(&socket_path, &req) {
                 Ok(resp) if resp.ok => {
-                    println!("Recording started → {output_dir}");
+                    println!("Recording started → {output_dir}{}",
+                        if record_video { " (video on)" } else { "" });
                     // Query state to show next_turn.
                     let state_req = crate::serve::DaemonRequest {
                         method: "call".into(),
@@ -1348,12 +1376,11 @@ pub fn run_recording_cmd(subcommand: &str, args: &[String], socket: Option<&str>
 /// `cua-driver recording render <input-dir> <out.mp4> [--no-zoom] [--scale N]`
 /// Pure file-to-file work — does NOT go through the daemon.
 ///
-/// Note on flag parsing: the global cua-driver CLI parser strips
-/// recognised flags before this subcommand sees them, leaving only
-/// positionals. So instead of `--output <out>` (which the parser
-/// would consume and lose) we accept the output path as the second
-/// positional. `--no-zoom` and `--scale N` survive because their
-/// values are inline (no separate value token).
+/// Note on flag parsing: the `recording` arm of `parse_command`
+/// forwards the raw argv tail (minus globally-consumed value flags
+/// like `--socket`), so `--no-zoom` and `--scale N` arrive here
+/// intact. Output path stays a positional (not `--output`) for
+/// backwards compatibility.
 fn run_recording_render(args: &[String]) {
     // First positional = input dir, second positional = output mp4.
     let positionals: Vec<&String> = args.iter().filter(|s| !s.starts_with("--")).collect();

@@ -27,9 +27,30 @@ use std::time::{Duration, Instant};
 /// granularity without interpolation noise.
 pub const SAMPLE_RATE_HZ: u32 = 30;
 
+/// Final tallies from a sampler run, exposed in `session.json` so a
+/// low apparent sample rate is self-explaining (samples are dropped
+/// while the cursor is off the recorded monitor, not lost).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CursorStats {
+    /// Samples written to cursor.jsonl.
+    pub samples: usize,
+    /// Polls that resolved a position outside the recorded monitor and
+    /// were deliberately not written.
+    pub dropped_offscreen: usize,
+}
+
+/// One poll result. `OffScreen` is distinguished from `Unavailable` so
+/// the deliberate off-monitor drop can be counted without conflating it
+/// with platforms/sessions that simply cannot poll the cursor.
+enum CursorPoll {
+    At(f64, f64),
+    OffScreen,
+    Unavailable,
+}
+
 /// One running cursor sampler. Drop or `stop()` to terminate.
 pub struct CursorSampler {
-    handle: Option<JoinHandle<usize>>,
+    handle: Option<JoinHandle<CursorStats>>,
     stop_flag: Arc<AtomicBool>,
     output_path: PathBuf,
 }
@@ -46,23 +67,27 @@ impl CursorSampler {
         let handle = std::thread::spawn(move || {
             let mut writer = BufWriter::new(file);
             let interval = Duration::from_millis(1000 / SAMPLE_RATE_HZ as u64);
-            let mut count = 0usize;
+            let mut stats = CursorStats::default();
             while !flag_for_thread.load(Ordering::Relaxed) {
-                if let Some((x, y)) = sample_cursor() {
-                    let t_ms = session_start.elapsed().as_millis() as f64;
-                    // Write one JSON object per line. We hand-format
-                    // the trivial shape rather than pulling serde_json
-                    // into the hot loop — keeps wakeup-cost bounded.
-                    let _ = writeln!(writer,
-                        "{{\"t_ms\":{:.3},\"x\":{:.2},\"y\":{:.2}}}",
-                        t_ms, x, y);
-                    count += 1;
+                match sample_cursor() {
+                    CursorPoll::At(x, y) => {
+                        let t_ms = session_start.elapsed().as_millis() as f64;
+                        // Write one JSON object per line. We hand-format
+                        // the trivial shape rather than pulling serde_json
+                        // into the hot loop — keeps wakeup-cost bounded.
+                        let _ = writeln!(writer,
+                            "{{\"t_ms\":{:.3},\"x\":{:.2},\"y\":{:.2}}}",
+                            t_ms, x, y);
+                        stats.samples += 1;
+                    }
+                    CursorPoll::OffScreen => stats.dropped_offscreen += 1,
+                    CursorPoll::Unavailable => {}
                 }
                 std::thread::sleep(interval);
             }
             let _ = writer.flush();
             let _ = path_for_thread; // keep path moved (warning silencer)
-            count
+            stats
         });
         Ok(CursorSampler {
             handle: Some(handle),
@@ -71,12 +96,12 @@ impl CursorSampler {
         })
     }
 
-    /// Stop the sampler. Returns the number of samples written.
-    pub fn stop(mut self) -> usize {
+    /// Stop the sampler. Returns the written/dropped tallies.
+    pub fn stop(mut self) -> CursorStats {
         self.stop_flag.store(true, Ordering::Relaxed);
         self.handle.take()
             .and_then(|h| h.join().ok())
-            .unwrap_or(0)
+            .unwrap_or_default()
     }
 
     pub fn output_path(&self) -> &std::path::Path { &self.output_path }
@@ -94,21 +119,21 @@ impl Drop for CursorSampler {
 // ── per-platform cursor poll ────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
-fn sample_cursor() -> Option<(f64, f64)> {
+fn sample_cursor() -> CursorPoll {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
     unsafe {
         let mut p = POINT::default();
         if GetCursorPos(&mut p).is_ok() {
-            Some((p.x as f64, p.y as f64))
+            CursorPoll::At(p.x as f64, p.y as f64)
         } else {
-            None
+            CursorPoll::Unavailable
         }
     }
 }
 
 #[cfg(target_os = "macos")]
-fn sample_cursor() -> Option<(f64, f64)> {
+fn sample_cursor() -> CursorPoll {
     // ApplicationServices/CGEvent.h: CGEventCreate(nil) → CGEventRef;
     // CGEventGetLocation(event) → CGPoint. The point is in points
     // (top-left origin) so it matches the cursor-space convention the
@@ -124,15 +149,15 @@ fn sample_cursor() -> Option<(f64, f64)> {
 
     unsafe {
         let event = CGEventCreate(std::ptr::null_mut());
-        if event.is_null() { return None; }
+        if event.is_null() { return CursorPoll::Unavailable; }
         let p = CGEventGetLocation(event);
         CFRelease(event);
-        Some((p.x, p.y))
+        CursorPoll::At(p.x, p.y)
     }
 }
 
 #[cfg(target_os = "linux")]
-fn sample_cursor() -> Option<(f64, f64)> {
+fn sample_cursor() -> CursorPoll {
     // Wayland has no portable cursor poll, but Hyprland exposes one over
     // its IPC socket (`cursorpos` — the same query `hyprctl cursorpos`
     // runs). One short-lived unix-socket connect per sample is the
@@ -153,14 +178,18 @@ fn sample_cursor() -> Option<(f64, f64)> {
             const { std::cell::OnceCell::new() };
     }
     MONITOR.with(|m| {
-        let mon = (*m.get_or_init(hyprland_focused_monitor))?;
-        let (cx, cy) = hyprland_cursorpos()?;
+        let Some(mon) = *m.get_or_init(hyprland_focused_monitor) else {
+            return CursorPoll::Unavailable;
+        };
+        let Some((cx, cy)) = hyprland_cursorpos() else {
+            return CursorPoll::Unavailable;
+        };
         let px = (cx - mon.x) * mon.scale;
         let py = (cy - mon.y) * mon.scale;
         if px < 0.0 || py < 0.0 || px > mon.width_px || py > mon.height_px {
-            return None;
+            return CursorPoll::OffScreen;
         }
-        Some((px, py))
+        CursorPoll::At(px, py)
     })
 }
 
