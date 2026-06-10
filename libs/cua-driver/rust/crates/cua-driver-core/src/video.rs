@@ -31,6 +31,14 @@ pub struct VideoMetadata {
     pub duration_ms: u64,
     /// Whether the backend finalized the mp4 cleanly (playable file).
     pub finalized: bool,
+    /// Capture-health detail when the recording stopped faithfully
+    /// tracking the screen mid-session (persistent capture failure,
+    /// frozen frames after an output change, encoder stderr on an
+    /// unclean exit). `None` for a healthy recording. Folded into
+    /// `session.json`'s `video.error` and `last_error` by
+    /// `RecordingSession::stop_owner` — a truncated/frozen mp4 must
+    /// not masquerade as a healthy one in structured state.
+    pub error: Option<String>,
 }
 
 /// One active capture session. Owned by `RecordingSession` for the

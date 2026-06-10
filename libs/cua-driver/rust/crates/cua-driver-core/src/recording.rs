@@ -128,6 +128,16 @@ struct RecordingInner {
     /// `session.json` after stop so the renderer can confirm the
     /// sampler ran.
     last_cursor_samples: usize,
+    /// Bumped by every `start()` at entry (phase 1) and by every effective
+    /// unconditional (`requester == None`) stop. `start()` re-checks it at
+    /// commit (phase 3): a stale value means a newer start or a manual stop
+    /// won the race while this start's backends were spinning up with the
+    /// lock released, so the loser tears down its own backends instead of
+    /// displacing the winner. Requester-scoped stops don't bump — a dying
+    /// session's reaper must not abort a newer session's in-flight start
+    /// (its own resurrection is already blocked by the dead-session
+    /// re-check at commit).
+    start_epoch: u64,
 }
 
 /// Snapshot of the current recording state (cheap to clone).
@@ -166,6 +176,7 @@ impl RecordingSession {
                 last_video: None,
                 cursor: None,
                 last_cursor_samples: 0,
+                start_epoch: 0,
             }),
         }
     }
@@ -187,31 +198,44 @@ impl RecordingSession {
     /// `_session_id`). `None` marks an anonymous start (CLI one-shot / legacy
     /// `configure()` shim) owned by nobody. See `stop_owner()` for how this
     /// gates teardown.
+    /// Structured as lock → prepare-unlocked → lock-commit: backend startup
+    /// (video::start_video on Wayland blocks on the compositor handshake,
+    /// CursorSampler::start, filesystem writes) must not run under the
+    /// daemon-global recording mutex — `record()` takes it synchronously on
+    /// every recorded tool call, and `stop_owner()`/`current_state()` would
+    /// stall behind a slow or wedged backend start.
     pub fn start(&self, output_dir: &str, record_video: bool, owner: Option<&str>) -> anyhow::Result<()> {
-        let mut inner = self.inner.lock().unwrap();
+        // Phase 1 (locked): resurrection guard + displace any live backends.
+        //
         // Write-boundary resurrection guard — checked INSIDE the lock so the
-        // is_session_ended test is atomic with the enabled/owner write below.
-        // An in-flight start_recording that lands after its owning session ended
-        // (passed the dispatch gate, then the proxy died) must not create a
-        // recording owned by a dead session — a leaked ffmpeg/SCStream. The
-        // teardown sites call `fire_session_end` (which marks ENDED_SESSIONS)
-        // BEFORE `stop_owner`, so either the mark is already set and we bail
-        // here, or we win the lock first and the reaper's later stop_owner(owner)
-        // reaps what we started. Anonymous starts (owner = None: CLI one-shot /
-        // legacy shim) are never gated.
-        if let Some(o) = owner {
-            if crate::session::is_session_ended(o) {
-                anyhow::bail!(
-                    "session {o} has ended; refusing to start a recording owned by a dead session"
-                );
+        // is_session_ended test is atomic with the recorder state. An in-flight
+        // start_recording that lands after its owning session ended (passed the
+        // dispatch gate, then the proxy died) must not create a recording owned
+        // by a dead session — a leaked ffmpeg/SCStream. The teardown sites call
+        // `fire_session_end` (which marks ENDED_SESSIONS) BEFORE `stop_owner`,
+        // so either the mark is already set and we bail here, or we win the
+        // lock first and the reaper's later stop_owner(owner) reaps what we
+        // started. The guard is re-checked at commit (phase 3) since the
+        // session can end while backends start. Anonymous starts (owner =
+        // None: CLI one-shot / legacy shim) are never gated.
+        let (old_video, old_cursor, my_epoch) = {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(o) = owner {
+                if crate::session::is_session_ended(o) {
+                    anyhow::bail!(
+                        "session {o} has ended; refusing to start a recording owned by a dead session"
+                    );
+                }
             }
-        }
-        // If a previous session is still open, gracefully tear it down
-        // first so the caller doesn't accidentally leak an ffmpeg process.
-        if let Some(rec) = inner.video.take() {
+            inner.start_epoch += 1;
+            (inner.video.take(), inner.cursor.take(), inner.start_epoch)
+        };
+        // Phase 2 (unlocked): tear down the displaced session's backends so
+        // the caller doesn't leak an ffmpeg process, then start the new ones.
+        if let Some(rec) = old_video {
             let _ = rec.stop();
         }
-        if let Some(cur) = inner.cursor.take() {
+        if let Some(cur) = old_cursor {
             let _ = cur.stop();
         }
 
@@ -223,14 +247,13 @@ impl RecordingSession {
         // three timelines line up at the millisecond.
         let monotonic_start = Instant::now();
 
-        let mut video_present = false;
+        let mut video: Option<Box<dyn VideoBackend>> = None;
         let mut video_error: Option<String> = None;
         if record_video {
             let path = dir.join("recording.mp4");
             match video::start_video(&path) {
                 Ok(rec) => {
-                    inner.video = Some(rec);
-                    video_present = true;
+                    video = Some(rec);
                 }
                 Err(e) => {
                     video_error = Some(e.to_string());
@@ -248,13 +271,14 @@ impl RecordingSession {
         // post-hoc analysis, so we run it anyway — the cost is one
         // background thread + a small jsonl file.
         let cursor_path = dir.join("cursor.jsonl");
-        match CursorSampler::start(cursor_path, monotonic_start) {
-            Ok(s) => { inner.cursor = Some(s); }
+        let cursor = match CursorSampler::start(cursor_path, monotonic_start) {
+            Ok(s) => Some(s),
             Err(e) => {
                 tracing::warn!(target: "recording",
                     "Cursor sampler failed to start: {e}");
+                None
             }
-        }
+        };
 
         // Write initial session.json — final video metadata is rewritten on
         // stop. We mark `present` based on whether ffmpeg actually started,
@@ -262,28 +286,75 @@ impl RecordingSession {
         let session_payload = serde_json::json!({
             "schema_version": 1,
             "started_at_monotonic_ms": now_ms(),
-            "video": video_session_payload(video_present, video_error.as_deref(), None),
-            "cursor": { "present": inner.cursor.is_some(), "sample_count": 0 }
+            "video": video_session_payload(video.is_some(), video_error.as_deref(), None),
+            "cursor": { "present": cursor.is_some(), "sample_count": 0 }
         });
         let _ = write_json_atomic(
             &dir.join("session.json"),
             &session_payload,
         );
 
-        // Stamp the owning session on every successful start (reached only on
-        // the success path — start() returns early via `?` on `create_dir_all`
-        // failure above). `owner` clobbers any previous owner, which is correct:
-        // the daemon-global recorder is a singleton, so the latest start() owns
-        // it. The previous owner's disconnect then no-ops in stop_owner().
-        inner.owner = owner.map(str::to_owned);
-        inner.enabled = true;
-        inner.output_dir = Some(dir);
-        inner.next_turn = 1;
-        inner.session_start_ms = now_ms();
-        inner.session_monotonic_start = Some(monotonic_start);
-        inner.last_error = video_error;
-        inner.last_video = None;
-        inner.last_cursor_samples = 0;
+        // Phase 3 (locked): commit. Two re-checks, both racing the unlocked
+        // backend startup above:
+        //   - resurrection guard: the owning session may have ended; the
+        //     reaper's stop_owner ran against the pre-start state and would
+        //     never see what we just started, so we tear it down ourselves.
+        //   - epoch guard: a newer start() (it entered phase 1 last, it must
+        //     win) or a manual stop_recording (it must not be silently
+        //     overridden) may have superseded this start.
+        // Either way the loser stops its own backends after dropping the
+        // lock and finalizes its orphaned session.json so the output dir
+        // doesn't claim an in-flight recording forever.
+        let displaced = {
+            let mut inner = self.inner.lock().unwrap();
+            let dead = owner.is_some_and(crate::session::is_session_ended);
+            if dead || inner.start_epoch != my_epoch {
+                // When the winning start already committed the SAME output
+                // dir, its in-flight session.json must survive — finalizing
+                // it here would mark the live recording absent until stop.
+                let dir_owned_by_winner =
+                    inner.enabled && inner.output_dir.as_deref() == Some(dir.as_path());
+                drop(inner);
+                abort_uncommitted_start(&dir, video, cursor, !dir_owned_by_winner);
+                if dead {
+                    let o = owner.unwrap_or_default();
+                    anyhow::bail!(
+                        "session {o} has ended; refusing to start a recording owned by a dead session"
+                    );
+                }
+                anyhow::bail!(
+                    "a concurrent start_recording or stop_recording superseded this start"
+                );
+            }
+            // Belt-and-suspenders: the epoch guard means no concurrent
+            // start() can have committed into our window (it would have seen
+            // a stale epoch and aborted), but displace-and-stop anything
+            // here anyway — after releasing the lock, since stop can block
+            // for seconds (same reason phase 2 is unlocked).
+            let displaced = (inner.video.take(), inner.cursor.take());
+            inner.video = video;
+            inner.cursor = cursor;
+            // Stamp the owning session on every successful start. `owner`
+            // clobbers any previous owner, which is correct: the daemon-global
+            // recorder is a singleton, so the latest start() owns it. The
+            // previous owner's disconnect then no-ops in stop_owner().
+            inner.owner = owner.map(str::to_owned);
+            inner.enabled = true;
+            inner.output_dir = Some(dir);
+            inner.next_turn = 1;
+            inner.session_start_ms = now_ms();
+            inner.session_monotonic_start = Some(monotonic_start);
+            inner.last_error = video_error;
+            inner.last_video = None;
+            inner.last_cursor_samples = 0;
+            displaced
+        };
+        if let Some(rec) = displaced.0 {
+            let _ = rec.stop();
+        }
+        if let Some(cur) = displaced.1 {
+            let _ = cur.stop();
+        }
         Ok(())
     }
 
@@ -317,6 +388,11 @@ impl RecordingSession {
             if inner.owner.as_deref() != Some(req) {
                 return Ok(());
             }
+        } else {
+            // Unconditional stop: bump the epoch so an in-flight start()
+            // (backends starting with the lock released) observes the stop
+            // at commit and aborts instead of silently overriding it.
+            inner.start_epoch += 1;
         }
         inner.owner = None;
         let dir = inner.output_dir.clone();
@@ -328,8 +404,14 @@ impl RecordingSession {
         inner.next_turn = 1;
         inner.session_start_ms = 0;
         inner.session_monotonic_start = None;
-        if video_meta.is_some() {
-            inner.last_error = None;
+        // The backend's stop() is the authority on capture health: clear any
+        // stale start-time error on a healthy stop, but carry a capture-side
+        // failure (persistent screencopy errors, frozen frames, unclean
+        // encoder exit) into last_error so a broken recording never reports
+        // a clean structured state. When no video ran, keep whatever error
+        // start() recorded.
+        if let Some(meta) = &video_meta {
+            inner.last_error = meta.error.clone();
         }
         inner.last_video = video_meta.clone();
         inner.last_cursor_samples = cursor_samples;
@@ -554,6 +636,38 @@ fn iso_now() -> String {
     format!("{:.3}", d.as_secs_f64())
 }
 
+/// Tear down backends started by a `start()` that lost its commit race
+/// (owning session ended, or a concurrent start/stop superseded it) and —
+/// when `finalize_session_json` — finalize the `session.json` it already
+/// wrote, so the orphaned output dir doesn't claim an in-flight recording
+/// (`present: true` with no final rewrite) forever. The caller passes
+/// `false` when the winning start committed the same dir and the file now
+/// describes the live recording.
+fn abort_uncommitted_start(
+    dir: &Path,
+    video: Option<Box<dyn VideoBackend>>,
+    cursor: Option<CursorSampler>,
+    finalize_session_json: bool,
+) {
+    let video_meta = video.and_then(|rec| rec.stop().ok());
+    let cursor_samples = cursor.map(|c| c.stop()).unwrap_or(0);
+    if !finalize_session_json {
+        return;
+    }
+    let video_block = if let Some(ref m) = video_meta {
+        video_session_payload(true, None, Some(m))
+    } else {
+        video_session_payload(false, None, None)
+    };
+    let session_payload = serde_json::json!({
+        "schema_version": 1,
+        "started_at_monotonic_ms": now_ms(),
+        "video": video_block,
+        "cursor": { "present": cursor_samples > 0, "sample_count": cursor_samples }
+    });
+    let _ = write_json_atomic(&dir.join("session.json"), &session_payload);
+}
+
 /// Build the `session.json` `video` field. Three shapes:
 ///   - not requested or ffmpeg missing: `{ present: false, error?: "..." }`
 ///   - in-flight session before stop: `{ present: true, path: "recording.mp4" }`
@@ -571,13 +685,20 @@ fn video_session_payload(
         return o;
     }
     if let Some(meta) = meta {
-        return serde_json::json!({
+        let mut o = serde_json::json!({
             "present": true,
             "path": "recording.mp4",
             "absolute_path": meta.path.to_string_lossy(),
             "duration_ms": meta.duration_ms,
             "finalized": meta.finalized,
         });
+        // Capture-health detail from the backend (persistent capture
+        // failure, frozen frames, encoder stderr) — present means "a file
+        // landed", not "the file is trustworthy".
+        if let Some(err) = &meta.error {
+            o["error"] = serde_json::Value::String(err.clone());
+        }
+        return o;
     }
     serde_json::json!({
         "present": true,

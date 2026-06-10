@@ -61,8 +61,8 @@ impl Default for WindowsPageBackend {
 
 #[async_trait]
 impl PageBackend for WindowsPageBackend {
-    async fn get_text(&self, _pid: i32, window_id: u32) -> anyhow::Result<String> {
-        let hwnd = window_id as u64;
+    async fn get_text(&self, _pid: i32, window_id: u64) -> anyhow::Result<String> {
+        let hwnd = window_id;
         tokio::task::spawn_blocking(move || unsafe { get_text_blocking(hwnd) })
             .await
             .map_err(|e| anyhow::anyhow!("join error: {e}"))?
@@ -71,11 +71,11 @@ impl PageBackend for WindowsPageBackend {
     async fn query_dom(
         &self,
         _pid: i32,
-        window_id: u32,
+        window_id: u64,
         css_selector: &str,
         attributes: &[String],
     ) -> anyhow::Result<String> {
-        let hwnd = window_id as u64;
+        let hwnd = window_id;
         let selector = css_selector.to_owned();
         let attrs: Vec<String> = attributes.to_vec();
         tokio::task::spawn_blocking(move || unsafe { query_dom_blocking(hwnd, &selector, &attrs) })
@@ -86,7 +86,7 @@ impl PageBackend for WindowsPageBackend {
     async fn execute_javascript(
         &self,
         pid: i32,
-        window_id: u32,
+        window_id: u64,
         javascript: &str,
     ) -> anyhow::Result<String> {
         // 1) Bookmark-based UIA exec — zero config, no launch flag needed.
@@ -95,13 +95,24 @@ impl PageBackend for WindowsPageBackend {
         //    sits there).  Any failure (favorites bar hidden + Ctrl+Shift+B
         //    fails to summon, dialog drift, title-poll timeout) is logged
         //    and falls through to the CDP path.
-        match super::page_bookmark::try_bookmark_exec(pid, window_id, javascript).await {
-            Ok(v) => {
-                return Ok(format!("uia.bookmark_exec: {v}"));
+        //    try_bookmark_exec still takes the historical u32 window id;
+        //    HWNDs above u32::MAX (rare) skip straight to CDP rather than
+        //    truncating to the wrong window.
+        match u32::try_from(window_id) {
+            Ok(wid32) => {
+                match super::page_bookmark::try_bookmark_exec(pid, wid32, javascript).await {
+                    Ok(v) => {
+                        return Ok(format!("uia.bookmark_exec: {v}"));
+                    }
+                    Err(e) => tracing::debug!(
+                        target: "page.execute_javascript",
+                        "bookmark exec path failed: {e:?}; falling back to CDP"
+                    ),
+                }
             }
-            Err(e) => tracing::debug!(
+            Err(_) => tracing::debug!(
                 target: "page.execute_javascript",
-                "bookmark exec path failed: {e:?}; falling back to CDP"
+                "window_id {window_id} exceeds u32; skipping bookmark exec, falling back to CDP"
             ),
         }
 
@@ -132,7 +143,7 @@ impl PageBackend for WindowsPageBackend {
     async fn click_element(
         &self,
         pid: i32,
-        window_id: u32,
+        window_id: u64,
         selector: &str,
     ) -> anyhow::Result<ClickElementResult> {
         // Two-step:
@@ -222,7 +233,7 @@ impl PageBackend for WindowsPageBackend {
         // HWND so the overlay sits at z+1 of the page, glide, click-pulse.
         // Inlined GA_ROOT lookup mirrors the helper in tools/impl_.rs but
         // keeps page.rs from depending on a private symbol there.
-        let hwnd = window_id as u64;
+        let hwnd = window_id;
         {
             use windows::Win32::Foundation::HWND;
             use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GA_ROOT};

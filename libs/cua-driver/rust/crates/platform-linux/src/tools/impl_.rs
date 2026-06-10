@@ -385,14 +385,16 @@ impl Tool for GetWindowStateTool {
                 Vec::new()
             };
             let screenshot = if do_shot {
-                match crate::capture::screenshot_window_bytes(xid) {
-                    Ok(raw) => {
+                match crate::capture::screenshot_window_bytes_with_provenance(xid) {
+                    Ok((raw, method)) => {
                         let orig_w = crate::capture::png_dimensions_pub(&raw).map(|(w, _)| w).unwrap_or(0);
                         let png = crate::capture::resize_png_if_needed(&raw, max_dim)?;
                         let (w, h) = crate::capture::png_dimensions_pub(&png)?;
                         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
                         let original_w = if w < orig_w { Some(orig_w) } else { None };
-                        Some((B64.encode(&png), w, h, original_w))
+                        let region_crop =
+                            method == Some(crate::hyprland::CaptureMethod::RegionCrop);
+                        Some((B64.encode(&png), w, h, original_w, region_crop))
                     }
                     Err(_) => None,
                 }
@@ -441,13 +443,25 @@ impl Tool for GetWindowStateTool {
                     structured["elements"] = json!(elements);
                 }
 
-                if let Some((b64, w, h, orig_w)) = shot_opt {
+                if let Some((b64, w, h, orig_w, region_crop)) = shot_opt {
                     if let Some(ow) = orig_w {
                         if w > 0 { state.resize_registry.set_ratio(pid, ow as f64 / w as f64); }
                     } else {
                         state.resize_registry.clear_ratio(pid);
                     }
                     content.push(cua_driver_core::protocol::Content::image_png(b64));
+                    if region_crop {
+                        // Mirrors the Windows occluded-capture contract: a
+                        // screen-region crop is indistinguishable from a real
+                        // per-surface capture, so say so explicitly.
+                        content.push(cua_driver_core::protocol::Content::text(
+                            "⚠️ Screenshot was captured via a screen-region crop \
+                             (toplevel-export unavailable): pixels reflect the \
+                             composited screen at the window's geometry and may show \
+                             overlapping windows instead of the target.",
+                        ));
+                        structured["screenshot_region_crop"] = json!(true);
+                    }
                     structured["screenshot_width"] = json!(w);
                     structured["screenshot_height"] = json!(h);
                 }
@@ -495,6 +509,11 @@ impl Tool for LaunchAppTool {
         }
 
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            // Hyprland focuses newly mapped windows; the driver's
+            // no-foreground contract says the user's active window must not
+            // change, so watch for a focus steal over the next ~2s and undo
+            // it (no-op outside Hyprland sessions).
+            crate::hyprland::spawn_focus_restore_guard();
             // Open URLs via xdg-open.
             if !urls.is_empty() {
                 for url in &urls {
@@ -600,6 +619,24 @@ fn resolve_element_local_coords(pid: u32, idx: usize, xid_hint: Option<u64>)
 fn element_screen_center(pid: u32, idx: usize) -> anyhow::Result<(f64, f64)> {
     let (bx, by, bw, bh) = crate::atspi::get_element_bounds(pid, idx)?;
     Ok((bx as f64 + bw as f64 / 2.0, by as f64 + bh as f64 / 2.0))
+}
+
+/// `" (screen (x,y))"` token for click-class result summaries — the exact
+/// pattern the recording loader parses to recover screen coordinates for
+/// element-indexed clicks (which carry no x/y arguments), so click zoom
+/// targeting works. Empty when the coordinate can't be trusted: AT-SPI
+/// extents are only screen-absolute for X11/XWayland windows (native-Wayland
+/// extents may be window-local), and (0,0) here means the bounds lookup
+/// failed — never poison the zoom target with a wrong-space coordinate.
+fn screen_summary_token(xid: u64, screen_x: f64, screen_y: f64) -> String {
+    if xid != 0
+        && !is_native_wayland_window_id(xid)
+        && (screen_x != 0.0 || screen_y != 0.0)
+    {
+        format!(" (screen ({screen_x:.0},{screen_y:.0}))")
+    } else {
+        String::new()
+    }
 }
 
 fn window_local_to_screen(xid: u64, x: f64, y: f64) -> anyhow::Result<(f64, f64)> {
@@ -822,7 +859,10 @@ impl Tool for ClickTool {
                     }
                     overlay_glide_to(x, y).await;
                     crate::overlay::send_command(cursor_overlay::OverlayCommand::ClickPulse { x, y });
-                    ToolResult::text(format!("Clicked element [{idx}] (pid {pid})."))
+                    ToolResult::text(format!(
+                        "Clicked element [{idx}] (pid {pid}){}.",
+                        screen_summary_token(xid, x, y)
+                    ))
                 }
                 Ok(Err(e)) => ToolResult::error(format!("AT-SPI element click failed: {e}")),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -1321,13 +1361,21 @@ impl Tool for DoubleClickTool {
             }).await;
             return match result {
                 Ok(Ok((xid, lx, ly))) => {
-                    if let Ok((sx, sy)) = element_screen_center(pid, idx) {
+                    let screen = element_screen_center(pid, idx).ok();
+                    if let Some((sx, sy)) = screen {
                         crate::overlay::send_command(cursor_overlay::OverlayCommand::PinAbove(xid));
                         overlay_glide_to(sx, sy).await;
                         crate::overlay::send_command(cursor_overlay::OverlayCommand::ClickPulse { x: sx, y: sy });
                     }
                     match tokio::task::spawn_blocking(move || crate::input::send_click(xid, lx as i32, ly as i32, 2, 1)).await {
-                        Ok(Ok(())) => ToolResult::text(format!("✅ Double-clicked element [{idx}].")),
+                        Ok(Ok(())) => {
+                            // xid here is X11-only (resolve_element_local_coords
+                            // bails on native-Wayland ids).
+                            let token = screen
+                                .map(|(sx, sy)| screen_summary_token(xid, sx, sy))
+                                .unwrap_or_default();
+                            ToolResult::text(format!("✅ Double-clicked element [{idx}]{token}."))
+                        }
                         Ok(Err(e)) => ToolResult::error(e.to_string()),
                         Err(e) => ToolResult::error(format!("Task error: {e}")),
                     }
@@ -1411,13 +1459,21 @@ impl Tool for RightClickTool {
             }).await;
             return match result {
                 Ok(Ok((xid, lx, ly))) => {
-                    if let Ok((sx, sy)) = element_screen_center(pid, idx) {
+                    let screen = element_screen_center(pid, idx).ok();
+                    if let Some((sx, sy)) = screen {
                         crate::overlay::send_command(cursor_overlay::OverlayCommand::PinAbove(xid));
                         overlay_glide_to(sx, sy).await;
                         crate::overlay::send_command(cursor_overlay::OverlayCommand::ClickPulse { x: sx, y: sy });
                     }
                     match tokio::task::spawn_blocking(move || crate::input::send_click(xid, lx as i32, ly as i32, 1, 3)).await {
-                        Ok(Ok(())) => ToolResult::text(format!("✅ Right-clicked element [{idx}].")),
+                        Ok(Ok(())) => {
+                            // xid here is X11-only (resolve_element_local_coords
+                            // bails on native-Wayland ids).
+                            let token = screen
+                                .map(|(sx, sy)| screen_summary_token(xid, sx, sy))
+                                .unwrap_or_default();
+                            ToolResult::text(format!("✅ Right-clicked element [{idx}]{token}."))
+                        }
                         Ok(Err(e)) => ToolResult::error(e.to_string()),
                         Err(e) => ToolResult::error(format!("Task error: {e}")),
                     }
@@ -2195,13 +2251,14 @@ impl Tool for ZoomTool {
         if x2 <= x1 || y2 <= y1 { return ToolResult::error("x2 must be > x1 and y2 must be > y1"); }
 
         let state = self.state.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let png = crate::capture::screenshot_window_bytes(xid)?;
-            cursor_overlay::capture_utils::crop_png_to_jpeg(&png, x1, y1, x2, y2, 500)
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let (png, method) = crate::capture::screenshot_window_bytes_with_provenance(xid)?;
+            let crop = cursor_overlay::capture_utils::crop_png_to_jpeg(&png, x1, y1, x2, y2, 500)?;
+            Ok((crop, method))
         }).await;
 
         match result {
-            Ok(Ok(crop)) => {
+            Ok(Ok((crop, method))) => {
                 if let Some(p) = pid {
                     state.zoom_registry.set(p, ZoomContext {
                         origin_x: crop.origin_x,
@@ -2213,11 +2270,19 @@ impl Tool for ZoomTool {
                 let b64 = B64.encode(&crop.jpeg_bytes);
                 let (w, h) = (crop.out_w, crop.out_h);
                 use cua_driver_core::protocol::Content;
+                let mut content = vec![
+                    Content::image_jpeg(b64),
+                    Content::text(format!("Zoom ({x1:.0},{y1:.0})–({x2:.0},{y2:.0}) → {w}×{h} px JPEG.")),
+                ];
+                if method == Some(crate::hyprland::CaptureMethod::RegionCrop) {
+                    content.push(Content::text(
+                        "⚠️ Source screenshot was a screen-region crop (toplevel-export \
+                         unavailable): pixels may show overlapping windows instead of \
+                         the target.",
+                    ));
+                }
                 ToolResult {
-                    content: vec![
-                        Content::image_jpeg(b64),
-                        Content::text(format!("Zoom ({x1:.0},{y1:.0})–({x2:.0},{y2:.0}) → {w}×{h} px JPEG.")),
-                    ],
+                    content,
                     is_error: None,
                     structured_content: Some(json!({ "width": w, "height": h, "format": "jpeg" })),
                 }

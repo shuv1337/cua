@@ -12,18 +12,29 @@ use std::process::Command;
 
 /// Capture a window by X11 XID. Returns raw PNG bytes.
 pub fn screenshot_window_bytes(xid: u64) -> Result<Vec<u8>> {
+    screenshot_window_bytes_with_provenance(xid).map(|(bytes, _)| bytes)
+}
+
+/// Like [`screenshot_window_bytes`] but reports how Hyprland-native windows
+/// were captured: `Some(CaptureMethod::RegionCrop)` means a composited-screen
+/// crop that can show overlapping windows, so callers surfacing the image to
+/// a user/LLM should attach a warning. X11 paths return `None` (the pixels
+/// come from the window's own drawable).
+pub fn screenshot_window_bytes_with_provenance(
+    xid: u64,
+) -> Result<(Vec<u8>, Option<crate::hyprland::CaptureMethod>)> {
     if xid > u32::MAX as u64 {
-        return crate::hyprland::screenshot_window_bytes(xid);
+        let (bytes, method) = crate::hyprland::screenshot_window_bytes_with_provenance(xid)?;
+        return Ok((bytes, Some(method)));
     }
     // Try `import -window <xid> png:-` (ImageMagick).
     if let Ok(bytes) = capture_via_import(xid) {
-        return Ok(bytes);
+        return Ok((bytes, None));
     }
     // Fallback: x11rb XGetImage → returns (b64, w, h); decode the b64 back.
     let (b64, _, _) = capture_via_xgetimage(xid)?;
-    use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(&b64)?;
-    Ok(bytes)
+    let bytes = BASE64.decode(&b64)?;
+    Ok((bytes, None))
 }
 
 /// Capture a window by X11 XID. Returns (base64_png, width, height).
@@ -106,8 +117,33 @@ pub fn png_dimensions_pub(data: &[u8]) -> Result<(u32, u32)> {
 // `CUA_DRIVER_RS_DEDUP_AUDIT.md`. RGBA-encoding callers below now go
 // through `cua_driver_core::image_utils::encode_rgba_to_png`.
 
-/// Capture the primary display (root window) as raw PNG bytes.
+/// Capture the primary display as raw PNG bytes.
+///
+/// Under Wayland the X11 root only shows XWayland content, so grim (all
+/// outputs composited) is tried first; X11 paths remain the fallback and
+/// the only path on pure-X11 sessions.
 pub fn screenshot_display_bytes() -> Result<Vec<u8>> {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        match crate::hyprland::screenshot_display_bytes_grim() {
+            Ok(png) => return Ok(png),
+            // On a pure-Wayland Hyprland session the X11 root shows only
+            // XWayland content — falling through would silently return a
+            // black frame that callers record as real, so propagate.
+            Err(e) if crate::hyprland::is_hyprland_session() => {
+                return Err(e.context(
+                    "grim display capture failed (the X11 root fallback only \
+                     shows XWayland content on Hyprland)",
+                ));
+            }
+            // Non-Hyprland Wayland sessions may still have a meaningful
+            // XWayland root; keep the fallback but make the loss visible.
+            Err(e) => {
+                tracing::warn!(
+                    "grim display capture failed ({e:#}); falling back to X11 root capture"
+                );
+            }
+        }
+    }
     // Try `import -window root png:-` (ImageMagick).
     let out = Command::new("import")
         .args(["-window", "root", "png:-"])
