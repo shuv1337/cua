@@ -607,6 +607,36 @@ fn native_wayland_input_error(action: &str) -> ToolResult {
     ))
 }
 
+/// Phrase an XSendEvent click-family result honestly. XSendEvent success only
+/// means the X server accepted the synthetic events — it cannot verify the
+/// target toolkit processed them, and several toolkits drop `send_event=true`
+/// button events outright (wxWidgets main frames AND modal dialogs, GTK3
+/// frames — confirmed against PrusaSlicer 2.9.5; xterm with allowSendEvents
+/// off, by design). So the success line says "dispatched … unverified" and
+/// points at the re-snapshot loop as the only real success signal.
+///
+/// When the cached AT-SPI tree for the target window has no actionable
+/// elements (≤1 entry — a bare window node, or no snapshot at all), the
+/// target very likely never registered on the accessibility bus, which is
+/// exactly the population that ignores synthetic events — append an explicit
+/// warning with the recovery path. Cost: one hash-map lookup, no D-Bus.
+fn xsend_unverified_message(state: &ToolState, base: String, pid: u32, xid: u64) -> String {
+    let mut msg = format!(
+        "🛰️ {base} via XSendEvent — synthetic-event delivery is best-effort and UNVERIFIED; \
+         re-snapshot with get_window_state and diff to confirm the UI actually changed."
+    );
+    if state.element_cache.element_count(pid, xid) <= 1 {
+        msg.push_str(
+            "\n⚠️ No actionable AT-SPI elements are cached for this window — toolkits that \
+             don't register on the accessibility bus (wxWidgets, GTK3 without the atk-bridge) \
+             commonly ignore synthetic XSendEvent clicks entirely. If nothing changed, \
+             relaunch the app via launch_app (which forces the accessibility bridge into the \
+             child environment) and use element_index actions instead.",
+        );
+    }
+    msg
+}
+
 fn prefer_xwayland_for_launched_apps(command: &mut std::process::Command) {
     if std::env::var_os("WAYLAND_DISPLAY").is_none() || std::env::var_os("DISPLAY").is_none() {
         return;
@@ -841,10 +871,13 @@ impl Tool for ClickTool {
                 a stable handle, and tells you what you're clicking via the cached AT-SPI \
                 element's role + label. Reach for `x, y` only when the target is a canvas / \
                 custom-drawn surface that doesn't appear in the AT-SPI tree.\n\n\
-                Provide either (window_id + x/y) or (pid + element_index). Routes via \
-                XSendEvent (no focus steal). element_index cache is scoped per (pid, \
-                window_id) and is replaced by the next get_window_state of the same window — \
-                re-snapshot every turn before clicking.\n\n\
+                Provide either (window_id + x/y) or (pid + element_index). Pixel clicks \
+                route via XSendEvent (no focus steal) and are BEST-EFFORT: some toolkits \
+                (wxWidgets, GTK3) silently ignore synthetic events, so a success result \
+                only means the events were dispatched — always verify with a re-snapshot. \
+                element_index cache is scoped per (pid, window_id) and is replaced by the \
+                next get_window_state of the same window — re-snapshot every turn before \
+                clicking.\n\n\
                 After a zoom call, pass from_zoom=true to auto-translate zoom-image coords \
                 back to full-window space.".into(),
             input_schema: json!({
@@ -878,7 +911,7 @@ impl Tool for ClickTool {
             let xid_hint = args.opt_u64("window_id");
             // For element_index: try AT-SPI perform_action first (background-safe).
             // Always get bounds to send the overlay ClickPulse at the element center.
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, f64, f64)> {
+            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, f64, f64, bool)> {
                 // Get element screen-absolute center for the overlay pulse.
                 let (screen_cx, screen_cy) = element_screen_center(pid, idx).unwrap_or((0.0, 0.0));
 
@@ -887,25 +920,42 @@ impl Tool for ClickTool {
                     let xid = xid_hint.or_else(|| {
                         crate::x11::list_windows(Some(pid)).into_iter().next().map(|w| w.xid)
                     }).unwrap_or(0);
-                    return Ok((xid, screen_cx, screen_cy));
+                    return Ok((xid, screen_cx, screen_cy, false));
                 }
 
                 // Fallback: XSendEvent at window-local coords.
                 let (xid, lx, ly) = resolve_element_local_coords(pid, idx, xid_hint)?;
                 crate::input::send_click(xid, lx as i32, ly as i32, count, button)?;
-                Ok((xid, screen_cx, screen_cy))
+                Ok((xid, screen_cx, screen_cy, true))
             }).await;
             return match result {
-                Ok(Ok((xid, x, y))) => {
+                Ok(Ok((xid, x, y, via_xsend))) => {
                     if xid != 0 {
                         crate::overlay::send_command(cursor_overlay::OverlayCommand::PinAbove(xid));
                     }
                     overlay_glide_to(x, y).await;
                     crate::overlay::send_command(cursor_overlay::OverlayCommand::ClickPulse { x, y });
-                    ToolResult::text(format!(
-                        "Clicked element [{idx}] (pid {pid}){}.",
-                        screen_summary_token(xid, x, y)
-                    ))
+                    if via_xsend {
+                        // The AT-SPI action path failed and the click went out
+                        // as synthetic X events — same unverified semantics as
+                        // the pixel path, and the caller should know which
+                        // mechanism actually ran.
+                        ToolResult::text(xsend_unverified_message(
+                            &self.state,
+                            format!(
+                                "Dispatched click to element [{idx}] (pid {pid}){} \
+                                 (AT-SPI action unavailable, fell back to coordinates)",
+                                screen_summary_token(xid, x, y)
+                            ),
+                            pid,
+                            xid,
+                        ))
+                    } else {
+                        ToolResult::text(format!(
+                            "✅ Clicked element [{idx}] (pid {pid}){} via AT-SPI action.",
+                            screen_summary_token(xid, x, y)
+                        ))
+                    }
                 }
                 Ok(Err(e)) => ToolResult::error(format!("AT-SPI element click failed: {e}")),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -948,7 +998,12 @@ impl Tool for ClickTool {
             crate::input::send_click(xid, xi, yi, count, button)
         }).await;
         match result {
-            Ok(Ok(())) => ToolResult::text(format!("✅ Clicked at ({x:.1}, {y:.1}) × {count}.")),
+            Ok(Ok(())) => ToolResult::text(xsend_unverified_message(
+                &self.state,
+                format!("Dispatched click at ({x:.1}, {y:.1}) × {count}"),
+                pid,
+                xid,
+            )),
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
@@ -1417,7 +1472,12 @@ impl Tool for DoubleClickTool {
                             let token = screen
                                 .map(|(sx, sy)| screen_summary_token(xid, sx, sy))
                                 .unwrap_or_default();
-                            ToolResult::text(format!("✅ Double-clicked element [{idx}]{token}."))
+                            ToolResult::text(xsend_unverified_message(
+                                &self.state,
+                                format!("Dispatched double-click to element [{idx}]{token}"),
+                                pid,
+                                xid,
+                            ))
                         }
                         Ok(Err(e)) => ToolResult::error(e.to_string()),
                         Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -1457,7 +1517,12 @@ impl Tool for DoubleClickTool {
         let (xi, yi) = (x as i32, y as i32);
         let result = tokio::task::spawn_blocking(move || crate::input::send_click(xid, xi, yi, 2, 1)).await;
         match result {
-            Ok(Ok(())) => ToolResult::text(format!("✅ Double-clicked at ({x:.1}, {y:.1}).")),
+            Ok(Ok(())) => ToolResult::text(xsend_unverified_message(
+                &self.state,
+                format!("Dispatched double-click at ({x:.1}, {y:.1})"),
+                pid,
+                xid,
+            )),
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
@@ -1515,7 +1580,12 @@ impl Tool for RightClickTool {
                             let token = screen
                                 .map(|(sx, sy)| screen_summary_token(xid, sx, sy))
                                 .unwrap_or_default();
-                            ToolResult::text(format!("✅ Right-clicked element [{idx}]{token}."))
+                            ToolResult::text(xsend_unverified_message(
+                                &self.state,
+                                format!("Dispatched right-click to element [{idx}]{token}"),
+                                pid,
+                                xid,
+                            ))
                         }
                         Ok(Err(e)) => ToolResult::error(e.to_string()),
                         Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -1555,7 +1625,12 @@ impl Tool for RightClickTool {
         let (xi, yi) = (x as i32, y as i32);
         let result = tokio::task::spawn_blocking(move || crate::input::send_click(xid, xi, yi, 1, 3)).await;
         match result {
-            Ok(Ok(())) => ToolResult::text(format!("✅ Right-clicked at ({x:.1}, {y:.1}).")),
+            Ok(Ok(())) => ToolResult::text(xsend_unverified_message(
+                &self.state,
+                format!("Dispatched right-click at ({x:.1}, {y:.1})"),
+                pid,
+                xid,
+            )),
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }

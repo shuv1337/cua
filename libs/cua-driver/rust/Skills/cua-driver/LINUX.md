@@ -96,6 +96,33 @@ specific to it:
   raised. Add an allow rule for the cua-driver binary to the
   Hyprland permission config.
 
+## Pixel click reliability (XSendEvent)
+
+Pixel clicks are synthesized as `ButtonPress`/`ButtonRelease` via
+`XSendEvent` directly to the target window — no focus steal, no
+pointer move, but also **no delivery guarantee**: the X server
+accepting the events says nothing about the toolkit processing them,
+and toolkits see `send_event=true` and may drop such events entirely.
+The tool therefore reports pixel clicks as "dispatched … delivery
+UNVERIFIED" — treat the post-action `get_window_state` diff as the
+only success signal. When the cached AT-SPI tree for the target
+window is empty, the result carries an explicit warning: an empty
+tree usually means the toolkit never registered on the accessibility
+bus, which correlates strongly with dropping synthetic events.
+
+| Toolkit / surface | Synthetic XSendEvent click |
+|---|---|
+| wxWidgets (e.g. PrusaSlicer 2.9.5) — main frames AND modal dialogs | ❌ silently ignored (confirmed 2026-06-10) — use element_index |
+| GTK3 main frames | ❌ frequently ignored |
+| xterm & friends with `allowSendEvents: false` (the default) | ❌ ignored by design |
+| Native-Wayland surfaces | ❌ rejected (no X window to address) |
+| GTK4 / Qt5 / Qt6 / Chromium & Electron (XWayland) | ⚠️ typically processed — still verify via re-snapshot |
+
+Recovery when a pixel click no-ops: relaunch the app via
+`launch_app` (it forces the atk-bridge into the child environment so
+the AT-SPI tree populates) and drive it with `element_index` actions,
+which use AT-SPI `doAction` instead of synthetic X events.
+
 ## Forbidden vectors
 
 Same idea as macOS / Windows — don't shell out to anything that
@@ -115,7 +142,7 @@ ask the user.
 | Intent | Status |
 |---|---|
 | Snapshot UIA tree | ✅ AT-SPI when available, often partial for GTK4/Qt6 |
-| Pixel click | ⚠️ X11 only, focus-stealing semantics |
+| Pixel click | ⚠️ X11/XWayland only, XSendEvent best-effort — silently ignored by some toolkits (see "Pixel click reliability") |
 | Element-indexed click | ⚠️ AT-SPI `accDoDefaultAction` when supported |
 | Type text | ⚠️ XTest, focus-sensitive |
 | Hotkey | ⚠️ XTest, focus-sensitive |
