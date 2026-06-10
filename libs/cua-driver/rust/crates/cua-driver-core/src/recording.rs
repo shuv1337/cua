@@ -124,10 +124,10 @@ struct RecordingInner {
     /// per-frame cursor positions for smooth pan-between-clicks
     /// behavior. Stopped on `stop()` along with video.
     cursor: Option<CursorSampler>,
-    /// Sample count from the last finalized cursor sampler; exposed in
+    /// Tallies from the last finalized cursor sampler; exposed in
     /// `session.json` after stop so the renderer can confirm the
-    /// sampler ran.
-    last_cursor_samples: usize,
+    /// sampler ran (and so off-monitor drops are self-explaining).
+    last_cursor_stats: crate::cursor_sampler::CursorStats,
     /// Bumped by every `start()` at entry (phase 1) and by every effective
     /// unconditional (`requester == None`) stop. `start()` re-checks it at
     /// commit (phase 3): a stale value means a newer start or a manual stop
@@ -175,7 +175,7 @@ impl RecordingSession {
                 video: None,
                 last_video: None,
                 cursor: None,
-                last_cursor_samples: 0,
+                last_cursor_stats: Default::default(),
                 start_epoch: 0,
             }),
         }
@@ -346,7 +346,7 @@ impl RecordingSession {
             inner.session_monotonic_start = Some(monotonic_start);
             inner.last_error = video_error;
             inner.last_video = None;
-            inner.last_cursor_samples = 0;
+            inner.last_cursor_stats = Default::default();
             displaced
         };
         if let Some(rec) = displaced.0 {
@@ -397,7 +397,7 @@ impl RecordingSession {
         inner.owner = None;
         let dir = inner.output_dir.clone();
         let video_meta = inner.video.take().and_then(|rec| rec.stop().ok());
-        let cursor_samples = inner.cursor.take().map(|c| c.stop()).unwrap_or(0);
+        let cursor_stats = inner.cursor.take().map(|c| c.stop()).unwrap_or_default();
 
         inner.enabled = false;
         inner.output_dir = None;
@@ -414,7 +414,7 @@ impl RecordingSession {
             inner.last_error = meta.error.clone();
         }
         inner.last_video = video_meta.clone();
-        inner.last_cursor_samples = cursor_samples;
+        inner.last_cursor_stats = cursor_stats;
 
         // Rewrite session.json with final video metadata + cursor count
         // so the renderer (and any external analysis) sees what actually
@@ -429,7 +429,7 @@ impl RecordingSession {
                 "schema_version": 1,
                 "started_at_monotonic_ms": now_ms(),
                 "video": video_block,
-                "cursor": { "present": cursor_samples > 0, "sample_count": cursor_samples }
+                "cursor": cursor_session_payload(cursor_stats)
             });
             let _ = write_json_atomic(
                 &dir.join("session.json"),
@@ -440,10 +440,11 @@ impl RecordingSession {
     }
 
     /// Legacy toggle API kept as a thin shim over `start()`/`stop()` so
-    /// existing callers (CLI subcommand, tests) keep compiling during the
-    /// rename window. Forces `record_video` on for this legacy CLI path — the
-    /// MCP `start_recording` tool now defaults video OFF (see
-    /// `recording_tools.rs`), but the CLI `recording start` keeps video on.
+    /// existing callers (tests) keep compiling during the rename window.
+    /// Forces `record_video` on for this legacy path. NOTE: the CLI
+    /// `recording start` subcommand does NOT go through here — it wraps the
+    /// `start_recording` tool (cli.rs::run_recording_cmd), where video
+    /// defaults OFF and is enabled with the `--video` flag.
     pub fn configure(&self, enabled: bool, output_dir: Option<&str>) -> anyhow::Result<()> {
         if !enabled {
             return self.stop_owner(None);
@@ -650,7 +651,7 @@ fn abort_uncommitted_start(
     finalize_session_json: bool,
 ) {
     let video_meta = video.and_then(|rec| rec.stop().ok());
-    let cursor_samples = cursor.map(|c| c.stop()).unwrap_or(0);
+    let cursor_stats = cursor.map(|c| c.stop()).unwrap_or_default();
     if !finalize_session_json {
         return;
     }
@@ -663,9 +664,21 @@ fn abort_uncommitted_start(
         "schema_version": 1,
         "started_at_monotonic_ms": now_ms(),
         "video": video_block,
-        "cursor": { "present": cursor_samples > 0, "sample_count": cursor_samples }
+        "cursor": cursor_session_payload(cursor_stats)
     });
     let _ = write_json_atomic(&dir.join("session.json"), &session_payload);
+}
+
+/// Build the `session.json` `cursor` field. `dropped_offscreen` counts
+/// polls deliberately skipped while the cursor was off the recorded
+/// monitor (Linux multi-monitor), so a sub-30 Hz average sample rate is
+/// self-explaining rather than looking like sampler loss.
+fn cursor_session_payload(stats: crate::cursor_sampler::CursorStats) -> Value {
+    serde_json::json!({
+        "present": stats.samples > 0,
+        "sample_count": stats.samples,
+        "dropped_offscreen": stats.dropped_offscreen,
+    })
 }
 
 /// Build the `session.json` `video` field. Three shapes:
