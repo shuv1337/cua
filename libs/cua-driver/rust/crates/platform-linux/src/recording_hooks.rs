@@ -19,32 +19,68 @@
 //! marker lands on the wrong element. macOS avoids this with a process-
 //! global element cache; porting that to Linux is the proper fix.
 
+use std::sync::mpsc::SyncSender;
+use std::sync::OnceLock;
 use std::time::Duration;
 
-/// Run a hook body on a scratch OS thread with a bounded wait.
+/// Jobs for the single long-lived hook worker, boxed so one thread serves
+/// both hook shapes.
+type HookJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// `Some(sender)` once the "rec-hook" worker is up; `None` when the spawn
+/// failed (hooks then permanently skip, matching the old per-call `.ok()?`).
+static HOOK_TX: OnceLock<Option<SyncSender<HookJob>>> = OnceLock::new();
+
+/// Run a hook body on the long-lived "rec-hook" worker with a bounded wait.
 ///
 /// Recording hooks are invoked synchronously from `write_turn` on a tokio
 /// async worker thread (tool impls escape via `spawn_blocking`, the
 /// recording path does not). The AT-SPI layer drives its own runtime via
-/// `block_on`, which panics when called from inside an async context —
-/// so hop to a plain thread first. The join is deadline-bounded so a
-/// wedged D-Bus walk cannot stall the tool-response path; on timeout the
-/// scratch thread is leaked and finishes (or times out internally) on its
-/// own. Recording cadence is human-scale; one short-lived thread per turn
-/// is fine.
+/// `block_on`, which panics when called from inside an async context — so
+/// hop to a plain thread first. A single persistent worker (rather than a
+/// spawn per call) caps in-flight AT-SPI work at one: agent-driven turn
+/// rates against a slow tree would otherwise accumulate leaked scratch
+/// threads all contending on the shared single-worker AT-SPI runtime.
+///
+/// The join is deadline-bounded so a wedged D-Bus walk cannot stall the
+/// tool-response path. The job queue holds at most one pending job; while
+/// the worker is busy and the slot is taken, further turns skip (`None`,
+/// callers omit the artifact for that turn). A timed-out job's late result
+/// lands in its own dropped channel and is discarded, leaving the worker
+/// free for the next turn.
 fn on_scratch_thread<T, F>(timeout: Duration, f: F) -> Option<T>
 where
     F: FnOnce() -> Option<T> + Send + 'static,
     T: Send + 'static,
 {
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("rec-hook".into())
-        .spawn(move || {
-            let _ = tx.send(f());
+    let tx = HOOK_TX
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<HookJob>(1);
+            std::thread::Builder::new()
+                .name("rec-hook".into())
+                .spawn(move || {
+                    while let Ok(job) = rx.recv() {
+                        job();
+                    }
+                })
+                .ok()
+                .map(|_| tx)
         })
-        .ok()?;
-    rx.recv_timeout(timeout).ok().flatten()
+        .as_ref()?;
+
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let job: HookJob = Box::new(move || {
+        // Capacity-1 + a fresh channel per job: the send never blocks, and
+        // a result arriving after the recv_timeout below is simply dropped
+        // with the channel.
+        let _ = result_tx.try_send(f());
+    });
+    if tx.try_send(job).is_err() {
+        // Queue full: a previous turn's walk is still running AND one job is
+        // already waiting behind it — skip this turn rather than backlog.
+        return None;
+    }
+    result_rx.recv_timeout(timeout).ok().flatten()
 }
 
 pub fn app_state_json_for(window_id: Option<u64>, pid: Option<i64>) -> Option<Vec<u8>> {
@@ -103,7 +139,15 @@ fn element_window_local_xy_blocking(
         .into_iter()
         .find(|w| w.xid == window_id)?;
 
-    let (x, y, w, h) = crate::atspi::get_element_bounds(pid_u32, element_index as usize).ok()?;
+    // Budget strictly under the 8s scratch-thread join above: unbounded,
+    // this call parks the shared hook worker on a wedged AT-SPI peer long
+    // after the join gave up (see `get_element_bounds_bounded`).
+    let (x, y, w, h) = crate::atspi::native::get_element_bounds_bounded(
+        pid_u32,
+        element_index as usize,
+        Duration::from_secs(7),
+    )
+    .ok()?;
     let cx = x as f64 + w as f64 / 2.0;
     let cy = y as f64 + h as f64 / 2.0;
 

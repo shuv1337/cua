@@ -313,9 +313,19 @@ async fn collect_visited<'a>(
     Ok(Some(visited))
 }
 
+/// Escape a string for a quoted field of the line-oriented tree markdown.
+/// Entry text is user-controlled and can be copied into `name` as well as
+/// `value`, so a literal newline or quote would corrupt the node line for
+/// downstream parsers.
+fn escape_md(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "")
+}
+
 /// Render visited nodes into the markdown + node list `walk_tree` returns.
-/// Format matches the historical pyatspi output exactly so downstream parsing
-/// (`extract_text_from_markdown`, `query_dom`) is unaffected.
+/// Format matches the historical pyatspi output (so downstream parsing —
+/// `extract_text_from_markdown`, `query_dom` — is unaffected), except that
+/// quoted `name`/`value` fields are backslash-escaped via [`escape_md`];
+/// `AtspiNode` fields stay raw.
 fn render(visited: &[Visited<'_>]) -> (String, Vec<AtspiNode>) {
     let mut md = String::new();
     let mut nodes = Vec::new();
@@ -325,20 +335,14 @@ fn render(visited: &[Visited<'_>]) -> (String, Vec<AtspiNode>) {
         let indent = "  ".repeat(v.depth);
         if !v.actions.is_empty() {
             let act_str = v.actions.join(",");
-            // Escape newlines/quotes: entry text is user-controlled and the
-            // tree markdown is line-oriented — a literal newline or quote
-            // would corrupt the node line for downstream parsers.
             let val_part = match &v.value {
-                Some(val) if !val.is_empty() => {
-                    let escaped = val.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "");
-                    format!(" value=\"{escaped}\"")
-                }
+                Some(val) if !val.is_empty() => format!(" value=\"{}\"", escape_md(val)),
                 _ => String::new(),
             };
             md.push_str(&format!(
                 "{indent}- [{idx}] {role} \"{name}\"{val_part} [actions=[{act_str}]]\n",
                 role = v.role,
-                name = v.name,
+                name = escape_md(&v.name),
             ));
             nodes.push(AtspiNode {
                 element_index: Some(idx),
@@ -354,7 +358,7 @@ fn render(visited: &[Visited<'_>]) -> (String, Vec<AtspiNode>) {
             md.push_str(&format!(
                 "{indent}- {role} = \"{name}\"\n",
                 role = v.role,
-                name = v.name,
+                name = escape_md(&v.name),
             ));
         }
     }
@@ -713,31 +717,57 @@ pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
 }
 
 pub fn get_element_bounds(pid: u32, idx: usize) -> Result<(i32, i32, u32, u32)> {
+    get_element_bounds_bounded(pid, idx, OP_TIMEOUT)
+}
+
+/// [`get_element_bounds`] with a caller-chosen operation deadline.
+///
+/// Mirrors the `OP_TIMEOUT` wrapper `walk_tree` already has: several awaits
+/// on this path (connection setup, `proxies()`, `component()`, the registry
+/// calls inside `app_for_pid`) are not `call()`-wrapped, so without an
+/// operation-level deadline a wedged AT-SPI peer parks the calling thread
+/// indefinitely. The recording hook joins its scratch worker after 8s and
+/// passes a budget strictly below that, so the worker actually finishes
+/// instead of outliving the join.
+pub fn get_element_bounds_bounded(
+    pid: u32,
+    idx: usize,
+    budget: Duration,
+) -> Result<(i32, i32, u32, u32)> {
     runtime().block_on(async {
-        let conn = AccessibilityConnection::new()
-            .await
-            .map_err(|e| anyhow!("AT-SPI connect failed: {e}"))?;
-        let visited = collect_visited(&conn, pid)
-            .await?
-            .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
-        let action_nodes: Vec<&Visited> = visited.iter().filter(|v| !v.actions.is_empty()).collect();
-        let target = action_nodes
-            .get(idx)
-            .ok_or_else(|| anyhow!("element {idx} not found"))?;
-        if !target.has_component {
-            return Err(anyhow!("element {idx} exposes no Component interface"));
+        let work = async {
+            let conn = AccessibilityConnection::new()
+                .await
+                .map_err(|e| anyhow!("AT-SPI connect failed: {e}"))?;
+            let visited = collect_visited(&conn, pid)
+                .await?
+                .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+            let action_nodes: Vec<&Visited> =
+                visited.iter().filter(|v| !v.actions.is_empty()).collect();
+            let target = action_nodes
+                .get(idx)
+                .ok_or_else(|| anyhow!("element {idx} not found"))?;
+            if !target.has_component {
+                return Err(anyhow!("element {idx} exposes no Component interface"));
+            }
+            let comp = target
+                .acc
+                .proxies()
+                .await
+                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?
+                .component()
+                .await
+                .map_err(|e| anyhow!("Component unavailable: {e}"))?;
+            component_extents_for_pid(&comp, pid)
+                .await
+                .ok_or_else(|| anyhow!("getExtents returned no usable bounds for element {idx}"))
+        };
+        match tokio::time::timeout(budget, work).await {
+            Ok(r) => r,
+            Err(_) => Err(anyhow!(
+                "get_element_bounds timed out after {budget:?} for pid {pid}"
+            )),
         }
-        let comp = target
-            .acc
-            .proxies()
-            .await
-            .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?
-            .component()
-            .await
-            .map_err(|e| anyhow!("Component unavailable: {e}"))?;
-        component_extents_for_pid(&comp, pid)
-            .await
-            .ok_or_else(|| anyhow!("getExtents returned no usable bounds for element {idx}"))
     })
 }
 

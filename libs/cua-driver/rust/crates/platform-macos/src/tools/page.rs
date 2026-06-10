@@ -40,9 +40,19 @@ impl MacOsPageBackend {
     }
 }
 
+/// The shared `PageBackend` contract carries u64 window ids (Hyprland
+/// addresses and HWNDs need the width); macOS CGWindowIDs are u32 and always
+/// fit, so anything wider is a caller error — reject it loudly instead of
+/// truncating to the wrong window.
+fn narrow_window_id(window_id: u64) -> anyhow::Result<u32> {
+    u32::try_from(window_id)
+        .map_err(|_| anyhow::anyhow!("window_id {window_id} out of CGWindowID (u32) range"))
+}
+
 #[async_trait]
 impl PageBackend for MacOsPageBackend {
-    async fn get_text(&self, pid: i32, window_id: u32) -> anyhow::Result<String> {
+    async fn get_text(&self, pid: i32, window_id: u64) -> anyhow::Result<String> {
+        let window_id = narrow_window_id(window_id)?;
         let bundle_id = Self::bundle_id_for(pid).await;
 
         let use_ax_fallback = !BrowserJs::supports(&bundle_id)
@@ -64,10 +74,11 @@ impl PageBackend for MacOsPageBackend {
     async fn query_dom(
         &self,
         pid: i32,
-        window_id: u32,
+        window_id: u64,
         css_selector: &str,
         attributes: &[String],
     ) -> anyhow::Result<String> {
+        let window_id = narrow_window_id(window_id)?;
         let bundle_id = Self::bundle_id_for(pid).await;
 
         let use_ax_fallback = !BrowserJs::supports(&bundle_id)
@@ -93,9 +104,10 @@ impl PageBackend for MacOsPageBackend {
     async fn execute_javascript(
         &self,
         pid: i32,
-        window_id: u32,
+        window_id: u64,
         javascript: &str,
     ) -> anyhow::Result<String> {
+        let window_id = narrow_window_id(window_id)?;
         let bundle_id = Self::bundle_id_for(pid).await;
         execute_js(javascript, &bundle_id, pid, window_id).await
     }

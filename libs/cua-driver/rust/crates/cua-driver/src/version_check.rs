@@ -581,11 +581,11 @@ fn civil_from_unix(unix_secs: u64) -> (i32, u32, u32, u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     /// All env-mutating tests serialise on this lock — `std::env::set_var`
-    /// is process-global, parallel tests would race.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// is process-global, parallel tests would race. Shared binary-wide:
+    /// `telemetry`'s tests redirect `HOME`/`USERPROFILE` too.
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
     /// Redirect `HOME` / `USERPROFILE` to a fresh temp dir for the body
     /// of `f`, then restore. Ensures the cache file lives in an isolated

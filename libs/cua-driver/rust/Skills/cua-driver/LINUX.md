@@ -79,10 +79,16 @@ specific to it:
 - **launch_app**: if a newly launched window steals focus, the driver
   restores the previously active window. Best-effort, watches for
   ~2 s after launch.
-- **Recording**: video captures the focused monitor via
+- **Recording**: opt-in — `start_recording` errors unless the daemon
+  was started with `--allow-recording` (or `CUA_RECORDING_ENABLED=1`);
+  the per-turn AT-SPI `app_state.json` dump additionally requires
+  `CUA_RECORDING_CAPTURE_AX=1`. Video captures the focused monitor via
   wlr-screencopy frames piped to ffmpeg. `cursor.jsonl` sampling
-  works via the Hyprland IPC `cursorpos` query (global logical
-  coords; empty on other Linux sessions).
+  works via the Hyprland IPC `cursorpos` query; samples are stored as
+  physical pixels local to the recorded (focused-at-start) monitor so
+  they line up with the video frame — samples while the cursor is on
+  another monitor are dropped, and the file is empty on other Linux
+  sessions.
 - **Permission caveat**: if `ecosystem:enforce_permissions` is
   enabled in the Hyprland config and screencopy is denied, captures
   silently return black "permission denied" frames — no error is

@@ -45,20 +45,23 @@ pub struct ClickElementResult {
 /// Platform-specific backend for the `page` tool.
 ///
 /// All methods take `(pid, window_id)` for consistency across actions.
-/// `bundle_id` is resolved by the backend if needed (macOS uses it for
-/// AppleScript routing; Windows/Linux ignore it).
+/// `window_id` is u64 to fit every platform's native id — Hyprland window
+/// addresses are full 64-bit pointers, Windows HWNDs are pointer-sized;
+/// macOS narrows to CGWindowID (u32) internally. `bundle_id` is resolved by
+/// the backend if needed (macOS uses it for AppleScript routing;
+/// Windows/Linux ignore it).
 #[async_trait]
 pub trait PageBackend: Send + Sync {
     /// Returns the visible text of the page (rough analog of
     /// `document.body.innerText`).
-    async fn get_text(&self, pid: i32, window_id: u32) -> anyhow::Result<String>;
+    async fn get_text(&self, pid: i32, window_id: u64) -> anyhow::Result<String>;
 
     /// Find elements matching `css_selector` and return a formatted-text
     /// response (same human-readable shape macOS already emits).
     async fn query_dom(
         &self,
         pid: i32,
-        window_id: u32,
+        window_id: u64,
         css_selector: &str,
         attributes: &[String],
     ) -> anyhow::Result<String>;
@@ -68,7 +71,7 @@ pub trait PageBackend: Send + Sync {
     async fn execute_javascript(
         &self,
         pid: i32,
-        window_id: u32,
+        window_id: u64,
         javascript: &str,
     ) -> anyhow::Result<String>;
 
@@ -101,7 +104,7 @@ pub trait PageBackend: Send + Sync {
     async fn click_element(
         &self,
         _pid: i32,
-        _window_id: u32,
+        _window_id: u64,
         _selector: &str,
     ) -> anyhow::Result<ClickElementResult> {
         anyhow::bail!(
@@ -210,9 +213,11 @@ impl Tool for PageTool {
         // `pid` / `window_id` are resolved per-action: every action except
         // `enable_javascript_apple_events` needs both. We resolve once here
         // so each arm can `?` on the Result and we get matching error text.
-        // Narrowing casts use `TryFrom` so out-of-range JSON numbers fail
-        // with an actionable error instead of silently truncating to the
-        // wrong process / window.
+        // The pid narrowing cast uses `TryFrom` so out-of-range JSON numbers
+        // fail with an actionable error instead of silently truncating to
+        // the wrong process. `window_id` stays the full u64 — native
+        // Hyprland window addresses exceed u32; platforms with narrower ids
+        // (macOS CGWindowID) narrow in their backend.
         let resolve_pid = |args: &Value| -> Result<i32, String> {
             let raw = args
                 .get("pid")
@@ -220,17 +225,14 @@ impl Tool for PageTool {
                 .ok_or_else(|| "Missing required parameter: pid".to_owned())?;
             i32::try_from(raw).map_err(|_| format!("Invalid parameter: pid {raw} out of i32 range"))
         };
-        let resolve_window_id = |args: &Value| -> Result<u32, String> {
-            let raw = args
-                .get("window_id")
+        let resolve_window_id = |args: &Value| -> Result<u64, String> {
+            args.get("window_id")
                 .and_then(|v| v.as_u64())
-                .ok_or_else(|| "Missing required parameter: window_id".to_owned())?;
-            u32::try_from(raw)
-                .map_err(|_| format!("Invalid parameter: window_id {raw} out of u32 range"))
+                .ok_or_else(|| "Missing required parameter: window_id".to_owned())
         };
 
         let (pid, window_id) = if action == "enable_javascript_apple_events" {
-            (0i32, 0u32) // unused
+            (0i32, 0u64) // unused
         } else {
             let pid = match resolve_pid(&args) {
                 Ok(v) => v,

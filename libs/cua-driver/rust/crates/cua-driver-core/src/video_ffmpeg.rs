@@ -20,6 +20,80 @@ use std::time::{Duration, Instant};
 
 use crate::video::{VideoBackend, VideoBackendFactory, VideoMetadata};
 
+/// Bytes of ffmpeg stderr kept for diagnostics (the failure detail is
+/// always at the end of the stream).
+const STDERR_TAIL_BYTES: usize = 4096;
+
+/// Drain ffmpeg's stderr on a thread so the pipe can't fill up and block
+/// the encoder, keeping a rolling tail of the last `STDERR_TAIL_BYTES`.
+/// Chunked reads cap memory at O(tail) for the whole session — a
+/// `read_to_end` would buffer everything ffmpeg prints until EOF.
+/// Public so platform ffmpeg pipelines (e.g. the Linux Wayland
+/// screencopy backend) reuse the same drain.
+pub fn spawn_stderr_drain(
+    mut stderr: std::process::ChildStderr,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || -> Vec<u8> {
+        use std::io::Read;
+        let mut buf = Vec::with_capacity(STDERR_TAIL_BYTES);
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stderr.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    // Trim with slack so we don't memmove on every read.
+                    if buf.len() > STDERR_TAIL_BYTES * 2 {
+                        let excess = buf.len() - STDERR_TAIL_BYTES;
+                        buf.drain(..excess);
+                    }
+                }
+            }
+        }
+        if buf.len() > STDERR_TAIL_BYTES {
+            let excess = buf.len() - STDERR_TAIL_BYTES;
+            buf.drain(..excess);
+        }
+        buf
+    })
+}
+
+/// Fast-fail startup probe — surface stderr immediately when ffmpeg dies
+/// right after spawn (bad input device, missing codec, unwritable
+/// output). Without it the recording session would report a live video
+/// backend and record a useless empty mp4. Consumes `stderr_thread` on
+/// the death path (the tail goes into the error). Public so platform
+/// ffmpeg pipelines share the probe.
+pub fn probe_ffmpeg_startup(
+    child: &mut Child,
+    stderr_thread: &mut Option<std::thread::JoinHandle<Vec<u8>>>,
+) -> anyhow::Result<()> {
+    let probe_deadline = Instant::now() + Duration::from_millis(1500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let tail = stderr_thread
+                    .take()
+                    .map(|h| h.join().unwrap_or_default())
+                    .unwrap_or_default();
+                let tail_str = String::from_utf8_lossy(&tail);
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "ffmpeg exited immediately ({status}). stderr tail:\n{tail_str}"
+                );
+            }
+            Ok(None) => {
+                if Instant::now() >= probe_deadline {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => anyhow::bail!("ffmpeg try_wait failed: {e}"),
+        }
+    }
+}
+
 pub struct FfmpegVideoBackendFactory;
 
 impl VideoBackendFactory for FfmpegVideoBackendFactory {
@@ -85,44 +159,9 @@ impl FfmpegVideoBackend {
             anyhow::anyhow!("Failed to spawn ffmpeg ({}): {e}", ffmpeg.display())
         })?;
 
-        let stderr_thread = child.stderr.take().map(|mut stderr| {
-            std::thread::spawn(move || -> Vec<u8> {
-                use std::io::Read;
-                let mut buf = Vec::with_capacity(4096);
-                let _ = stderr.read_to_end(&mut buf);
-                let len = buf.len();
-                if len > 4096 {
-                    buf.drain(..len - 4096);
-                }
-                buf
-            })
-        });
+        let mut stderr_thread = child.stderr.take().map(spawn_stderr_drain);
 
-        // Fast-fail probe — surface stderr immediately when ffmpeg dies
-        // on startup (bad input device, missing codec). Without this the
-        // recording session would record a useless empty mp4.
-        let probe_deadline = Instant::now() + Duration::from_millis(1500);
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let tail = stderr_thread
-                        .map(|h| h.join().unwrap_or_default())
-                        .unwrap_or_default();
-                    let tail_str = String::from_utf8_lossy(&tail);
-                    let _ = child.kill();
-                    anyhow::bail!(
-                        "ffmpeg exited immediately ({status}). stderr tail:\n{tail_str}"
-                    );
-                }
-                Ok(None) => {
-                    if Instant::now() >= probe_deadline {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                Err(e) => anyhow::bail!("ffmpeg try_wait failed: {e}"),
-            }
-        }
+        probe_ffmpeg_startup(&mut child, &mut stderr_thread)?;
 
         Ok(FfmpegVideoBackend {
             child,
@@ -165,14 +204,19 @@ impl VideoBackend for FfmpegVideoBackend {
             }
         }
 
+        let mut error: Option<String> = None;
         if !finalized {
+            let mut detail = String::new();
             if let Some(handle) = self.stderr_thread.take() {
                 if let Ok(buf) = handle.join() {
-                    let tail = String::from_utf8_lossy(&buf);
-                    tracing::warn!(target: "recording",
-                        "ffmpeg did not finalize cleanly. Last stderr tail:\n{tail}");
+                    if !buf.is_empty() {
+                        detail = format!(". Last stderr tail:\n{}", String::from_utf8_lossy(&buf));
+                    }
                 }
             }
+            let msg = format!("ffmpeg did not finalize cleanly{detail}");
+            tracing::warn!(target: "recording", "{msg}");
+            error = Some(msg);
         } else if let Some(handle) = self.stderr_thread.take() {
             let _ = handle.join();
         }
@@ -181,6 +225,7 @@ impl VideoBackend for FfmpegVideoBackend {
             path: self.output_path,
             duration_ms: elapsed.as_millis() as u64,
             finalized,
+            error,
         })
     }
 }

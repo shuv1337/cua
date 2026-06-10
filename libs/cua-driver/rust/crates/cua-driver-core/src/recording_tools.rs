@@ -13,6 +13,7 @@
 //! stop|status`) and removes the "is this a setting write?" ambiguity of
 //! the old `set_*` name.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
@@ -37,6 +38,34 @@ pub fn init_replay_registry(weak: Weak<ToolRegistry>) {
 
 fn get_replay_registry() -> Option<Arc<ToolRegistry>> {
     REPLAY_REGISTRY.get()?.upgrade()
+}
+
+// ── Recording opt-in gate ─────────────────────────────────────────────────────
+//
+// Continuous capture (per-turn screenshots + AX dumps + optional video,
+// persisted to disk) is strictly more powerful than the on-demand
+// screenshot / get_window_state tools, so it is off by default: the
+// operator opts in by launching the daemon with `--allow-recording` or by
+// setting CUA_RECORDING_ENABLED=1. Without it, `start_recording` errors
+// and no per-turn capture can be enabled.
+
+static RECORDING_ALLOWED_FLAG: AtomicBool = AtomicBool::new(false);
+
+/// Called from `main.rs` when `--allow-recording` is on argv.
+pub fn allow_recording() {
+    RECORDING_ALLOWED_FLAG.store(true, Ordering::SeqCst);
+}
+
+/// True when recording capture was opted into via `--allow-recording` or
+/// `CUA_RECORDING_ENABLED=1` / `=true`.
+pub fn recording_allowed() -> bool {
+    RECORDING_ALLOWED_FLAG.load(Ordering::SeqCst)
+        || std::env::var("CUA_RECORDING_ENABLED")
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false)
 }
 
 // ── start_recording ──────────────────────────────────────────────────────────
@@ -84,7 +113,10 @@ impl Tool for StartRecordingTool {
                 carries the diagnostic.\n\n\
                 State persists for the life of the daemon / MCP session; a restart \
                 resets to disabled with no on-disk state. Call `stop_recording` to \
-                disable + finalize the mp4.".into(),
+                disable + finalize the mp4.\n\n\
+                **Opt-in required.** Continuous capture is off by default; this \
+                tool errors unless the daemon was started with `--allow-recording` \
+                or `CUA_RECORDING_ENABLED=1`.".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["output_dir"],
@@ -115,6 +147,13 @@ impl Tool for StartRecordingTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use crate::tool_args::ArgsExt;
+        if !recording_allowed() {
+            return ToolResult::error(
+                "Recording is disabled by default. Start the daemon with \
+                 --allow-recording (or set CUA_RECORDING_ENABLED=1) to opt in \
+                 to continuous per-turn capture.",
+            );
+        }
         let output_dir = args.opt_str("output_dir");
         if output_dir.as_deref().map(str::is_empty).unwrap_or(true) {
             return ToolResult::error("`output_dir` is required.");

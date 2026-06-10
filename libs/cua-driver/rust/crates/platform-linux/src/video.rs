@@ -15,14 +15,15 @@
 //! with video time (the render zoom pipeline depends on this).
 //!
 //! `LinuxVideoBackendFactory` picks per session: Wayland screencopy when
-//! `WAYLAND_DISPLAY` is set (falling back to x11grab if the Wayland path
-//! fails to start), else the core ffmpeg x11grab backend.
+//! `WAYLAND_DISPLAY` is set (deliberately NO x11grab fallback there — see
+//! the comment in `start()`; a failed Wayland start surfaces as an error
+//! in `session.json`), else the core ffmpeg x11grab backend.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -54,11 +55,31 @@ impl VideoBackendFactory for LinuxVideoBackendFactory {
     }
 }
 
+/// Capture-thread health, shared with `stop()` so capture-side failures
+/// land in structured `VideoMetadata.error` (→ `session.json`
+/// `video.error` / `last_error`) instead of only the log. Both cases
+/// would otherwise masquerade as healthy recordings: the feeder's EOF on
+/// persistent failure makes ffmpeg finalize a *truncated* mp4 cleanly,
+/// and a geometry freeze keeps producing a playable file whose frames
+/// after t=X are stale.
+#[derive(Default)]
+struct CaptureHealth {
+    /// Set when the feeder gave up (persistent capture failure): the mp4
+    /// is truncated and `duration_ms` misstates it — forces
+    /// `finalized: false`.
+    fatal: Option<String>,
+    /// Set on the first mid-recording output geometry change: the mp4
+    /// stays playable and wall-clock-aligned, but frames after the
+    /// freeze point duplicate the last good frame.
+    froze: Option<String>,
+}
+
 pub struct WaylandVideoBackend {
     child: Child,
     output_path: PathBuf,
     started_at: Instant,
     stop: Arc<AtomicBool>,
+    health: Arc<Mutex<CaptureHealth>>,
     capture_thread: Option<std::thread::JoinHandle<()>>,
     stderr_thread: Option<std::thread::JoinHandle<Vec<u8>>>,
 }
@@ -116,29 +137,30 @@ impl WaylandVideoBackend {
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn ffmpeg ({}): {e}", ffmpeg.display()))?;
 
-        let stderr_thread = child.stderr.take().map(|mut stderr| {
-            std::thread::spawn(move || -> Vec<u8> {
-                use std::io::Read;
-                let mut buf = Vec::with_capacity(4096);
-                let _ = stderr.read_to_end(&mut buf);
-                let len = buf.len();
-                if len > 4096 {
-                    buf.drain(..len - 4096);
-                }
-                buf
-            })
-        });
+        let mut stderr_thread = child
+            .stderr
+            .take()
+            .map(cua_driver_core::video_ffmpeg::spawn_stderr_drain);
+
+        // Fast-fail probe (shared with the core ffmpeg backend) — a spawn
+        // only proves the process launched, not that ffmpeg accepted the
+        // rawvideo args or could open the output. Without it a dead
+        // encoder would be reported as a started backend and session.json
+        // would carry video.present:true for a session with no video.
+        cua_driver_core::video_ffmpeg::probe_ffmpeg_startup(&mut child, &mut stderr_thread)?;
 
         let mut stdin = child.stdin.take().context("ffmpeg stdin unavailable")?;
         let stop = Arc::new(AtomicBool::new(false));
+        let health = Arc::new(Mutex::new(CaptureHealth::default()));
         let started_at = Instant::now();
 
         let capture_thread = {
             let stop = Arc::clone(&stop);
+            let health = Arc::clone(&health);
             let spawned = std::thread::Builder::new()
                 .name("wl-video-capture".into())
                 .spawn(move || {
-                    capture_loop(capturer, info, first_frame, &mut stdin, &stop, started_at);
+                    capture_loop(capturer, info, first_frame, &mut stdin, &stop, &health, started_at);
                     // Dropping stdin sends EOF — ffmpeg finalizes the mp4.
                     drop(stdin);
                 });
@@ -159,8 +181,9 @@ impl WaylandVideoBackend {
             output_path,
             started_at,
             stop,
+            health,
             capture_thread: Some(capture_thread),
-            stderr_thread: Some(stderr_thread).flatten(),
+            stderr_thread,
         })
     }
 }
@@ -174,6 +197,7 @@ fn capture_loop(
     mut latest: Vec<u8>,
     stdin: &mut std::process::ChildStdin,
     stop: &AtomicBool,
+    health: &Mutex<CaptureHealth>,
     started_at: Instant,
 ) {
     let mut scratch: Vec<u8> = Vec::with_capacity(latest.len());
@@ -219,12 +243,23 @@ fn capture_loop(
                 consecutive_failures = 0;
             }
             Ok(info) => {
-                tracing::warn!(target: "recording",
-                    "screencopy frame geometry changed ({}x{} -> {}x{}); freezing video frame",
-                    first_info.width, first_info.height, info.width, info.height);
                 // Output mode/scale changed mid-recording: the rawvideo
                 // geometry is fixed, so keep duplicating the last good
-                // frame rather than corrupting the stream.
+                // frame rather than corrupting the stream. Recorded once
+                // into health (first occurrence = freeze point) so stop()
+                // surfaces "video froze at t=X" in structured state.
+                let mut h = health.lock().unwrap();
+                if h.froze.is_none() {
+                    tracing::warn!(target: "recording",
+                        "screencopy frame geometry changed ({}x{} -> {}x{}); freezing video frame",
+                        first_info.width, first_info.height, info.width, info.height);
+                    h.froze = Some(format!(
+                        "video froze at t={}ms: output geometry changed ({}x{} -> {}x{}); \
+                         frames after this point duplicate the last good frame",
+                        started_at.elapsed().as_millis(),
+                        first_info.width, first_info.height, info.width, info.height,
+                    ));
+                }
                 consecutive_failures = 0;
             }
             Err(e) => {
@@ -232,6 +267,14 @@ fn capture_loop(
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                     tracing::warn!(target: "recording",
                         "screencopy capture failing persistently ({e:#}); stopping video frames");
+                    // Set BEFORE returning (the spawn closure drops stdin
+                    // right after, EOF-finalizing a truncated mp4) so
+                    // stop() always sees the failure after joining.
+                    health.lock().unwrap().fatal = Some(format!(
+                        "screencopy capture failing persistently ({e:#}); \
+                         video frames stopped at t={}ms",
+                        started_at.elapsed().as_millis(),
+                    ));
                     return;
                 }
             }
@@ -252,10 +295,12 @@ impl VideoBackend for WaylandVideoBackend {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.capture_thread.take() {
             // Bounded wait: the thread can be stuck in write_all against a
-            // wedged encoder, and stop() runs under the daemon-wide
-            // recording mutex — an unbounded join here would hang every
-            // recorded tool call. Killing ffmpeg breaks the pipe (EPIPE),
-            // which unblocks write_all and lets the thread exit.
+            // wedged encoder or inside capture_frame's libc::poll on the
+            // Wayland fd (the stop flag is only checked between captures),
+            // and stop() runs under the daemon-wide recording mutex — an
+            // unbounded join here would hang every recorded tool call.
+            // Killing ffmpeg breaks the pipe (EPIPE), which unblocks
+            // write_all and lets the thread exit.
             let deadline = Instant::now() + Duration::from_millis(3000);
             while !handle.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(20));
@@ -265,12 +310,28 @@ impl VideoBackend for WaylandVideoBackend {
                     "video capture thread stuck (encoder back-pressure?); killing ffmpeg");
                 let _ = self.child.kill();
             }
-            let _ = handle.join(); // drops ffmpeg stdin -> EOF
+            // The ffmpeg kill does NOT interrupt a Wayland poll — that only
+            // returns when capture_frame's internal deadline (4 s, see
+            // wayland_capture::CAPTURE_DEADLINE) expires. Bound this final
+            // join past that deadline with margin and leak the thread on
+            // expiry (the recording-hooks scratch threads set the precedent)
+            // rather than blocking the recording mutex; the try_wait loop
+            // below still reaps ffmpeg even when stdin never drops.
+            let join_deadline = Instant::now() + Duration::from_millis(5000);
+            while !handle.is_finished() && Instant::now() < join_deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if handle.is_finished() {
+                let _ = handle.join(); // stdin already dropped -> EOF sent
+            } else {
+                tracing::warn!(target: "recording",
+                    "video capture thread still blocked past the capture deadline; leaking it");
+            }
         }
 
         // Encoder flush on EOF; 4K ultrafast flush fits comfortably in 5 s.
         let deadline = Instant::now() + Duration::from_millis(5000);
-        let finalized;
+        let mut finalized;
         loop {
             match self.child.try_wait() {
                 Ok(Some(status)) => {
@@ -295,20 +356,45 @@ impl VideoBackend for WaylandVideoBackend {
             }
         }
 
+        // Capture-thread health beats ffmpeg's exit status: on persistent
+        // capture failure the feeder's early EOF makes ffmpeg finalize a
+        // truncated mp4 *cleanly*, so a successful exit must not report a
+        // healthy recording. A geometry freeze leaves the file playable
+        // (finalized stands) but the error still surfaces.
+        let mut error: Option<String> = None;
+        {
+            let h = self.health.lock().unwrap();
+            if let Some(fatal) = &h.fatal {
+                finalized = false;
+                error = Some(fatal.clone());
+            } else if let Some(froze) = &h.froze {
+                error = Some(froze.clone());
+            }
+        }
+
         if let Some(handle) = self.stderr_thread.take() {
             if let Ok(buf) = handle.join() {
                 if !finalized && !buf.is_empty() {
                     let tail = String::from_utf8_lossy(&buf);
                     tracing::warn!(target: "recording",
                         "ffmpeg did not finalize cleanly. Last stderr tail:\n{tail}");
+                    if error.is_none() {
+                        error = Some(format!(
+                            "ffmpeg did not finalize cleanly. Last stderr tail:\n{tail}"
+                        ));
+                    }
                 }
             }
+        }
+        if !finalized && error.is_none() {
+            error = Some("ffmpeg did not finalize cleanly".to_string());
         }
 
         Ok(VideoMetadata {
             path: self.output_path,
             duration_ms: elapsed.as_millis() as u64,
             finalized,
+            error,
         })
     }
 }

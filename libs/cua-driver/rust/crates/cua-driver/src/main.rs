@@ -11,6 +11,8 @@
 //!   --glide-ms     <f64>                  glide duration override
 //!   --dwell-ms     <f64>                  post-click dwell override
 //!   --idle-hide-ms <f64>                  idle-hide timeout override
+//!   --allow-recording                     opt in to `start_recording`
+//!                                         (env: CUA_RECORDING_ENABLED=1)
 //!
 //! ## macOS threading model
 //!
@@ -40,6 +42,13 @@ mod version_check;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Serialises every env-mutating test in this binary. `std::env::set_var`
+/// is process-global, so per-module locks are not enough: the `telemetry`
+/// and `version_check` test modules both redirect `HOME`/`USERPROFILE`
+/// and would race each other under the parallel test runner.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Set by the `Command::Mcp` arm when `--claude-code-computer-use-compat`
 /// is on argv. Read by `build_registry` / `build_registry_no_cursor` to
 /// pick which `screenshot` tool variant to register. Static keeps the
@@ -57,6 +66,17 @@ fn init_logging() {
                 .add_directive(tracing::Level::WARN.into()),
         )
         .init();
+}
+
+/// Continuous-capture opt-in: `start_recording` is rejected unless the
+/// daemon was launched with `--allow-recording` (checked once here) or
+/// `CUA_RECORDING_ENABLED=1` (read per-call in `recording_tools`). Keeps
+/// silent always-on screen+AX capture from being one unauthenticated tool
+/// call away for any local process that can reach the daemon.
+fn apply_recording_opt_in() {
+    if std::env::args().any(|a| a == "--allow-recording") {
+        cua_driver_core::recording_tools::allow_recording();
+    }
 }
 
 /// Fire the per-entry-point telemetry event (e.g. `cua_driver_mcp`,
@@ -166,6 +186,7 @@ fn build_macos_registry_with_compat(compat: bool) -> cua_driver_core::tool::Tool
 #[cfg(target_os = "macos")]
 fn main() {
     init_logging();
+    apply_recording_opt_in();
 
     // ── CLI subcommand dispatch ──────────────────────────────────────────────
     // Handled before AppKit init so `list-tools` / `describe` / `call` exit
@@ -530,6 +551,7 @@ fn main() {
 #[cfg(not(target_os = "macos"))]
 fn main() -> anyhow::Result<()> {
     init_logging();
+    apply_recording_opt_in();
 
     // ── CLI subcommand dispatch ──────────────────────────────────────────────
     // These commands create their own tokio runtimes internally, so they must
@@ -720,6 +742,23 @@ async fn async_main() -> anyhow::Result<()> {
 
 // ── Registry builder (non-macOS) ──────────────────────────────────────────
 
+/// Separate default-off opt-in for the per-turn AT-SPI app-state dump.
+/// `app_state.json` persists window titles and all UI element text to disk
+/// every recorded turn — the most sensitive at-rest artifact recording
+/// produces — so it requires `CUA_RECORDING_CAPTURE_AX=1` on top of the
+/// recording opt-in itself. When off, recording still writes screenshots +
+/// action.json but skips app_state.json (the snapshot hook is never
+/// registered).
+#[cfg(target_os = "linux")]
+fn ax_capture_enabled() -> bool {
+    std::env::var("CUA_RECORDING_CAPTURE_AX")
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(not(target_os = "macos"))]
 fn build_registry(cursor_cfg: cursor_overlay::CursorConfig) -> cua_driver_core::tool::ToolRegistry {
     let compat = CLAUDE_CODE_COMPAT.load(Ordering::SeqCst);
@@ -768,9 +807,11 @@ fn build_registry(cursor_cfg: cursor_overlay::CursorConfig) -> cua_driver_core::
         cua_driver_core::recording::set_click_marker_fn(|png_bytes, cx, cy| {
             platform_linux::capture::crosshair_png_bytes(png_bytes, cx, cy).ok()
         });
-        cua_driver_core::recording::set_ax_snapshot_fn(|window_id, pid| {
-            platform_linux::recording_hooks::app_state_json_for(window_id, pid)
-        });
+        if ax_capture_enabled() {
+            cua_driver_core::recording::set_ax_snapshot_fn(|window_id, pid| {
+                platform_linux::recording_hooks::app_state_json_for(window_id, pid)
+            });
+        }
         cua_driver_core::recording::set_element_bounds_fn(|wid, pid, idx| {
             platform_linux::recording_hooks::element_window_local_xy(wid, pid, idx)
         });
@@ -848,9 +889,11 @@ fn build_registry_no_cursor() -> cua_driver_core::tool::ToolRegistry {
         cua_driver_core::recording::set_click_marker_fn(|png_bytes, cx, cy| {
             platform_linux::capture::crosshair_png_bytes(png_bytes, cx, cy).ok()
         });
-        cua_driver_core::recording::set_ax_snapshot_fn(|window_id, pid| {
-            platform_linux::recording_hooks::app_state_json_for(window_id, pid)
-        });
+        if ax_capture_enabled() {
+            cua_driver_core::recording::set_ax_snapshot_fn(|window_id, pid| {
+                platform_linux::recording_hooks::app_state_json_for(window_id, pid)
+            });
+        }
         cua_driver_core::recording::set_element_bounds_fn(|wid, pid, idx| {
             platform_linux::recording_hooks::element_window_local_xy(wid, pid, idx)
         });

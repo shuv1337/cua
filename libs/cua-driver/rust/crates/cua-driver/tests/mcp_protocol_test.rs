@@ -760,6 +760,7 @@ fn test_recording_session() {
     let tmp_str = tmp_dir.to_string_lossy().to_string();
 
     let mut child = Command::new(&binary)
+        .env("CUA_RECORDING_ENABLED", "1") // recording is opt-in (default off)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
         .spawn().expect("spawn");
     let stdin = child.stdin.as_mut().unwrap();
@@ -830,6 +831,7 @@ fn test_recording_session_linux() {
     let tmp_str = tmp_dir.to_string_lossy().to_string();
 
     let mut child = Command::new(&binary)
+        .env("CUA_RECORDING_ENABLED", "1") // recording is opt-in (default off)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
         .spawn().expect("spawn");
     let stdin = child.stdin.as_mut().unwrap();
@@ -883,6 +885,48 @@ fn test_recording_session_linux() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn test_start_recording_requires_opt_in() {
+    //! Continuous capture is opt-in: without `--allow-recording` /
+    //! CUA_RECORDING_ENABLED the tool must error and leave the recorder
+    //! disabled.
+    let binary = binary_path();
+    if !binary.exists() { return; }
+
+    let mut child = Command::new(&binary)
+        .env_remove("CUA_RECORDING_ENABLED")
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+        .spawn().expect("spawn");
+    let stdin = child.stdin.as_mut().unwrap();
+    let mut stdout = BufReader::new(child.stdout.as_mut().unwrap());
+
+    send_request(stdin, &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+    read_response(&mut stdout);
+
+    send_request(stdin, &serde_json::json!({
+        "jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{"name":"start_recording","arguments":{
+            "output_dir":"/tmp/cua-driver-rs-rec-gate","record_video":false
+        }}
+    }));
+    let resp = read_response(&mut stdout);
+    assert!(resp["result"]["isError"].as_bool().unwrap_or(false),
+        "start_recording should error without the opt-in: {resp:?}");
+    let msg = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(msg.contains("--allow-recording"), "error should point at the opt-in flag: {msg}");
+
+    // Recorder must still report disabled.
+    send_request(stdin, &serde_json::json!({
+        "jsonrpc":"2.0","id":3,"method":"tools/call",
+        "params":{"name":"get_recording_state","arguments":{}}
+    }));
+    let resp = read_response(&mut stdout);
+    assert!(!resp["result"]["structuredContent"]["enabled"].as_bool().unwrap_or(true),
+        "recorder should stay disabled: {resp:?}");
+    child.kill().ok();
+}
+
+#[test]
 #[cfg(target_os = "macos")]
 fn test_recording_screenshot_capture() {
     //! When recording is active and a tool call includes a window_id, a screenshot.png
@@ -894,6 +938,7 @@ fn test_recording_screenshot_capture() {
     let tmp_str = tmp_dir.to_string_lossy().to_string();
 
     let mut child = Command::new(&binary)
+        .env("CUA_RECORDING_ENABLED", "1") // recording is opt-in (default off)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
         .spawn().expect("spawn");
     let stdin = child.stdin.as_mut().unwrap();
@@ -2029,6 +2074,7 @@ fn test_start_recording_record_video_flag_accepted() {
     std::fs::create_dir_all(&tmp_dir).unwrap();
 
     let mut child = Command::new(&binary)
+        .env("CUA_RECORDING_ENABLED", "1") // recording is opt-in (default off)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
         .spawn().expect("spawn");
     let stdin = child.stdin.as_mut().unwrap();
@@ -3012,6 +3058,7 @@ fn test_recording_session_windows() {
     let tmp_str = tmp_dir.to_string_lossy().to_string();
 
     let mut child = Command::new(&binary)
+        .env("CUA_RECORDING_ENABLED", "1") // recording is opt-in (default off)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
         .spawn().expect("spawn");
     let stdin = child.stdin.as_mut().unwrap();
@@ -3263,6 +3310,7 @@ fn test_start_recording_record_video_flag_accepted_windows() {
     std::fs::create_dir_all(&tmp_dir).unwrap();
 
     let mut child = Command::new(&binary)
+        .env("CUA_RECORDING_ENABLED", "1") // recording is opt-in (default off)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
         .spawn().expect("spawn");
     let stdin = child.stdin.as_mut().unwrap();

@@ -27,6 +27,13 @@ struct HyprClient {
     size: [i32; 2],
     #[serde(default)]
     monitor: Option<i64>,
+    #[serde(default)]
+    workspace: Option<HyprWorkspaceRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HyprWorkspaceRef {
+    id: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,6 +44,8 @@ struct HyprMonitor {
     scale: f64,
     #[serde(default)]
     focused: bool,
+    #[serde(default, rename = "activeWorkspace")]
+    active_workspace: Option<HyprWorkspaceRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,29 +58,73 @@ pub fn list_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     list_windows_inner(filter_pid).unwrap_or_default()
 }
 
+/// How a per-window capture was obtained. `RegionCrop` pixels come from the
+/// live composited screen at the window's geometry — unlike a true
+/// `ToplevelExport` surface copy they can show overlapping windows, so
+/// callers surfacing the image to a user/LLM should attach a warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureMethod {
+    ToplevelExport,
+    RegionCrop,
+}
+
+/// True while a previous toplevel-export scratch thread has not finished.
+/// The capture is fully deadline-bounded now, so this should never stay set;
+/// it caps the damage at one outstanding thread+connection if something
+/// unforeseen (e.g. a blocking AF_UNIX connect) wedges a worker anyway.
+static TOPLEVEL_CAPTURE_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Per-window screenshot. Tries hyprland-toplevel-export first (true
 /// surface capture: correct content for occluded/background windows and
 /// windows on other workspaces), falling back to a grim screen-region crop
 /// of the client geometry when the protocol path is unavailable.
-///
-/// The protocol capture runs on a bounded scratch thread: the frame
-/// dispatch loops are deadline-bounded internally, but the initial
-/// connect/registry handshake is not, and this function is called
-/// synchronously from the recording write path — a wedged compositor must
-/// cost at most the timeout, not a hang.
 pub fn screenshot_window_bytes(window_id: u64) -> Result<Vec<u8>> {
+    screenshot_window_bytes_with_provenance(window_id).map(|(png, _)| png)
+}
+
+/// Like [`screenshot_window_bytes`] but reports which capture method
+/// produced the pixels, so tool surfaces can warn about region crops.
+///
+/// The protocol capture runs on a bounded scratch thread: both the
+/// connect/registry handshake and the frame dispatch loops are
+/// deadline-bounded in `wayland_capture`, and this function is called
+/// synchronously from the recording write path — a wedged compositor must
+/// cost at most the timeout, not a hang or a leaked thread.
+pub fn screenshot_window_bytes_with_provenance(
+    window_id: u64,
+) -> Result<(Vec<u8>, CaptureMethod)> {
+    use std::sync::atomic::Ordering;
+
+    if TOPLEVEL_CAPTURE_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        tracing::debug!(
+            "previous toplevel-export capture still in flight; \
+             using grim region crop for 0x{window_id:x}"
+        );
+        return screenshot_window_bytes_grim(window_id)
+            .map(|png| (png, CaptureMethod::RegionCrop));
+    }
+
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let spawn = std::thread::Builder::new().name("wl-shot".into()).spawn(move || {
-        let _ = tx.send(crate::wayland_capture::capture_toplevel_png(window_id));
+        let result = crate::wayland_capture::capture_toplevel_png(window_id);
+        TOPLEVEL_CAPTURE_IN_FLIGHT.store(false, Ordering::Release);
+        let _ = tx.send(result);
     });
     let result = match spawn {
         Ok(_) => rx
             .recv_timeout(Duration::from_secs(6))
             .map_err(|_| anyhow::anyhow!("toplevel-export capture timed out")),
-        Err(e) => Err(anyhow::anyhow!("capture thread spawn failed: {e}")),
+        Err(e) => {
+            TOPLEVEL_CAPTURE_IN_FLIGHT.store(false, Ordering::Release);
+            Err(anyhow::anyhow!("capture thread spawn failed: {e}"))
+        }
     };
     match result {
-        Ok(Ok(png)) => return Ok(png),
+        Ok(Ok(png)) => return Ok((png, CaptureMethod::ToplevelExport)),
         Ok(Err(e)) => {
             tracing::debug!(
                 "toplevel-export capture failed for 0x{window_id:x} ({e:#}); \
@@ -85,7 +138,7 @@ pub fn screenshot_window_bytes(window_id: u64) -> Result<Vec<u8>> {
             );
         }
     }
-    screenshot_window_bytes_grim(window_id)
+    screenshot_window_bytes_grim(window_id).map(|png| (png, CaptureMethod::RegionCrop))
 }
 
 fn screenshot_window_bytes_grim(window_id: u64) -> Result<Vec<u8>> {
@@ -95,6 +148,31 @@ fn screenshot_window_bytes_grim(window_id: u64) -> Result<Vec<u8>> {
         .ok_or_else(|| anyhow::anyhow!("Hyprland client 0x{window_id:x} not found"))?;
     if client.size[0] <= 1 || client.size[1] <= 1 {
         bail!("Hyprland client 0x{window_id:x} has invalid geometry");
+    }
+    // grim has no window concept: -g crops the live composited output at
+    // these screen coordinates. If the client's workspace is not the active
+    // one on its monitor, the crop would return unrelated screen content
+    // that looks like a faithful capture — refuse instead, so callers
+    // degrade to "no frame" rather than storing a wrong one. (A window on
+    // the active workspace but occluded can still be cropped to the
+    // covering window's pixels; that residual is why callers get
+    // CaptureMethod::RegionCrop provenance.)
+    if let (Some(workspace), Some(monitor_id)) = (&client.workspace, client.monitor) {
+        let active = monitors().ok().and_then(|ms| {
+            ms.into_iter()
+                .find(|m| m.id == monitor_id)
+                .and_then(|m| m.active_workspace)
+        });
+        if let Some(active) = active {
+            if active.id != workspace.id {
+                bail!(
+                    "Hyprland client 0x{window_id:x} is on workspace {} but its monitor \
+                     shows workspace {}; a grim region crop would capture unrelated content",
+                    workspace.id,
+                    active.id
+                );
+            }
+        }
     }
 
     let geometry = format!(
@@ -194,15 +272,25 @@ fn hyprctl_dispatch(arg: &str) -> bool {
 }
 
 /// Preserve the active window across an app launch: snapshot the focused
-/// window now and watch — for the next ~2 s — for focus moving to a
-/// window that did not exist before the launch, putting it back.
+/// window now and watch — for the next ~3 s — for a launch-induced focus
+/// grab, putting the previous window back.
 ///
 /// Hyprland focuses newly mapped windows by default; the driver's contract
 /// is that the user's frontmost window must not change, so launch_app
-/// restores it. Only focus grabs by NEW windows are reverted — a user
-/// alt-tabbing to a pre-existing window during the watch window is left
-/// alone. Detached and best-effort: if the previous window closed or
-/// hyprctl fails, focus is simply left alone.
+/// restores it. Two phases distinguish launch-induced grabs from a user
+/// alt-tab during the watch:
+///
+/// - For the first ~700 ms ANY focus change away from the snapshot is
+///   reverted, including to a pre-existing window — xdg-open handing a URL
+///   to an already-running browser raises that browser's EXISTING toplevel
+///   within a few hundred ms, while a deliberate human alt-tab in that
+///   sliver is improbable.
+/// - After that, only focus grabs by NEW windows (slow app cold-starts) are
+///   reverted, so a user alt-tabbing to a pre-existing window later in the
+///   watch is left alone.
+///
+/// Detached and best-effort: if the previous window closed or hyprctl
+/// fails, focus is simply left alone.
 pub fn spawn_focus_restore_guard() {
     if !is_hyprland_session() {
         return;
@@ -216,13 +304,17 @@ pub fn spawn_focus_restore_guard() {
         .filter_map(|c| parse_address(&c.address))
         .collect();
     std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        const EARLY_RESTORE: Duration = Duration::from_millis(700);
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(3);
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
             match active_window_address() {
-                Some(current) if current != previous && !preexisting.contains(&current) => {
-                    focus_window(previous);
-                    return;
+                Some(current) if current != previous => {
+                    if start.elapsed() < EARLY_RESTORE || !preexisting.contains(&current) {
+                        focus_window(previous);
+                        return;
+                    }
                 }
                 _ => {}
             }

@@ -158,6 +158,8 @@ impl VideoBackend for SckitVideoBackend {
             path: self.output_path,
             duration_ms: elapsed.as_millis() as u64,
             finalized,
+            error: (!finalized)
+                .then(|| "SCStream::stop_capture failed; recording.mp4 may be incomplete".into()),
         })
     }
 }

@@ -13,13 +13,15 @@
 //! - **Full output**: `wlr-screencopy-unstable-v1` for repeated frame
 //!   capture feeding the video recording backend (`crate::video`).
 //!
-//! Frame dispatch loops are deadline-bounded: `copy` with `ignore_damage=0`
+//! Every dispatch loop is deadline-bounded: `copy` with `ignore_damage=0`
 //! waits for window damage and would hang forever on an idle window, and a
-//! wedged compositor must not stall the recording hook path. (The initial
-//! `connect`/`registry_queue_init`/roundtrip handshakes still use the
-//! library's blocking calls — callers on latency-sensitive paths should
-//! wrap captures in a bounded scratch thread, as `hyprland.rs` does for
-//! the screenshot path.) Captures are one connection per call (cheap,
+//! wedged compositor must not stall the recording hook path. The initial
+//! connect/registry handshakes go through the same bounded dispatch
+//! (`connect_bounded` / `roundtrip_bounded`) instead of the library's
+//! blocking `registry_queue_init`/`roundtrip`, so a wedged compositor
+//! costs at most the deadline — scratch threads like `hyprland.rs`'s
+//! screenshot worker always terminate instead of leaking a thread plus
+//! connection per capture. Captures are one connection per call (cheap,
 //! thread-safe); the video capturer keeps one connection plus a reusable
 //! shm pool across frames.
 //!
@@ -34,9 +36,10 @@ use std::os::unix::fs::FileExt;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use wayland_client::globals::{registry_queue_init, GlobalListContents};
+use wayland_client::globals::Global;
 use wayland_client::protocol::{
     wl_buffer::WlBuffer,
+    wl_callback,
     wl_output::{self, WlOutput},
     wl_registry,
     wl_shm::{self, WlShm},
@@ -94,6 +97,10 @@ struct CaptureState {
     failed: bool,
     /// wl_output name events, keyed by the bind-time index user data.
     output_names: std::collections::HashMap<usize, String>,
+    /// Globals advertised during the bounded registry handshake.
+    globals: Vec<Global>,
+    /// Set when the wl_callback of the in-progress bounded roundtrip fires.
+    sync_done: bool,
 }
 
 impl CaptureState {
@@ -116,15 +123,34 @@ pub struct RawFrame {
     pub data: Vec<u8>,
 }
 
-impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for CaptureState {
+impl Dispatch<wl_registry::WlRegistry, ()> for CaptureState {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _proxy: &wl_registry::WlRegistry,
-        _event: wl_registry::Event,
-        _data: &GlobalListContents,
+        event: wl_registry::Event,
+        _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
+        if let wl_registry::Event::Global { name, interface, version } = event {
+            state.globals.push(Global { name, interface, version });
+        }
+    }
+}
+
+/// wl_display.sync callback used by `roundtrip_bounded`.
+impl Dispatch<wl_callback::WlCallback, ()> for CaptureState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            state.sync_done = true;
+        }
     }
 }
 
@@ -256,6 +282,61 @@ fn dispatch_until(
     }
 }
 
+/// `EventQueue::roundtrip` with a hard deadline: issue a `wl_display.sync`
+/// and dispatch until its callback fires. The library's own roundtrip blocks
+/// without bound, which is exactly what a wedged compositor must not cost.
+fn roundtrip_bounded(
+    conn: &Connection,
+    queue: &mut EventQueue<CaptureState>,
+    state: &mut CaptureState,
+    deadline: Instant,
+    what: &str,
+) -> Result<()> {
+    state.sync_done = false;
+    let qh = queue.handle();
+    conn.display().sync(&qh, ());
+    dispatch_until(queue, state, deadline, what, |s| s.sync_done)
+}
+
+/// Deadline-bounded replacement for `registry_queue_init`: connect, request
+/// the registry, and drive global enumeration through `dispatch_until`. The
+/// AF_UNIX connect itself is fast in practice; the part that can park forever
+/// on a wedged-but-accepting compositor is the registry roundtrip, which is
+/// bounded here.
+fn connect_bounded(
+    deadline: Instant,
+) -> Result<(Connection, EventQueue<CaptureState>, CaptureState, wl_registry::WlRegistry)> {
+    let conn = Connection::connect_to_env().context("WAYLAND_DISPLAY connect failed")?;
+    let mut queue = conn.new_event_queue();
+    let qh = queue.handle();
+    let registry = conn.display().get_registry(&qh, ());
+    let mut state = CaptureState::default();
+    roundtrip_bounded(&conn, &mut queue, &mut state, deadline, "wl_registry global enumeration")?;
+    Ok((conn, queue, state, registry))
+}
+
+/// Bind a global enumerated by `connect_bounded`, mirroring
+/// `GlobalList::bind`'s version contract (errors when the global is missing
+/// or older than the requested minimum; binds at most the requested maximum).
+fn bind_global<I>(
+    registry: &wl_registry::WlRegistry,
+    state: &CaptureState,
+    qh: &QueueHandle<CaptureState>,
+    versions: std::ops::RangeInclusive<u32>,
+) -> Result<I>
+where
+    I: wayland_client::Proxy + 'static,
+    CaptureState: Dispatch<I, ()> + 'static,
+{
+    let iface = I::interface().name;
+    let global = state
+        .globals
+        .iter()
+        .find(|g| g.interface == iface && g.version >= *versions.start())
+        .ok_or_else(|| anyhow::anyhow!("compositor lacks {iface} (>= v{})", versions.start()))?;
+    Ok(registry.bind(global.name, global.version.min(*versions.end()), qh, ()))
+}
+
 // ---------------------------------------------------------------------------
 // wl_shm helpers
 // ---------------------------------------------------------------------------
@@ -271,6 +352,37 @@ fn create_shm_file(len: u64) -> Result<File> {
     let file = unsafe { File::from_raw_fd(fd) };
     file.set_len(len).context("ftruncate on memfd failed")?;
     Ok(file)
+}
+
+/// Hard cap on one frame's shm allocation — comfortably covers 8K at 32bpp
+/// while rejecting bogus compositor-advertised dimensions. Staying below
+/// `i32::MAX` also keeps the `len as i32` cast in `ShmBuffer::create`
+/// lossless.
+const MAX_FRAME_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Validate compositor-advertised buffer params before any allocation or row
+/// slicing. The params arrive unvalidated from the frame's `buffer` event; a
+/// buggy compositor advertising `stride < width*4` would otherwise panic the
+/// row-copy slices, and an enormous `stride*height` would drive an unbounded
+/// memfd reservation.
+fn validate_shm_params(params: (wl_shm::Format, u32, u32, u32)) -> Result<()> {
+    let (_format, width, height, stride) = params;
+    if width == 0 || height == 0 || stride == 0 {
+        bail!("compositor advertised degenerate shm params {width}x{height} stride {stride}");
+    }
+    if width > i32::MAX as u32 || height > i32::MAX as u32 || stride > i32::MAX as u32 {
+        bail!("compositor advertised shm params out of i32 range: {width}x{height} stride {stride}");
+    }
+    // All supported wl_shm formats here are 32-bit (4 bytes per pixel).
+    let min_stride = width as u64 * 4;
+    if (stride as u64) < min_stride {
+        bail!("compositor advertised stride {stride} < width*4 ({min_stride})");
+    }
+    let total = stride as u64 * height as u64; // both <= i32::MAX — no overflow
+    if total > MAX_FRAME_BYTES {
+        bail!("frame buffer of {total} bytes ({width}x{height} stride {stride}) exceeds the {MAX_FRAME_BYTES}-byte cap");
+    }
+    Ok(())
 }
 
 struct ShmBuffer {
@@ -302,16 +414,27 @@ impl ShmBuffer {
 }
 
 /// Copy shm rows into a tightly packed buffer, dropping stride padding and
-/// un-flipping when the compositor reported y_invert.
-fn pack_rows(raw: &[u8], width: u32, height: u32, stride: u32, y_invert: bool) -> Vec<u8> {
+/// un-flipping when the compositor reported y_invert. Row bounds are checked
+/// (rather than panic-sliced) as belt-and-suspenders behind
+/// `validate_shm_params`.
+fn pack_rows(raw: &[u8], width: u32, height: u32, stride: u32, y_invert: bool) -> Result<Vec<u8>> {
     let row_bytes = width as usize * 4;
     let mut out = Vec::with_capacity(row_bytes * height as usize);
     for y in 0..height as usize {
         let src_y = if y_invert { height as usize - 1 - y } else { y };
         let start = src_y * stride as usize;
-        out.extend_from_slice(&raw[start..start + row_bytes]);
+        let row = raw
+            .get(start..start + row_bytes)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "shm buffer ({} bytes) too small for advertised geometry \
+                     {width}x{height} stride {stride}",
+                    raw.len()
+                )
+            })?;
+        out.extend_from_slice(row);
     }
-    out
+    Ok(out)
 }
 
 /// Convert a packed frame to RGBA8 in place semantics (returns a new Vec).
@@ -372,19 +495,18 @@ pub fn toplevel_handle(address: u64) -> u32 {
 /// physical pixels at the window's render scale (a 1.5x-scaled 800x600
 /// window yields a 1200x900 frame).
 pub fn capture_toplevel_frame(address: u64, overlay_cursor: bool) -> Result<RawFrame> {
-    let conn = Connection::connect_to_env().context("WAYLAND_DISPLAY connect failed")?;
-    let (globals, mut queue) = registry_queue_init::<CaptureState>(&conn)
-        .context("wl_registry global enumeration failed")?;
+    // One deadline covers the registry handshake AND both frame phases, so
+    // the whole call — and any scratch thread running it — is bounded.
+    let deadline = Instant::now() + CAPTURE_DEADLINE;
+    let (_conn, mut queue, mut state, registry) = connect_bounded(deadline)?;
     let qh = queue.handle();
 
-    let shm: WlShm = globals.bind(&qh, 1..=1, ()).context("compositor lacks wl_shm")?;
-    let manager: HyprlandToplevelExportManagerV1 = globals
-        .bind(&qh, 1..=2, ())
+    let shm: WlShm = bind_global(&registry, &state, &qh, 1..=1)?;
+    let manager: HyprlandToplevelExportManagerV1 = bind_global(&registry, &state, &qh, 1..=2)
         .context("compositor lacks hyprland_toplevel_export_manager_v1 (not Hyprland?)")?;
 
     let handle = toplevel_handle(address);
-    let mut state = CaptureState::default();
-    let deadline = Instant::now() + CAPTURE_DEADLINE;
+    state.reset_frame();
     let frame = manager.capture_toplevel(overlay_cursor as i32, handle, &qh, ());
 
     // Phase 1: buffer params (buffer → buffer_done).
@@ -399,6 +521,10 @@ pub fn capture_toplevel_frame(address: u64, overlay_cursor: bool) -> Result<RawF
         frame.destroy();
         bail!("compositor offered no wl_shm buffer params");
     };
+    if let Err(e) = validate_shm_params(params) {
+        frame.destroy();
+        return Err(e);
+    }
 
     // Phase 2: copy. ignore_damage=1 — with 0 the copy waits for window
     // damage and hangs forever on an idle window.
@@ -431,7 +557,7 @@ pub fn capture_toplevel_frame(address: u64, overlay_cursor: bool) -> Result<RawF
             width,
             height,
             format,
-            data: pack_rows(&raw, width, height, stride, state.y_invert),
+            data: pack_rows(&raw, width, height, stride, state.y_invert)?,
         })
     })();
     shm_buf.destroy();
@@ -475,22 +601,20 @@ pub struct ScreencopyCapturer {
 impl ScreencopyCapturer {
     /// Connect and select an output: `prefer_name` (e.g. the focused Hyprland
     /// monitor) when it matches a wl_output name, else the first output.
+    /// The whole handshake is deadline-bounded so a wedged compositor cannot
+    /// park the caller indefinitely.
     pub fn open(prefer_name: Option<&str>) -> Result<Self> {
-        let conn = Connection::connect_to_env().context("WAYLAND_DISPLAY connect failed")?;
-        let (globals, mut queue) = registry_queue_init::<CaptureState>(&conn)
-            .context("wl_registry global enumeration failed")?;
+        let deadline = Instant::now() + CAPTURE_DEADLINE;
+        let (conn, mut queue, mut state, registry) = connect_bounded(deadline)?;
         let qh = queue.handle();
 
-        let shm: WlShm = globals.bind(&qh, 1..=1, ()).context("compositor lacks wl_shm")?;
-        let manager: ZwlrScreencopyManagerV1 = globals
-            .bind(&qh, 3..=3, ())
+        let shm: WlShm = bind_global(&registry, &state, &qh, 1..=1)?;
+        let manager: ZwlrScreencopyManagerV1 = bind_global(&registry, &state, &qh, 3..=3)
             .context("compositor lacks zwlr_screencopy_manager_v1 (v3)")?;
 
-        let registry = globals.registry();
-        let outputs: Vec<WlOutput> = globals
-            .contents()
-            .clone_list()
-            .into_iter()
+        let outputs: Vec<WlOutput> = state
+            .globals
+            .iter()
             .filter(|g| g.interface == "wl_output")
             .enumerate()
             .map(|(idx, g)| registry.bind(g.name, g.version.min(4), &qh, idx))
@@ -499,9 +623,8 @@ impl ScreencopyCapturer {
             bail!("compositor advertises no wl_output");
         }
 
-        let mut state = CaptureState::default();
-        // Collect `name` events so prefer_name can match.
-        queue.roundtrip(&mut state).context("wl_output roundtrip failed")?;
+        // Collect `name` events so prefer_name can match (bounded).
+        roundtrip_bounded(&conn, &mut queue, &mut state, deadline, "wl_output name events")?;
 
         let chosen = prefer_name
             .and_then(|want| {
@@ -555,6 +678,10 @@ impl ScreencopyCapturer {
             frame.destroy();
             bail!("compositor offered no wl_shm buffer params");
         };
+        if let Err(e) = validate_shm_params(params) {
+            frame.destroy();
+            return Err(e);
+        }
 
         // (Re)create the pool when params change (first frame, mode switch).
         let recreate = self.shm_buf.as_ref().map(|b| b.params != params).unwrap_or(true);
@@ -605,7 +732,14 @@ impl ScreencopyCapturer {
         for y in 0..height as usize {
             let src_y = if self.state.y_invert { height as usize - 1 - y } else { y };
             let start = src_y * stride as usize;
-            out.extend_from_slice(&self.raw[start..start + row_bytes]);
+            let row = self.raw.get(start..start + row_bytes).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "shm buffer ({} bytes) too small for advertised geometry \
+                     {width}x{height} stride {stride}",
+                    self.raw.len()
+                )
+            })?;
+            out.extend_from_slice(row);
         }
         Ok(FrameInfo { width, height, format })
     }
@@ -639,7 +773,7 @@ mod tests {
             1, 1, 1, 1, 2, 2, 2, 2, 99, 99, 99, 99, // row 0 + pad
             3, 3, 3, 3, 4, 4, 4, 4, 99, 99, 99, 99, // row 1 + pad
         ];
-        let packed = pack_rows(&raw, 2, 2, 12, false);
+        let packed = pack_rows(&raw, 2, 2, 12, false).unwrap();
         assert_eq!(packed, vec![1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4]);
     }
 
@@ -649,8 +783,30 @@ mod tests {
             1, 1, 1, 1, // row 0
             2, 2, 2, 2, // row 1
         ];
-        let packed = pack_rows(&raw, 1, 2, 4, true);
+        let packed = pack_rows(&raw, 1, 2, 4, true).unwrap();
         assert_eq!(packed, vec![2, 2, 2, 2, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn pack_rows_errors_instead_of_panicking_on_short_buffer() {
+        // stride (4) < width*4 (8): the second half of each row is missing.
+        let raw: Vec<u8> = vec![0; 8];
+        assert!(pack_rows(&raw, 2, 2, 4, false).is_err());
+    }
+
+    #[test]
+    fn validate_shm_params_rejects_hostile_geometry() {
+        use wl_shm::Format;
+        let ok = |w, h, s| validate_shm_params((Format::Xrgb8888, w, h, s));
+        assert!(ok(1920, 1080, 1920 * 4).is_ok());
+        // 8K still fits under the cap.
+        assert!(ok(7680, 4320, 7680 * 4).is_ok());
+        assert!(ok(0, 1080, 4).is_err()); // zero width
+        assert!(ok(1920, 0, 1920 * 4).is_err()); // zero height
+        assert!(ok(1920, 1080, 0).is_err()); // zero stride
+        assert!(ok(1920, 1080, 1920 * 4 - 1).is_err()); // stride < width*4
+        assert!(ok(u32::MAX, 1, u32::MAX).is_err()); // i32 wrap
+        assert!(ok(8192, u32::MAX / 2, 8192 * 4).is_err()); // total over cap
     }
 
     #[test]
