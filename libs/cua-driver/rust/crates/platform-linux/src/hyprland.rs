@@ -339,7 +339,7 @@ fn enforce_background_placement(pid: u32) -> usize {
     for c in clients().unwrap_or_default() {
         if c.pid == pid as i64 && c.workspace.as_ref().is_some_and(|w| w.id >= 0) {
             if let Some(addr) = parse_address(&c.address) {
-                if move_window_to_workspace_silent(addr, BACKGROUND_WORKSPACE) {
+                if move_window_to_background_workspace(addr) {
                     moved += 1;
                 }
             }
@@ -363,13 +363,28 @@ fn spawn_background_placement_guard(pid: u32, watch: Duration) {
     });
 }
 
-/// Move a window (by Hyprland client address) onto `workspace` without
-/// switching to it. Modern (≥0.55) Lua grammar first (verified live:
-/// `hl.dsp.window.move({ workspace = …, window = 'address:…', silent =
-/// true })` → ok), legacy `movetoworkspacesilent` fallback.
-pub fn move_window_to_workspace_silent(address: u64, workspace: &str) -> bool {
+/// Move a window (by Hyprland client address) onto [`BACKGROUND_WORKSPACE`]
+/// without revealing it.
+///
+/// On Hyprland ≥0.55 `hl.dsp.window.move` ALWAYS reveals the target special
+/// workspace — a `silent = true` key is accepted but ignored (verified
+/// live), so a plain move would pop the hidden workspace over the user's
+/// session. The modern path is therefore an atomic Lua script: move, then
+/// re-hide the overlay if (and only if) it now shows OUR workspace, all
+/// inside one compositor dispatch so no frame is ever rendered with the
+/// overlay visible. It returns `hl.dsp.no_op()` so hyprctl answers "ok".
+/// Older releases fall back to legacy `movetoworkspacesilent`, which is
+/// silent natively.
+pub fn move_window_to_background_workspace(address: u64) -> bool {
+    let workspace = BACKGROUND_WORKSPACE;
+    let name = workspace.trim_start_matches("special:");
     let modern = format!(
-        "hl.dsp.window.move({{ workspace = '{workspace}', window = 'address:0x{address:x}', silent = true }})"
+        "(function() \
+         hl.dispatch(hl.dsp.window.move({{ workspace = '{workspace}', window = 'address:0x{address:x}' }})) \
+         local sp = hl.get_active_special_workspace() \
+         if sp ~= nil and tostring(sp):find('{workspace}', 1, true) then \
+         hl.dispatch(hl.dsp.workspace.toggle_special('{name}')) end \
+         return hl.dsp.no_op() end)()"
     );
     if hyprctl_dispatch(&modern) {
         return true;
