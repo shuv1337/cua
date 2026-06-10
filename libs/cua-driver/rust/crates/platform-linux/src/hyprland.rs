@@ -310,13 +310,71 @@ pub fn launch_on_special_workspace(shell_cmd: &str) -> Result<Option<WindowInfo>
         if fresh.is_empty() {
             continue;
         }
-        let on_special = fresh
+        let found = fresh
             .iter()
             .find(|w| w.workspace_id.is_some_and(|id| id < 0))
-            .cloned();
-        return Ok(Some(on_special.unwrap_or_else(|| fresh[0].clone())));
+            .cloned()
+            .unwrap_or_else(|| fresh[0].clone());
+        // The exec rule only covers the FIRST window the spawned pid maps.
+        // Apps with a splash screen burn the rule on the splash and map
+        // their real main frame onto the user's active workspace seconds
+        // later (observed: PrusaSlicer 2.9.5 — splash got special:cua, main
+        // frame arrived on the active workspace ~6 s in). Sweep the pid's
+        // windows back now and keep enforcing from a detached guard while
+        // the app finishes starting up.
+        if let Some(pid) = found.pid {
+            enforce_background_placement(pid);
+            spawn_background_placement_guard(pid, Duration::from_secs(20));
+        }
+        return Ok(Some(found));
     }
     Ok(None)
+}
+
+/// Silently move every non-special-workspace window of `pid` onto
+/// [`BACKGROUND_WORKSPACE`]. One enforcement pass; returns how many windows
+/// were moved.
+fn enforce_background_placement(pid: u32) -> usize {
+    let mut moved = 0;
+    for c in clients().unwrap_or_default() {
+        if c.pid == pid as i64 && c.workspace.as_ref().is_some_and(|w| w.id >= 0) {
+            if let Some(addr) = parse_address(&c.address) {
+                if move_window_to_workspace_silent(addr, BACKGROUND_WORKSPACE) {
+                    moved += 1;
+                }
+            }
+        }
+    }
+    moved
+}
+
+/// Detached follow-up for [`launch_on_special_workspace`]: keep sweeping the
+/// launched pid's windows onto the background workspace for `watch`, so a
+/// main frame that maps after the splash consumed the exec rule still ends
+/// up hidden instead of on the user's active workspace. Best-effort, same
+/// spirit as [`spawn_focus_restore_guard`].
+fn spawn_background_placement_guard(pid: u32, watch: Duration) {
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + watch;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(300));
+            enforce_background_placement(pid);
+        }
+    });
+}
+
+/// Move a window (by Hyprland client address) onto `workspace` without
+/// switching to it. Modern (≥0.55) Lua grammar first (verified live:
+/// `hl.dsp.window.move({ workspace = …, window = 'address:…', silent =
+/// true })` → ok), legacy `movetoworkspacesilent` fallback.
+pub fn move_window_to_workspace_silent(address: u64, workspace: &str) -> bool {
+    let modern = format!(
+        "hl.dsp.window.move({{ workspace = '{workspace}', window = 'address:0x{address:x}', silent = true }})"
+    );
+    if hyprctl_dispatch(&modern) {
+        return true;
+    }
+    hyprctl_dispatch(&format!("movetoworkspacesilent {workspace},address:0x{address:x}"))
 }
 
 /// `hyprctl dispatch exec` with a window-rule prefix, speaking both
