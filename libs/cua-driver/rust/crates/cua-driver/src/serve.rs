@@ -86,7 +86,8 @@ fn recording_idle_ttl_secs() -> u64 {
         .unwrap_or(RECORDING_IDLE_TTL_SECS_DEFAULT)
 }
 
-/// Spawn a detached daemon task that auto-stops a recording after the idle TTL.
+/// Spawn a detached daemon task that auto-stops an OWNERLESS recording after
+/// the idle TTL.
 ///
 /// Defense-in-depth for #1764: the primary teardown is now the per-session
 /// reaper (the proxy's persistent control connection EOF fires `session_end`,
@@ -97,6 +98,15 @@ fn recording_idle_ttl_secs() -> u64 {
 /// TTL. As long as a session keeps issuing tool calls, `last_activity` is bumped
 /// every turn and the idle window never reaches the TTL. `stop()` is idempotent,
 /// so racing with the proxy-exit hook or an explicit `stop_recording` is benign.
+///
+/// A recording with a LIVE owner session is exempt (#19): its lifecycle is the
+/// session's (explicit `end_session` / disconnect / daemon shutdown — the
+/// session itself is pinned against the TTL sweep while it owns the
+/// recording), and an operator mid-think for >TTL must not lose the rest of
+/// their trajectory. The residual leak this accepts: a RAW-socket client that
+/// declared a session, started a recording, and died with no control
+/// connection to reap it keeps recording until daemon shutdown —
+/// `cua-driver status` surfaces it.
 fn spawn_recording_idle_backstop(
     registry: std::sync::Arc<cua_driver_core::tool::ToolRegistry>,
     last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -109,28 +119,31 @@ fn spawn_recording_idle_backstop(
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             tick.tick().await;
-            if registry.recording.current_state().enabled {
+            let state = registry.recording.current_state();
+            if state.enabled && state.owner.is_none() {
                 let idle = now_unix_secs().saturating_sub(
                     last_activity.load(std::sync::atomic::Ordering::Relaxed),
                 );
                 if idle >= ttl {
                     tracing::warn!(
-                        "recording idle {idle}s ≥ {ttl}s TTL; auto-stopping \
-                         (proxy-exit hook likely missed)"
+                        "ownerless recording idle {idle}s ≥ {ttl}s TTL; auto-stopping \
+                         (raw client died without session identity)"
                     );
                     // Unconditional (`None`): the idle backstop is a last-resort
-                    // GLOBAL kill of whatever recording is active after global
-                    // inactivity — not an owner reclaiming a specific session.
-                    // It already targets the live recording by definition, so a
-                    // requester id would be redundant and could only make it
-                    // wrongly no-op. Session-scoped teardown is the proxy-exit
+                    // kill of an ownerless recording after global inactivity —
+                    // not an owner reclaiming a specific session. A requester id
+                    // would be redundant and could only make it wrongly no-op.
+                    // Session-owned recordings are torn down by the proxy-exit /
                     // `session_end` path (#1764 / session-identity work).
                     // stop_owner can SYNCHRONOUSLY finalize the recording's mp4
                     // (SCStream::stop_capture blocks on disk I/O), so run it on a
                     // blocking thread to keep the reactor free (see the EOF reaper).
                     let reg2 = registry.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        reg2.recording.stop_owner(None)
+                        reg2.recording.stop_owner_with_reason(
+                            None,
+                            cua_driver_core::recording::RecordingEndReason::IdleTtl,
+                        )
                     })
                     .await;
                 }
@@ -167,13 +180,29 @@ fn session_ended_message(sid: &str) -> String {
 /// every session whose last activity is older than the TTL; `session::evict_idle`
 /// fans `fire_session_end` out to the cursor/recording/config cleanup hooks. A
 /// session that keeps issuing tool calls bumps its activity every turn and never
-/// reaches the idle window. Idempotent and cheap.
-fn spawn_session_idle_sweep() {
+/// reaches the idle window.
+///
+/// A session that owns the LIVE recording is exempt (#19): it is touched every
+/// tick, so it can only end via explicit `end_session`, client disconnect, or
+/// daemon shutdown. An operator deliberately recording a long-running workflow
+/// is not "idle" in any sense the user cares about — the sweep previously
+/// reclaimed such a session mid-think and silently stopped its trajectory
+/// recording (observed: a >300 s investigation gap split the 2026-06-10
+/// PrusaSlicer trajectory across two directories). Idempotent and cheap.
+fn spawn_session_idle_sweep(
+    recording: std::sync::Arc<cua_driver_core::recording::RecordingSession>,
+) {
     let ttl = std::time::Duration::from_secs(session_idle_ttl_secs());
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             tick.tick().await;
+            let state = recording.current_state();
+            if state.enabled {
+                if let Some(owner) = &state.owner {
+                    cua_driver_core::session::touch_session(owner);
+                }
+            }
             let ended = cua_driver_core::session::evict_idle(ttl);
             if !ended.is_empty() {
                 tracing::info!(count = ended.len(), "idle-TTL reclaimed sessions: {ended:?}");
@@ -188,19 +217,32 @@ fn spawn_session_idle_sweep() {
 /// `fire_session_end`; this adds recording teardown to the SAME signal, so
 /// `end_session`, the idle-TTL sweep, and the control-connection EOF reaper all
 /// stop a session's recording uniformly (matching `end_session`'s contract).
-/// `stop_owner(Some(sid))` is a no-op unless `sid` owns the live recording, and
+/// `stop_owner` is a no-op unless `sid` owns the live recording, and
 /// runs on a detached thread so finalizing the mp4 never blocks the synchronous
 /// `fire_session_end` caller (the sweep task or an async tool invoke). The EOF
 /// arm keeps its own inline `spawn_blocking` stop for ordered finalize-then-reply;
 /// a second stop here is an idempotent no-op.
+///
+/// The end cause is folded into the trajectory's `end_reason` (#19): an
+/// idle-TTL reclaim writes `idle_ttl` (defensive — owner pinning in
+/// [`spawn_session_idle_sweep`] should make that unreachable), everything
+/// else `session_end`.
 fn register_recording_session_end_hook(
     recording: std::sync::Arc<cua_driver_core::recording::RecordingSession>,
 ) {
-    cua_driver_core::session::register_session_end_hook(move |sid| {
+    use cua_driver_core::recording::RecordingEndReason;
+    use cua_driver_core::session::SessionEndCause;
+    cua_driver_core::session::register_session_end_cause_hook(move |sid, cause| {
         let recording = recording.clone();
         let sid = sid.to_owned();
+        let reason = match cause {
+            SessionEndCause::IdleTtl => RecordingEndReason::IdleTtl,
+            SessionEndCause::Explicit | SessionEndCause::Disconnect => {
+                RecordingEndReason::SessionEnd
+            }
+        };
         std::thread::spawn(move || {
-            let _ = recording.stop_owner(Some(&sid));
+            let _ = recording.stop_owner_with_reason(Some(&sid), reason);
         });
     });
 }
@@ -577,7 +619,7 @@ pub async fn run_serve(
     // so an actively-used session is never reaped.
     let last_activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now_unix_secs()));
     spawn_recording_idle_backstop(registry.clone(), last_activity.clone());
-    spawn_session_idle_sweep();
+    spawn_session_idle_sweep(registry.recording.clone());
     if let Some(port) = crate::mcp_http::configured_port() {
         crate::mcp_http::spawn(registry.clone(), port);
     }
@@ -1118,7 +1160,7 @@ pub async fn run_serve(
     // full rationale; the leak (record_video via ffmpeg) is platform-independent.
     let last_activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now_unix_secs()));
     spawn_recording_idle_backstop(registry.clone(), last_activity.clone());
-    spawn_session_idle_sweep();
+    spawn_session_idle_sweep(registry.recording.clone());
     if let Some(port) = crate::mcp_http::configured_port() {
         crate::mcp_http::spawn(registry.clone(), port);
     }

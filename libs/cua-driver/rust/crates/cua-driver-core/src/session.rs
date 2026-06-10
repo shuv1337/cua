@@ -23,8 +23,26 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 type SessionEndHook = Box<dyn Fn(&str) + Send + Sync>;
+type SessionEndCauseHook = Box<dyn Fn(&str, SessionEndCause) + Send + Sync>;
 
 static SESSION_END_HOOKS: OnceLock<Mutex<Vec<SessionEndHook>>> = OnceLock::new();
+static SESSION_END_CAUSE_HOOKS: OnceLock<Mutex<Vec<SessionEndCauseHook>>> = OnceLock::new();
+
+/// Why a session ended. Most cleanup is cause-agnostic (cursor remove,
+/// config clear) and registers via [`register_session_end_hook`]; the
+/// recording hook registers via [`register_session_end_cause_hook`] and
+/// folds the cause into the finalized trajectory's `end_reason` so a
+/// truncated recording is self-explaining (#19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEndCause {
+    /// Explicit `end_session` (tool / CLI verb).
+    Explicit,
+    /// The daemon's idle-TTL sweep reclaimed it.
+    IdleTtl,
+    /// Control-connection EOF (proxy exit/crash) or the legacy
+    /// `session_end` method arm.
+    Disconnect,
+}
 
 /// Last-activity timestamp per live session id. A session is "touched" every
 /// time a tool call carries its explicit `session` id (see the daemon boundary
@@ -57,6 +75,10 @@ fn hooks() -> &'static Mutex<Vec<SessionEndHook>> {
     SESSION_END_HOOKS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn cause_hooks() -> &'static Mutex<Vec<SessionEndCauseHook>> {
+    SESSION_END_CAUSE_HOOKS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 fn ended_sessions() -> &'static Mutex<HashSet<String>> {
     ENDED_SESSIONS.get_or_init(|| Mutex::new(HashSet::new()))
 }
@@ -71,6 +93,15 @@ pub fn register_session_end_hook(hook: impl Fn(&str) + Send + Sync + 'static) {
     hooks().lock().unwrap().push(Box::new(hook));
 }
 
+/// Like [`register_session_end_hook`], but the callback also receives WHY the
+/// session ended. Same firing rules (once per ended id, after the
+/// cause-agnostic hooks).
+pub fn register_session_end_cause_hook(
+    hook: impl Fn(&str, SessionEndCause) + Send + Sync + 'static,
+) {
+    cause_hooks().lock().unwrap().push(Box::new(hook));
+}
+
 /// Fan a session-end out to every registered cleanup hook. Called by the daemon
 /// on control-connection EOF (the reaper) and by the legacy `session_end` method
 /// arm. Idempotent: the FIRST fire for a given `session_id` runs every hook; any
@@ -78,6 +109,13 @@ pub fn register_session_end_hook(hook: impl Fn(&str) + Send + Sync + 'static) {
 /// stray legacy `session_end` (mixed-version rollout) so cursor-remove +
 /// recording-stop run exactly once. No-op when no hooks are registered.
 pub fn fire_session_end(session_id: &str) {
+    fire_session_end_with_cause(session_id, SessionEndCause::Disconnect);
+}
+
+/// [`fire_session_end`] with an explicit cause for the cause-aware hooks.
+/// The dedupe is shared: whichever fire arrives FIRST for an id determines
+/// the cause its hooks observe; later fires (any cause) are no-ops.
+pub fn fire_session_end_with_cause(session_id: &str, cause: SessionEndCause) {
     // Mark-then-fan-out under a short critical section, releasing the lock
     // before running hooks (hooks may be slow / re-entrant and must not hold
     // the dedupe lock).
@@ -89,6 +127,9 @@ pub fn fire_session_end(session_id: &str) {
     }
     for hook in hooks().lock().unwrap().iter() {
         hook(session_id);
+    }
+    for hook in cause_hooks().lock().unwrap().iter() {
+        hook(session_id, cause);
     }
 }
 
@@ -158,11 +199,15 @@ pub fn session_idle_ttl_secs() -> u64 {
 /// (overlay remove, recording stop, config-override clear). Idempotent via
 /// `fire_session_end`'s dedupe. No-op for the anonymous fallback.
 pub fn end_session(session_id: &str) {
+    end_session_with_cause(session_id, SessionEndCause::Explicit);
+}
+
+fn end_session_with_cause(session_id: &str, cause: SessionEndCause) {
     if !is_trackable(session_id) {
         return;
     }
     activity().lock().unwrap().remove(session_id);
-    fire_session_end(session_id);
+    fire_session_end_with_cause(session_id, cause);
 }
 
 /// End every session whose last activity is older than `ttl`, returning the ids
@@ -181,7 +226,7 @@ pub fn evict_idle(ttl: Duration) -> Vec<String> {
             .collect()
     };
     for id in &stale {
-        end_session(id);
+        end_session_with_cause(id, SessionEndCause::IdleTtl);
     }
     stale
 }
@@ -283,5 +328,51 @@ mod tests {
         assert!(is_session_ended(sid));
         // Its TTL entry is gone, so a later sweep doesn't re-fire for it.
         assert!(!evict_idle(Duration::ZERO).iter().any(|s| s == sid));
+    }
+
+    /// #19: cause-aware hooks see WHY a session ended — the recording hook
+    /// folds this into the trajectory's `end_reason`. Hooks are
+    /// process-global and tests run in parallel, so the hook filters on
+    /// this test's own sid prefix.
+    #[test]
+    fn end_cause_reaches_cause_hooks() {
+        static SEEN: OnceLock<Mutex<HashMap<String, SessionEndCause>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
+        register_session_end_cause_hook(|sid, cause| {
+            if let Some(map) = SEEN.get() {
+                if sid.starts_with("test-cause-") {
+                    map.lock().unwrap().insert(sid.to_owned(), cause);
+                }
+            }
+        });
+
+        touch_session("test-cause-evict");
+        assert!(evict_idle(Duration::ZERO).iter().any(|s| s == "test-cause-evict"));
+        assert_eq!(
+            seen.lock().unwrap().get("test-cause-evict").copied(),
+            Some(SessionEndCause::IdleTtl)
+        );
+
+        touch_session("test-cause-explicit");
+        end_session("test-cause-explicit");
+        assert_eq!(
+            seen.lock().unwrap().get("test-cause-explicit").copied(),
+            Some(SessionEndCause::Explicit)
+        );
+
+        touch_session("test-cause-eof");
+        fire_session_end("test-cause-eof");
+        assert_eq!(
+            seen.lock().unwrap().get("test-cause-eof").copied(),
+            Some(SessionEndCause::Disconnect)
+        );
+
+        // The dedupe is shared with the cause-agnostic path: a second fire
+        // (any cause) must not rewrite the recorded cause.
+        fire_session_end_with_cause("test-cause-eof", SessionEndCause::IdleTtl);
+        assert_eq!(
+            seen.lock().unwrap().get("test-cause-eof").copied(),
+            Some(SessionEndCause::Disconnect)
+        );
     }
 }

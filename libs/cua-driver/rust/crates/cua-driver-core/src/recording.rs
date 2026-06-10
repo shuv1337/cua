@@ -140,6 +140,33 @@ struct RecordingInner {
     start_epoch: u64,
 }
 
+/// Why a recording ended — folded into the finalized `session.json` as
+/// `end_reason` so a split or truncated trajectory is self-explaining (#19).
+/// A `session.json` with NO `end_reason` was never finalized: the daemon
+/// died (shutdown/crash) with the recording live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordingEndReason {
+    /// Explicit `stop_recording` (tool, CLI, or legacy `configure(false)`).
+    Manual,
+    /// The owning session ended (explicit `end_session` or client
+    /// disconnect) and the session-end hook tore the recording down.
+    SessionEnd,
+    /// An idle reaper stopped it: the recording idle backstop (ownerless
+    /// recordings only), or — defensively, should owner-pinning ever
+    /// regress — the session idle-TTL sweep.
+    IdleTtl,
+}
+
+impl RecordingEndReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecordingEndReason::Manual => "manual",
+            RecordingEndReason::SessionEnd => "session_end",
+            RecordingEndReason::IdleTtl => "idle_ttl",
+        }
+    }
+}
+
 /// Snapshot of the current recording state (cheap to clone).
 #[derive(Debug, Clone)]
 pub struct RecordingState {
@@ -379,7 +406,26 @@ impl RecordingSession {
     ///     owner's recording running.
     /// The guard lives inside the lock so it is race-free against a concurrent
     /// `start()`. Supersedes the #1775 generation-token `stop()`.
+    ///
+    /// The end reason defaults by requester — `None` is the manual-stop
+    /// family, `Some(sid)` is session-driven teardown. Callers whose stop is
+    /// an idle reclaim (the recording idle backstop, the session TTL sweep's
+    /// hook) pass the reason explicitly via [`Self::stop_owner_with_reason`].
     pub fn stop_owner(&self, requester: Option<&str>) -> anyhow::Result<()> {
+        let reason = match requester {
+            None => RecordingEndReason::Manual,
+            Some(_) => RecordingEndReason::SessionEnd,
+        };
+        self.stop_owner_with_reason(requester, reason)
+    }
+
+    /// [`Self::stop_owner`] with an explicit end reason for the finalized
+    /// `session.json` (#19): `manual | session_end | idle_ttl`.
+    pub fn stop_owner_with_reason(
+        &self,
+        requester: Option<&str>,
+        reason: RecordingEndReason,
+    ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         if !inner.enabled {
             return Ok(());
@@ -432,6 +478,7 @@ impl RecordingSession {
             let session_payload = serde_json::json!({
                 "schema_version": 1,
                 "started_at_monotonic_ms": now_ms(),
+                "end_reason": reason.as_str(),
                 "video": video_block,
                 "cursor": cursor_session_payload(cursor_stats)
             });
@@ -787,4 +834,54 @@ fn expand_tilde(path: &str) -> PathBuf {
         }
     }
     PathBuf::from(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("cua-rec-end-reason-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn end_reason_in(dir: &std::path::Path) -> serde_json::Value {
+        let raw = std::fs::read_to_string(dir.join("session.json")).unwrap();
+        serde_json::from_str::<serde_json::Value>(&raw).unwrap()["end_reason"].clone()
+    }
+
+    /// #19: a finalized trajectory names why it ended, so a split or
+    /// truncated recording is self-explaining.
+    #[test]
+    fn stop_writes_end_reason_into_session_json() {
+        let session = RecordingSession::new();
+
+        // Explicit reason wins (the idle reapers pass IdleTtl).
+        let dir = fresh_dir("idle");
+        session.start(dir.to_str().unwrap(), false, Some("end-reason-idle-sid")).unwrap();
+        session
+            .stop_owner_with_reason(Some("end-reason-idle-sid"), RecordingEndReason::IdleTtl)
+            .unwrap();
+        assert_eq!(end_reason_in(&dir), "idle_ttl");
+
+        // Session-scoped stop defaults to session_end.
+        let dir = fresh_dir("session-end");
+        session.start(dir.to_str().unwrap(), false, Some("end-reason-end-sid")).unwrap();
+        session.stop_owner(Some("end-reason-end-sid")).unwrap();
+        assert_eq!(end_reason_in(&dir), "session_end");
+
+        // Unconditional stop defaults to manual.
+        let dir = fresh_dir("manual");
+        session.start(dir.to_str().unwrap(), false, None).unwrap();
+        session.stop_owner(None).unwrap();
+        assert_eq!(end_reason_in(&dir), "manual");
+
+        // A live recording's session.json has no end_reason yet.
+        let dir = fresh_dir("live");
+        session.start(dir.to_str().unwrap(), false, None).unwrap();
+        assert_eq!(end_reason_in(&dir), serde_json::Value::Null);
+        session.stop_owner(None).unwrap();
+    }
 }
