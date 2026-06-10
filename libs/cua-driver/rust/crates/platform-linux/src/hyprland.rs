@@ -319,12 +319,13 @@ pub fn launch_on_special_workspace(shell_cmd: &str) -> Result<Option<WindowInfo>
         // Apps with a splash screen burn the rule on the splash and map
         // their real main frame onto the user's active workspace seconds
         // later (observed: PrusaSlicer 2.9.5 — splash got special:cua, main
-        // frame arrived on the active workspace ~6 s in). Sweep the pid's
-        // windows back now and keep enforcing from a detached guard while
-        // the app finishes starting up.
+        // frame arrived on the active workspace ~6 s in), and modal dialogs
+        // can map MINUTES later (observed: the "Send G-Code" modal, #15).
+        // Sweep the pid's windows back now and keep enforcing for the
+        // pid's whole lifetime.
         if let Some(pid) = found.pid {
             enforce_background_placement(pid);
-            spawn_background_placement_guard(pid, Duration::from_secs(20));
+            guard_background_placement_for_pid_lifetime(pid);
         }
         return Ok(Some(found));
     }
@@ -348,19 +349,148 @@ fn enforce_background_placement(pid: u32) -> usize {
     moved
 }
 
-/// Detached follow-up for [`launch_on_special_workspace`]: keep sweeping the
-/// launched pid's windows onto the background workspace for `watch`, so a
-/// main frame that maps after the splash consumed the exec rule still ends
-/// up hidden instead of on the user's active workspace. Best-effort, same
-/// spirit as [`spawn_focus_restore_guard`].
-fn spawn_background_placement_guard(pid: u32, watch: Duration) {
+/// Keep every window `pid` maps — for the pid's whole lifetime — off the
+/// user's workspaces (#15: a fixed 20 s watch missed modal dialogs that
+/// open minutes into a workflow, exactly at the most user-visible step).
+/// Two tiers:
+///
+/// - Hyprland ≥0.55: a compositor-resident `window.open` hook moves a
+///   guarded pid's new window onto [`BACKGROUND_WORKSPACE`] inside the
+///   open event itself — before a frame renders, so nothing flashes on
+///   the user's workspace and no polling runs. A detached reaper drops
+///   the pid from the compositor-side registry when the process exits.
+/// - Older releases (no compositor Lua state): the polling sweep, kept
+///   alive until the pid exits instead of a fixed watch window.
+///
+/// Either way the parent window is already on [`BACKGROUND_WORKSPACE`],
+/// so a swept modal lands on the SAME workspace as its parent — never
+/// orphaned cross-workspace, which would break the compositor's focus
+/// routing for the whole app (observed: `activewindow: None`, all input
+/// dead until the pair was reunited).
+fn guard_background_placement_for_pid_lifetime(pid: u32) {
+    if register_background_pid_hook(pid) {
+        spawn_background_pid_reaper(pid);
+    } else {
+        spawn_background_placement_guard(pid);
+    }
+}
+
+/// Add `pid` to the compositor-side guard registry (`_G.cua_bg.pids`),
+/// installing the shared `window.open` subscription on first use. The
+/// callback runs inside the compositor at map time and reuses the atomic
+/// move + re-hide pattern from [`move_window_to_background_workspace`].
+/// Returns false on pre-Lua Hyprland (legacy grammar), where the caller
+/// must fall back to polling.
+///
+/// An event subscription is used rather than `hl.window_rule` because
+/// rules have no pid matcher and can only ever be disabled, never removed
+/// (`:set_enabled(false)` is the whole runtime API, verified live on
+/// 0.55.3) — and a per-launch rule that can't be removed is a leak that
+/// pid recycling would eventually turn into misplaced windows.
+fn register_background_pid_hook(pid: u32) -> bool {
+    reset_background_pid_registry_once();
+    let workspace = BACKGROUND_WORKSPACE;
+    let name = workspace.trim_start_matches("special:");
+    let lua = format!(
+        "(function() \
+         if _G.cua_bg == nil then _G.cua_bg = {{ pids = {{}} }} end \
+         _G.cua_bg.pids[{pid}] = true \
+         if _G.cua_bg.sub == nil then \
+         _G.cua_bg.sub = hl.on('window.open', function(w) \
+         local t = _G.cua_bg \
+         if t == nil or w == nil or not t.pids[w.pid] then return end \
+         if w.workspace == nil or w.workspace.id >= 0 then \
+         hl.dispatch(hl.dsp.window.move({{ workspace = '{workspace}', window = 'address:'..tostring(w.address) }})) \
+         local sp = hl.get_active_special_workspace() \
+         if sp ~= nil and tostring(sp):find('{workspace}', 1, true) then \
+         hl.dispatch(hl.dsp.workspace.toggle_special('{name}')) end \
+         end \
+         end) \
+         end \
+         return hl.dsp.no_op() end)()"
+    );
+    hyprctl_dispatch(&lua)
+}
+
+/// One-time (per daemon process) cleanup of compositor-side guard state a
+/// previous daemon instance may have left behind: a stale `window.open`
+/// subscription whose reaper died with the old daemon would keep sweeping
+/// its registered pids — and pids recycle.
+fn reset_background_pid_registry_once() {
+    static RESET: std::sync::Once = std::sync::Once::new();
+    RESET.call_once(|| {
+        let _ = hyprctl_dispatch(
+            "(function() \
+             local t = _G.cua_bg \
+             if t ~= nil and t.sub ~= nil then t.sub:remove() end \
+             _G.cua_bg = { pids = {} } \
+             return hl.dsp.no_op() end)()",
+        );
+    });
+}
+
+/// Drop `pid` from the compositor-side guard registry, removing the shared
+/// `window.open` subscription once no guarded pids remain.
+fn unregister_background_pid_hook(pid: u32) {
+    let lua = format!(
+        "(function() \
+         local t = _G.cua_bg \
+         if t ~= nil then \
+         t.pids[{pid}] = nil \
+         if t.sub ~= nil and next(t.pids) == nil then t.sub:remove() t.sub = nil end \
+         end \
+         return hl.dsp.no_op() end)()"
+    );
+    let _ = hyprctl_dispatch(&lua);
+}
+
+/// Watch for `pid`'s exit, then unregister its compositor-side guard
+/// entry. Process identity is `(pid, /proc starttime)` so a recycled pid
+/// can't keep an unrelated process's windows getting swept off-screen.
+fn spawn_background_pid_reaper(pid: u32) {
     std::thread::spawn(move || {
-        let deadline = Instant::now() + watch;
-        while Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(300));
+        let Some(start) = proc_start_time(pid) else {
+            // Gone before the reaper started; nothing left to guard.
+            unregister_background_pid_hook(pid);
+            return;
+        };
+        while proc_start_time(pid) == Some(start) {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        unregister_background_pid_hook(pid);
+    });
+}
+
+/// Pre-0.55 fallback for [`guard_background_placement_for_pid_lifetime`]:
+/// keep sweeping the launched pid's windows onto the background workspace
+/// until the process exits. A late window can flash on the active
+/// workspace for up to one poll interval before the sweep catches it —
+/// the event-hook tier exists precisely to avoid that. Polls fast through
+/// app startup (splash → main frame churn), then relaxes. Best-effort,
+/// same spirit as [`spawn_focus_restore_guard`].
+fn spawn_background_placement_guard(pid: u32) {
+    std::thread::spawn(move || {
+        let Some(start) = proc_start_time(pid) else { return };
+        let begun = Instant::now();
+        while proc_start_time(pid) == Some(start) {
+            std::thread::sleep(if begun.elapsed() < Duration::from_secs(30) {
+                Duration::from_millis(300)
+            } else {
+                Duration::from_secs(1)
+            });
             enforce_background_placement(pid);
         }
     });
+}
+
+/// Kernel start time of `pid` (`/proc/<pid>/stat` field 22, clock ticks
+/// since boot) — the stable half of a `(pid, starttime)` process identity.
+/// `None` once the process is gone. The comm field may itself contain
+/// spaces and parens, so fields are taken from after the LAST `)`.
+fn proc_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_ascii_whitespace().nth(19)?.parse().ok()
 }
 
 /// Move a window (by Hyprland client address) onto [`BACKGROUND_WORKSPACE`]
@@ -538,4 +668,119 @@ fn monitors() -> Result<Vec<HyprMonitor>> {
 
 fn parse_address(address: &str) -> Option<u64> {
     u64::from_str_radix(address.trim_start_matches("0x"), 16).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proc_start_time_reads_a_live_process() {
+        assert!(proc_start_time(std::process::id()).is_some());
+    }
+
+    #[test]
+    fn proc_start_time_is_stable_for_a_live_process() {
+        let pid = std::process::id();
+        assert_eq!(proc_start_time(pid), proc_start_time(pid));
+    }
+
+    #[test]
+    fn proc_start_time_none_once_gone() {
+        // pid 0 (the idle task) never has a /proc/<pid>/stat entry.
+        assert_eq!(proc_start_time(0), None);
+    }
+
+    /// Kills the probe process even when an assertion panics mid-test.
+    struct KillOnDrop(u32);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = Command::new("kill").arg(self.0.to_string()).output();
+        }
+    }
+
+    fn probe_windows(class: &str) -> Vec<HyprClient> {
+        clients()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.class == class)
+            .collect()
+    }
+
+    /// Live acceptance test for #15 — needs a running Hyprland ≥0.55 and
+    /// kitty; run with `cargo test -p platform-linux -- --ignored`.
+    ///
+    /// Maps a SECOND window from an already-guarded pid (kitty remote
+    /// control: one process, two OS windows) and asserts the window.open
+    /// hook placed it on the background workspace without revealing the
+    /// special workspace on any monitor.
+    #[test]
+    #[ignore = "drives the live compositor; Hyprland + kitty only"]
+    fn live_window_open_hook_sweeps_late_windows() {
+        const CLASS: &str = "cua-live-issue15";
+        if !is_hyprland_session()
+            || !Command::new("kitty").arg("--version").output().is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skipping: needs a live Hyprland session and kitty");
+            return;
+        }
+        assert!(probe_windows(CLASS).is_empty(), "stale {CLASS} probe window present");
+
+        dispatch_exec_with_rules(
+            &format!("workspace {BACKGROUND_WORKSPACE} silent"),
+            &format!(
+                "kitty --class {CLASS} -o allow_remote_control=yes \
+                 -o confirm_os_window_close=0 --listen-on=unix:@{CLASS}"
+            ),
+        )
+        .expect("dispatch exec");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let first = loop {
+            if let Some(c) = probe_windows(CLASS).pop() {
+                break c;
+            }
+            assert!(Instant::now() < deadline, "first probe window never mapped");
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        let pid = first.pid as u32;
+        let _guard = KillOnDrop(pid);
+
+        assert!(register_background_pid_hook(pid), "hook registration rejected");
+
+        // Same pid maps a second OS window — Hyprland's default placement
+        // for it would be the user's active workspace.
+        let out = Command::new("kitten")
+            .args(["@", "--to", &format!("unix:@{CLASS}"), "launch", "--type=os-window"])
+            .output()
+            .expect("kitten launch");
+        assert!(out.status.success(), "kitten remote launch failed");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let wins = probe_windows(CLASS);
+            if wins.len() >= 2
+                && wins.iter().all(|w| w.workspace.as_ref().is_some_and(|ws| ws.id < 0))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "late window never reached {BACKGROUND_WORKSPACE}: {:?}",
+                wins.iter().map(|w| w.workspace.as_ref().map(|ws| ws.id)).collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        // The sweep must not have revealed the special workspace anywhere.
+        for m in monitors().expect("monitors") {
+            assert!(
+                m.special_workspace.as_ref().is_none_or(|ws| ws.id == 0),
+                "special workspace left revealed on {}",
+                m.name
+            );
+        }
+
+        unregister_background_pid_hook(pid);
+    }
 }
