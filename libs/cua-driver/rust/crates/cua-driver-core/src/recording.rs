@@ -241,6 +241,9 @@ impl RecordingSession {
 
         let dir = expand_tilde(output_dir);
         std::fs::create_dir_all(&dir)?;
+        // Kept for the cross-process state hint written at commit — `dir`
+        // itself moves into the locked state.
+        let dir_for_hint = dir.clone();
 
         // Single monotonic anchor shared by video, cursor sampler, and
         // per-turn `t_ms_from_session_start` math in `record()` — so all
@@ -355,6 +358,7 @@ impl RecordingSession {
         if let Some(cur) = displaced.1 {
             let _ = cur.stop();
         }
+        write_state_hint(&dir_for_hint);
         Ok(())
     }
 
@@ -436,6 +440,7 @@ impl RecordingSession {
                 &session_payload,
             );
         }
+        clear_state_hint();
         Ok(())
     }
 
@@ -619,6 +624,62 @@ fn write_json_atomic(path: &Path, value: &Value) -> anyhow::Result<()> {
     std::fs::write(&tmp, serde_json::to_string_pretty(value)?)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+// ── Cross-process recording-state hint ────────────────────────────────────────
+//
+// Recording state lives in the recording process's memory only, which leaves
+// other processes (notably the CLI deciding whether an in-process fallback
+// would silently bypass an active trajectory recording) unable to ask "is a
+// recording live?" when the daemon socket itself is the thing that's failing.
+// The hint file is a tiny JSON breadcrumb — written on every successful
+// `start()`, removed on `stop_owner()` — that callers validate by matching
+// `pid` against the daemon's pid file, so a hint left behind by a crashed
+// process is ignored rather than trusted.
+
+/// Location of the recording-state hint file (`~/.cua-driver/recording.state`).
+pub fn state_hint_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(PathBuf::from(home).join(".cua-driver").join("recording.state"))
+}
+
+fn write_state_hint(output_dir: &Path) {
+    let Some(path) = state_hint_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let payload = serde_json::json!({
+        "pid": std::process::id(),
+        "output_dir": output_dir.to_string_lossy(),
+        "started_at_ms": now_ms(),
+    });
+    let _ = write_json_atomic(&path, &payload);
+}
+
+fn clear_state_hint() {
+    let Some(path) = state_hint_path() else { return };
+    // Only remove our own breadcrumb — a newer daemon may have started a
+    // recording (and rewritten the hint) since this process wrote it.
+    let ours = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("pid").and_then(|p| p.as_u64()))
+        == Some(std::process::id() as u64);
+    if ours {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Read the recording-state hint, returning `(recorder_pid, output_dir)` when
+/// present and parseable. The hint is advisory: callers MUST validate that
+/// `recorder_pid` is the process they're about to bypass (e.g. compare with
+/// the daemon pid file) before treating a recording as active.
+pub fn read_state_hint() -> Option<(u32, String)> {
+    let path = state_hint_path()?;
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+    let pid = v.get("pid")?.as_u64()? as u32;
+    let dir = v.get("output_dir")?.as_str()?.to_owned();
+    Some((pid, dir))
 }
 
 /// Current wall-clock time as milliseconds since Unix epoch.

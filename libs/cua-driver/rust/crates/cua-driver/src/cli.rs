@@ -960,6 +960,54 @@ pub fn run_mcp_config(client: Option<&str>) {
 /// instead of emitted as base64 on stdout.
 ///
 /// `socket` — override the daemon socket path (from --socket flag).
+/// Recording-integrity guard for the in-process fallback (issue #6).
+///
+/// In-process execution gets a fresh ToolState AND a fresh, throwaway
+/// RecordingSession — so when the daemon that should have proxied this call
+/// owns a live trajectory recording, falling back silently records nothing
+/// and the trajectory ends up with unmarked holes. A recording must be
+/// complete or fail loudly: abort (exit 70) unless explicitly overridden via
+/// `CUA_DRIVER_RS_ALLOW_DEGRADED_FALLBACK=1`.
+///
+/// The hint file is written by `RecordingSession` on start/stop. Trust it
+/// only when its pid matches the daemon pid file (a crashed daemon's stale
+/// hint must not block one-shot mode) and, where /proc exists, the process
+/// is actually alive.
+fn refuse_inprocess_fallback_if_recording(tool: &str, socket_path: &str) {
+    let Some((rec_pid, dir)) = cua_driver_core::recording::read_state_hint() else {
+        return;
+    };
+    let daemon_pid = crate::serve::read_pid_file(&crate::serve::default_pid_file_path());
+    if daemon_pid != Some(rec_pid) {
+        return;
+    }
+    if std::path::Path::new("/proc").exists()
+        && !std::path::Path::new(&format!("/proc/{rec_pid}")).exists()
+    {
+        return; // recorder process is gone — stale hint, nothing to protect.
+    }
+    if std::env::var("CUA_DRIVER_RS_ALLOW_DEGRADED_FALLBACK")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        eprintln!(
+            "[cua-driver] WARNING: degraded in-process fallback overridden by \
+             CUA_DRIVER_RS_ALLOW_DEGRADED_FALLBACK=1 — '{tool}' will NOT appear in the \
+             recorded trajectory at {dir}."
+        );
+        return;
+    }
+    eprintln!(
+        "[cua-driver] ERROR: the daemon (pid {rec_pid}) is unreachable via {socket_path} \
+         while a trajectory recording is active (output_dir: {dir}). Refusing to run \
+         '{tool}' in-process — it would bypass the daemon's recorder and element cache, \
+         leaving an unmarked hole in the trajectory. Check the daemon with \
+         `cua-driver status`, retry, or stop the recording. Set \
+         CUA_DRIVER_RS_ALLOW_DEGRADED_FALLBACK=1 to override."
+    );
+    process::exit(70);
+}
+
 pub fn run_call(
     registry: std::sync::Arc<ToolRegistry>,
     tool: &str,
@@ -1041,7 +1089,7 @@ pub fn run_call(
             // CLI one-shot is its own ephemeral, anonymous/global session.
             session_id: None,
         };
-        match crate::serve::send_request(&socket_path, &req) {
+        match crate::serve::send_request_resilient(&socket_path, &req) {
             Ok(resp) => {
                 if resp.ok {
                     if let Some(result) = resp.result {
@@ -1118,7 +1166,10 @@ pub fn run_call(
                 }
             }
             Err(e) => {
-                // Daemon became unreachable mid-call — fall through to in-process.
+                // Daemon became unreachable mid-call (even after the resilient
+                // retry/read-resume window) — fall through to in-process; the
+                // recording-integrity guard below decides whether that's
+                // allowed.
                 // Promoted from `tracing::debug!` to `eprintln!` so callers see
                 // the degradation: in-process execution gets a FRESH ToolState,
                 // which means state-dependent tools (`click`, `type_text`,
@@ -1133,6 +1184,11 @@ pub fn run_call(
             }
         }
     }
+    // Reaching this point means the tool is about to run IN-PROCESS — either
+    // no daemon was listening, or the proxy failed. Recording-integrity
+    // guard: if a live daemon owns an active trajectory recording, refuse the
+    // silent fallback instead of punching an unmarked hole in the trajectory.
+    refuse_inprocess_fallback_if_recording(tool, &socket_path);
     if registry.get_def(tool).is_none() {
         eprintln!("Unknown tool: {tool}");
         eprintln!("Run `cua-driver list-tools` to see available tools.");
@@ -1288,7 +1344,7 @@ pub fn run_recording_cmd(subcommand: &str, args: &[String], socket: Option<&str>
                 // nobody, so only an unconditional stop (CLI / manual) reaps it.
                 session_id: None,
             };
-            match crate::serve::send_request(&socket_path, &req) {
+            match crate::serve::send_request_resilient(&socket_path, &req) {
                 Ok(resp) if resp.ok => {
                     println!("Recording started → {output_dir}{}",
                         if record_video { " (video on)" } else { "" });
@@ -1324,7 +1380,7 @@ pub fn run_recording_cmd(subcommand: &str, args: &[String], socket: Option<&str>
                 args: Some(serde_json::json!({})),
                 session_id: None,
             };
-            match crate::serve::send_request(&socket_path, &req) {
+            match crate::serve::send_request_resilient(&socket_path, &req) {
                 Ok(resp) if resp.ok => println!("Recording stopped."),
                 Ok(resp) => {
                     if let Some(e) = resp.error { eprintln!("{e}"); }
@@ -1341,7 +1397,7 @@ pub fn run_recording_cmd(subcommand: &str, args: &[String], socket: Option<&str>
                 args: Some(serde_json::json!({})),
                 session_id: None,
             };
-            match crate::serve::send_request(&socket_path, &req) {
+            match crate::serve::send_request_resilient(&socket_path, &req) {
                 Ok(resp) if resp.ok => {
                     if let Some(result) = resp.result {
                         let sc = result.get("structuredContent")
