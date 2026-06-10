@@ -1,106 +1,76 @@
 //! Linux video-recording backend.
 //!
-//! On Wayland (Hyprland) the stock ffmpeg `x11grab` input only sees the
-//! XWayland root — native Wayland surfaces never appear, so screen
-//! recordings come out black or XWayland-only. This backend captures real
-//! compositor output frames via wlr-screencopy
-//! (`crate::wayland_capture::ScreencopyCapturer`) and pipes them to an
-//! ffmpeg subprocess as rawvideo on stdin (libx264, same encode settings
-//! as the core ffmpeg backend).
+//! On Wayland (Hyprland) display-level capture is the wrong source for
+//! background automation: the target usually lives on `special:cua`, and when
+//! the physical session is locked, the compositor output is just the lock
+//! surface. Instead of streaming the display, the Wayland backend synthesizes
+//! `recording.mp4` at stop time from the recorder's own per-turn
+//! target-window screenshots (`turn-*/click.png` or `screenshot.png`,
+//! filtered to turns whose arguments carry `pid`/`window_id` — the same
+//! fields the recorder uses to pick its screenshot source).
 //!
-//! Frame pacing: the encoder is fed at a fixed nominal FPS against the
-//! wall clock. When a capture iteration runs slow, the last good frame is
-//! duplicated to catch up, so the mp4's duration tracks wall time and the
-//! per-turn `t_ms_from_session_start` timestamps in action.json line up
-//! with video time (the render zoom pipeline depends on this).
+//! Timing model: the mp4 is testing evidence, not a render/zoom input. Each
+//! frame is shown from its turn's `t_ms_from_session_start` until the next
+//! turn's, with a 250 ms display floor, so video time tracks turn timestamps
+//! only approximately — bursts of sub-floor turns push later frames past
+//! their timestamps, and `VideoMetadata.duration_ms` (wall time) can differ
+//! from the encoded duration accordingly.
 //!
-//! `LinuxVideoBackendFactory` picks per session: Wayland screencopy when
-//! `WAYLAND_DISPLAY` is set (deliberately NO x11grab fallback there — see
-//! the comment in `start()`; a failed Wayland start surfaces as an error
-//! in `session.json`), else the core ffmpeg x11grab backend.
+//! `stop()` runs while the daemon-wide recording mutex is held (see
+//! `RecordingState::stop_owner`), so the encode is strictly bounded: ffmpeg
+//! is killed at `ENCODE_DEADLINE` and the failure lands in
+//! `VideoMetadata.error` instead of wedging every recorded tool call.
+//!
+//! X11 sessions still use the core ffmpeg x11grab backend.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use cua_driver_core::video::{VideoBackend, VideoBackendFactory, VideoMetadata};
 
-use crate::wayland_capture::{ffmpeg_pixel_format, FrameInfo, ScreencopyCapturer};
-
-const FPS: u32 = 30;
-/// Give up on the capture thread after this many consecutive failed frames:
-/// the compositor is gone or the output vanished. Each failed attempt can
-/// burn up to the 4 s dispatch deadline, so worst case this is ~40 s of
-/// retrying, not a frame-count worth of wall time.
-const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+/// Output fps for the synthesized trajectory mp4. Content is static between
+/// turns, so a low rate loses nothing while keeping the stop-time encode —
+/// which runs under the daemon-wide recording mutex — short.
+const FPS: u32 = 10;
+/// Hard ceiling on the stop-time ffmpeg encode. stop() holds the daemon-wide
+/// recording mutex, so a wedged or pathologically slow encode must be killed
+/// rather than waited on; the timeout surfaces in `VideoMetadata.error`.
+const ENCODE_DEADLINE: Duration = Duration::from_secs(60);
 
 pub struct LinuxVideoBackendFactory;
 
 impl VideoBackendFactory for LinuxVideoBackendFactory {
     fn start(&self, output_path: &Path) -> Result<Box<dyn VideoBackend>> {
         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            // No x11grab fallback on Wayland sessions: it records only the
-            // XWayland root (black / partial), which would silently
-            // masquerade as a healthy recording. Surfacing the error puts
-            // it in session.json video.error where the user can see it.
-            return WaylandVideoBackend::start(output_path)
+            // Do not record compositor output on Wayland. Hidden-workspace
+            // automation and locked desktops both make the focused monitor an
+            // unrelated source. Build the mp4 from target-window turn frames.
+            return ScreenshotSequenceVideoBackend::start(output_path)
                 .map(|b| Box::new(b) as Box<dyn VideoBackend>)
-                .map_err(|e| e.context("Wayland screencopy video failed"));
+                .map_err(|e| e.context("Wayland trajectory video failed"));
         }
         cua_driver_core::video_ffmpeg::FfmpegVideoBackendFactory.start(output_path)
     }
 }
 
-/// Capture-thread health, shared with `stop()` so capture-side failures
-/// land in structured `VideoMetadata.error` (→ `session.json`
-/// `video.error` / `last_error`) instead of only the log. Both cases
-/// would otherwise masquerade as healthy recordings: the feeder's EOF on
-/// persistent failure makes ffmpeg finalize a *truncated* mp4 cleanly,
-/// and a geometry freeze keeps producing a playable file whose frames
-/// after t=X are stale.
-#[derive(Default)]
-struct CaptureHealth {
-    /// Set when the feeder gave up (persistent capture failure): the mp4
-    /// is truncated and `duration_ms` misstates it — forces
-    /// `finalized: false`.
-    fatal: Option<String>,
-    /// Set on the first mid-recording output geometry change: the mp4
-    /// stays playable and wall-clock-aligned, but frames after the
-    /// freeze point duplicate the last good frame.
-    froze: Option<String>,
+#[derive(Debug, Clone)]
+struct TurnFrame {
+    path: PathBuf,
+    t_ms: u64,
 }
 
-pub struct WaylandVideoBackend {
-    child: Child,
+/// Lock-safe Linux Wayland video backend. It starts cheaply and creates the
+/// mp4 on stop after all `turn-*` folders have been written.
+struct ScreenshotSequenceVideoBackend {
     output_path: PathBuf,
     started_at: Instant,
-    stop: Arc<AtomicBool>,
-    health: Arc<Mutex<CaptureHealth>>,
-    capture_thread: Option<std::thread::JoinHandle<()>>,
-    stderr_thread: Option<std::thread::JoinHandle<Vec<u8>>>,
+    ffmpeg: PathBuf,
 }
 
-impl WaylandVideoBackend {
+impl ScreenshotSequenceVideoBackend {
     fn start(output_path: &Path) -> Result<Self> {
-        let output_path = output_path.to_path_buf();
-
-        // Open the capture session and grab one frame up front: it proves
-        // the protocol path works and pins the frame geometry/format for
-        // the ffmpeg invocation.
-        let focused = crate::hyprland::focused_monitor_name();
-        let mut capturer = ScreencopyCapturer::open(focused.as_deref())
-            .context("wlr-screencopy session open failed")?;
-        let mut first_frame = Vec::new();
-        let info = capturer
-            .capture_frame(true, &mut first_frame)
-            .context("initial screencopy frame failed")?;
-        let pix_fmt = ffmpeg_pixel_format(info.format)
-            .with_context(|| format!("unsupported screencopy pixel format {:?}", info.format))?;
-
         let ffmpeg = cua_driver_core::video_ffmpeg::find_ffmpeg().context(
             "ffmpeg not found on PATH. Install with: apt install ffmpeg (Debian/Ubuntu) \
              or pacman -S ffmpeg (Arch).",
@@ -113,288 +83,354 @@ impl WaylandVideoBackend {
                 )
             })?;
         }
-
-        let mut cmd = Command::new(&ffmpeg);
-        cmd.arg("-y")
-            .arg("-loglevel").arg("error")
-            .arg("-f").arg("rawvideo")
-            .arg("-pixel_format").arg(pix_fmt)
-            .arg("-video_size").arg(format!("{}x{}", info.width, info.height))
-            .arg("-framerate").arg(FPS.to_string())
-            .arg("-i").arg("pipe:0")
-            // yuv420p needs even dimensions; pad rather than crop (matches
-            // the core ffmpeg backend).
-            .arg("-vf").arg("pad=ceil(iw/2)*2:ceil(ih/2)*2")
-            .arg("-c:v").arg("libx264")
-            .arg("-preset").arg("ultrafast")
-            .arg("-pix_fmt").arg("yuv420p")
-            .arg("-movflags").arg("+faststart")
-            .arg("-g").arg("30")
-            .arg(&output_path);
-        cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to spawn ffmpeg ({}): {e}", ffmpeg.display()))?;
-
-        let mut stderr_thread = child
-            .stderr
-            .take()
-            .map(cua_driver_core::video_ffmpeg::spawn_stderr_drain);
-
-        // Fast-fail probe (shared with the core ffmpeg backend) — a spawn
-        // only proves the process launched, not that ffmpeg accepted the
-        // rawvideo args or could open the output. Without it a dead
-        // encoder would be reported as a started backend and session.json
-        // would carry video.present:true for a session with no video.
-        cua_driver_core::video_ffmpeg::probe_ffmpeg_startup(&mut child, &mut stderr_thread)?;
-
-        let mut stdin = child.stdin.take().context("ffmpeg stdin unavailable")?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let health = Arc::new(Mutex::new(CaptureHealth::default()));
-        let started_at = Instant::now();
-
-        let capture_thread = {
-            let stop = Arc::clone(&stop);
-            let health = Arc::clone(&health);
-            let spawned = std::thread::Builder::new()
-                .name("wl-video-capture".into())
-                .spawn(move || {
-                    capture_loop(capturer, info, first_frame, &mut stdin, &stop, &health, started_at);
-                    // Dropping stdin sends EOF — ffmpeg finalizes the mp4.
-                    drop(stdin);
-                });
-            match spawned {
-                Ok(handle) => handle,
-                Err(e) => {
-                    // Without the feeder thread ffmpeg would linger as a
-                    // zombie blocked on an empty pipe.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(e).context("failed to spawn capture thread");
-                }
-            }
-        };
-
-        Ok(WaylandVideoBackend {
-            child,
-            output_path,
-            started_at,
-            stop,
-            health,
-            capture_thread: Some(capture_thread),
-            stderr_thread,
+        Ok(Self {
+            output_path: output_path.to_path_buf(),
+            started_at: Instant::now(),
+            ffmpeg,
         })
     }
 }
 
-/// Feed ffmpeg at a fixed nominal FPS against the wall clock, duplicating
-/// the last good frame when capture runs slow and tolerating transient
-/// capture failures.
-fn capture_loop(
-    mut capturer: ScreencopyCapturer,
-    first_info: FrameInfo,
-    mut latest: Vec<u8>,
-    stdin: &mut std::process::ChildStdin,
-    stop: &AtomicBool,
-    health: &Mutex<CaptureHealth>,
-    started_at: Instant,
-) {
-    let mut scratch: Vec<u8> = Vec::with_capacity(latest.len());
-    let mut frames_written: u64 = 0;
-    let mut consecutive_failures: u32 = 0;
-    let frame_interval = 1.0 / FPS as f64;
-
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            return;
-        }
-
-        // Keep the encoder fed up to the wall clock (duplicates catch up
-        // after slow captures). Bounded per iteration: when the encoder
-        // back-pressures (write_all blocks), an unbounded catch-up loop
-        // would keep accumulating debt and never observe the stop flag.
-        // Dropping backlog trades a brief slow-motion segment for bounded
-        // latency; FPS duplicates per pass caps a single iteration's
-        // writes at one second of video.
-        let due = (started_at.elapsed().as_secs_f64() / frame_interval) as u64 + 1;
-        if due - frames_written > FPS as u64 * 2 {
-            tracing::warn!(target: "recording",
-                "video encoder back-pressure: dropping {} frames of backlog",
-                due - frames_written - 1);
-            frames_written = due - 1;
-        }
-        let mut wrote_this_pass = 0u32;
-        while frames_written < due && wrote_this_pass < FPS {
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-            if stdin.write_all(&latest).is_err() {
-                // ffmpeg died; nothing more to do.
-                return;
-            }
-            frames_written += 1;
-            wrote_this_pass += 1;
-        }
-
-        match capturer.capture_frame(true, &mut scratch) {
-            Ok(info) if info == first_info => {
-                std::mem::swap(&mut latest, &mut scratch);
-                consecutive_failures = 0;
-            }
-            Ok(info) => {
-                // Output mode/scale changed mid-recording: the rawvideo
-                // geometry is fixed, so keep duplicating the last good
-                // frame rather than corrupting the stream. Recorded once
-                // into health (first occurrence = freeze point) so stop()
-                // surfaces "video froze at t=X" in structured state.
-                let mut h = health.lock().unwrap();
-                if h.froze.is_none() {
-                    tracing::warn!(target: "recording",
-                        "screencopy frame geometry changed ({}x{} -> {}x{}); freezing video frame",
-                        first_info.width, first_info.height, info.width, info.height);
-                    h.froze = Some(format!(
-                        "video froze at t={}ms: output geometry changed ({}x{} -> {}x{}); \
-                         frames after this point duplicate the last good frame",
-                        started_at.elapsed().as_millis(),
-                        first_info.width, first_info.height, info.width, info.height,
-                    ));
-                }
-                consecutive_failures = 0;
-            }
-            Err(e) => {
-                consecutive_failures += 1;
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    tracing::warn!(target: "recording",
-                        "screencopy capture failing persistently ({e:#}); stopping video frames");
-                    // Set BEFORE returning (the spawn closure drops stdin
-                    // right after, EOF-finalizing a truncated mp4) so
-                    // stop() always sees the failure after joining.
-                    health.lock().unwrap().fatal = Some(format!(
-                        "screencopy capture failing persistently ({e:#}); \
-                         video frames stopped at t={}ms",
-                        started_at.elapsed().as_millis(),
-                    ));
-                    return;
-                }
-            }
-        }
-
-        // Sleep to the next frame boundary.
-        let next = started_at + Duration::from_secs_f64(frames_written as f64 * frame_interval);
-        if let Some(d) = next.checked_duration_since(Instant::now()) {
-            std::thread::sleep(d);
-        }
-    }
-}
-
-impl VideoBackend for WaylandVideoBackend {
-    fn stop(mut self: Box<Self>) -> Result<VideoMetadata> {
+impl VideoBackend for ScreenshotSequenceVideoBackend {
+    fn stop(self: Box<Self>) -> Result<VideoMetadata> {
         let elapsed = self.started_at.elapsed();
+        let duration_ms = elapsed.as_millis() as u64;
+        let session_dir = self
+            .output_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
 
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.capture_thread.take() {
-            // Bounded wait: the thread can be stuck in write_all against a
-            // wedged encoder or inside capture_frame's libc::poll on the
-            // Wayland fd (the stop flag is only checked between captures),
-            // and stop() runs under the daemon-wide recording mutex — an
-            // unbounded join here would hang every recorded tool call.
-            // Killing ffmpeg breaks the pipe (EPIPE), which unblocks
-            // write_all and lets the thread exit.
-            let deadline = Instant::now() + Duration::from_millis(3000);
-            while !handle.is_finished() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            if !handle.is_finished() {
-                tracing::warn!(target: "recording",
-                    "video capture thread stuck (encoder back-pressure?); killing ffmpeg");
-                let _ = self.child.kill();
-            }
-            // The ffmpeg kill does NOT interrupt a Wayland poll — that only
-            // returns when capture_frame's internal deadline (4 s, see
-            // wayland_capture::CAPTURE_DEADLINE) expires. Bound this final
-            // join past that deadline with margin and leak the thread on
-            // expiry (the recording-hooks scratch threads set the precedent)
-            // rather than blocking the recording mutex; the try_wait loop
-            // below still reaps ffmpeg even when stdin never drops.
-            let join_deadline = Instant::now() + Duration::from_millis(5000);
-            while !handle.is_finished() && Instant::now() < join_deadline {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            if handle.is_finished() {
-                let _ = handle.join(); // stdin already dropped -> EOF sent
-            } else {
-                tracing::warn!(target: "recording",
-                    "video capture thread still blocked past the capture deadline; leaking it");
-            }
+        let frames = collect_target_window_frames(&session_dir);
+        if frames.is_empty() {
+            let error = "no target-window screenshots were recorded; Linux Wayland video avoids \
+                         display capture because locked desktops only expose the lock screen"
+                .to_string();
+            return Ok(VideoMetadata {
+                path: self.output_path,
+                duration_ms,
+                finalized: false,
+                error: Some(error),
+            });
         }
 
-        // Encoder flush on EOF; 4K ultrafast flush fits comfortably in 5 s.
-        let deadline = Instant::now() + Duration::from_millis(5000);
-        let mut finalized;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => {
-                    finalized = status.success();
-                    break;
-                }
-                Ok(None) => {
-                    if Instant::now() > deadline {
-                        let _ = self.child.kill();
-                        let _ = self.child.wait();
-                        finalized = false;
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(80));
-                }
-                Err(_) => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
-                    finalized = false;
-                    break;
-                }
-            }
-        }
-
-        // Capture-thread health beats ffmpeg's exit status: on persistent
-        // capture failure the feeder's early EOF makes ffmpeg finalize a
-        // truncated mp4 *cleanly*, so a successful exit must not report a
-        // healthy recording. A geometry freeze leaves the file playable
-        // (finalized stands) but the error still surfaces.
-        let mut error: Option<String> = None;
-        {
-            let h = self.health.lock().unwrap();
-            if let Some(fatal) = &h.fatal {
-                finalized = false;
-                error = Some(fatal.clone());
-            } else if let Some(froze) = &h.froze {
-                error = Some(froze.clone());
-            }
-        }
-
-        if let Some(handle) = self.stderr_thread.take() {
-            if let Ok(buf) = handle.join() {
-                if !finalized && !buf.is_empty() {
-                    let tail = String::from_utf8_lossy(&buf);
-                    tracing::warn!(target: "recording",
-                        "ffmpeg did not finalize cleanly. Last stderr tail:\n{tail}");
-                    if error.is_none() {
-                        error = Some(format!(
-                            "ffmpeg did not finalize cleanly. Last stderr tail:\n{tail}"
-                        ));
-                    }
-                }
-            }
-        }
-        if !finalized && error.is_none() {
-            error = Some("ffmpeg did not finalize cleanly".to_string());
-        }
-
+        let result =
+            encode_screenshot_sequence(&self.ffmpeg, &self.output_path, &frames, duration_ms);
         Ok(VideoMetadata {
             path: self.output_path,
-            duration_ms: elapsed.as_millis() as u64,
-            finalized,
-            error,
+            duration_ms,
+            finalized: result.is_ok(),
+            error: result.err().map(|e| e.to_string()),
         })
+    }
+}
+
+fn collect_target_window_frames(session_dir: &Path) -> Vec<TurnFrame> {
+    let mut frames = Vec::new();
+    let Ok(entries) = std::fs::read_dir(session_dir) else {
+        return frames;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("turn-") {
+            continue;
+        }
+        let turn_dir = entry.path();
+        let screenshot = preferred_turn_frame_path(&turn_dir);
+        if !screenshot.exists() {
+            continue;
+        }
+        let Some((t_ms, target_window)) = turn_timestamp_and_target(&turn_dir.join("action.json"))
+        else {
+            continue;
+        };
+        if target_window {
+            frames.push(TurnFrame {
+                path: screenshot,
+                t_ms,
+            });
+        }
+    }
+    frames.sort_by(|a, b| a.t_ms.cmp(&b.t_ms).then_with(|| a.path.cmp(&b.path)));
+    frames
+}
+
+fn preferred_turn_frame_path(turn_dir: &Path) -> PathBuf {
+    let click = turn_dir.join("click.png");
+    if click.exists() {
+        click
+    } else {
+        turn_dir.join("screenshot.png")
+    }
+}
+
+fn turn_timestamp_and_target(action_path: &Path) -> Option<(u64, bool)> {
+    let text = std::fs::read_to_string(action_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let t_ms = json
+        .get("t_ms_from_session_start")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let args = json.get("arguments")?;
+    let target_window = args.get("window_id").is_some() || args.get("pid").is_some();
+    Some((t_ms, target_window))
+}
+
+fn encode_screenshot_sequence(
+    ffmpeg: &Path,
+    output_path: &Path,
+    frames: &[TurnFrame],
+    duration_ms: u64,
+) -> Result<()> {
+    let durations = frame_durations_ms(frames, duration_ms);
+    let (width, height) = output_dimensions(frames)?;
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut cmd = Command::new(ffmpeg);
+    cmd.arg("-y").arg("-loglevel").arg("error");
+    for (frame, duration) in frames.iter().zip(durations.iter()) {
+        cmd.arg("-loop")
+            .arg("1")
+            .arg("-t")
+            .arg(format_duration(*duration))
+            .arg("-i")
+            .arg(&frame.path);
+    }
+
+    let mut filter_parts = Vec::with_capacity(frames.len() + 1);
+    for i in 0..frames.len() {
+        filter_parts.push(format!(
+            "[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,\
+             pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=rgba[v{i}]"
+        ));
+    }
+    let inputs = (0..frames.len())
+        .map(|i| format!("[v{i}]"))
+        .collect::<String>();
+    filter_parts.push(format!(
+        "{inputs}concat=n={}:v=1:a=0,format=yuv420p[v]",
+        frames.len()
+    ));
+    let filter_complex = filter_parts.join(";");
+
+    cmd.arg("-filter_complex")
+        .arg(filter_complex)
+        .arg("-map")
+        .arg("[v]")
+        .arg("-r")
+        .arg(FPS.to_string())
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg("ultrafast")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg("-g")
+        .arg(FPS.to_string())
+        .arg(output_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .context("spawn ffmpeg for screenshot-sequence recording")?;
+    let stderr_thread = child
+        .stderr
+        .take()
+        .map(cua_driver_core::video_ffmpeg::spawn_stderr_drain);
+
+    // Bounded wait: stop() runs under the daemon-wide recording mutex, so a
+    // wedged encode must be killed, never waited on indefinitely.
+    let deadline = Instant::now() + ENCODE_DEADLINE;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!(
+                        "ffmpeg screenshot-sequence encode exceeded {}s ({} frames); \
+                         killed to avoid blocking the recording mutex",
+                        ENCODE_DEADLINE.as_secs(),
+                        frames.len()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e).context("wait on ffmpeg screenshot-sequence encode");
+            }
+        }
+    };
+    if status.success() {
+        return Ok(());
+    }
+    let stderr_tail = stderr_thread
+        .and_then(|h| h.join().ok())
+        .map(|buf| String::from_utf8_lossy(&buf).into_owned())
+        .unwrap_or_default();
+    anyhow::bail!("ffmpeg screenshot-sequence encode failed ({status}): {stderr_tail}");
+}
+
+fn frame_durations_ms(frames: &[TurnFrame], total_duration_ms: u64) -> Vec<u64> {
+    frames
+        .iter()
+        .enumerate()
+        .map(|(i, frame)| {
+            let start = if i == 0 { 0 } else { frame.t_ms };
+            let end = frames
+                .get(i + 1)
+                .map(|next| next.t_ms)
+                .unwrap_or(total_duration_ms);
+            end.saturating_sub(start).max(250)
+        })
+        .collect()
+}
+
+fn output_dimensions(frames: &[TurnFrame]) -> Result<(u32, u32)> {
+    let mut width = 0;
+    let mut height = 0;
+    for frame in frames {
+        let bytes = std::fs::read(&frame.path)
+            .with_context(|| format!("read frame {}", frame.path.display()))?;
+        let (w, h) = cua_driver_core::image_utils::png_dimensions(&bytes)
+            .with_context(|| format!("read PNG dimensions for {}", frame.path.display()))?;
+        width = width.max(w);
+        height = height.max(h);
+    }
+    if width == 0 || height == 0 {
+        anyhow::bail!("no valid screenshot frames found");
+    }
+    if width % 2 != 0 {
+        width += 1;
+    }
+    if height % 2 != 0 {
+        height += 1;
+    }
+    Ok((width, height))
+}
+
+fn format_duration(ms: u64) -> String {
+    format!("{:.3}", ms as f64 / 1000.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "cua-linux-video-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_png(path: &Path, width: u32, height: u32) {
+        let rgba = vec![0x80; (width * height * 4) as usize];
+        let png = cua_driver_core::image_utils::encode_rgba_to_png(&rgba, width, height).unwrap();
+        std::fs::write(path, png).unwrap();
+    }
+
+    fn write_turn(root: &Path, idx: u32, t_ms: u64, args: serde_json::Value, click_png: bool) {
+        let turn = root.join(format!("turn-{idx:05}"));
+        std::fs::create_dir_all(&turn).unwrap();
+        let payload = serde_json::json!({
+            "tool": "click",
+            "arguments": args,
+            "result_summary": "ok",
+            "timestamp": "0.000",
+            "t_ms_from_session_start": t_ms,
+            "t_start_ms_from_session_start": t_ms,
+        });
+        std::fs::write(
+            turn.join("action.json"),
+            serde_json::to_vec_pretty(&payload).unwrap(),
+        )
+        .unwrap();
+        write_png(&turn.join("screenshot.png"), 3, 5);
+        if click_png {
+            write_png(&turn.join("click.png"), 5, 7);
+        }
+    }
+
+    #[test]
+    fn collect_target_window_frames_skips_display_only_turns() {
+        let dir = temp_dir("collect");
+        write_turn(&dir, 1, 100, serde_json::json!({"name":"zenity"}), false);
+        write_turn(
+            &dir,
+            2,
+            250,
+            serde_json::json!({"pid":42,"window_id":99}),
+            true,
+        );
+        write_turn(&dir, 3, 500, serde_json::json!({"pid":42}), false);
+
+        let frames = collect_target_window_frames(&dir);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].t_ms, 250);
+        assert_eq!(frames[1].t_ms, 500);
+        assert_eq!(frames[0].path.file_name().unwrap(), "click.png");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn frame_durations_start_first_target_at_zero_and_have_floor() {
+        let frames = vec![
+            TurnFrame {
+                path: PathBuf::from("a.png"),
+                t_ms: 5_000,
+            },
+            TurnFrame {
+                path: PathBuf::from("b.png"),
+                t_ms: 5_100,
+            },
+            TurnFrame {
+                path: PathBuf::from("c.png"),
+                t_ms: 8_000,
+            },
+        ];
+        assert_eq!(
+            frame_durations_ms(&frames, 9_000),
+            vec![5_100, 2_900, 1_000]
+        );
+    }
+
+    #[test]
+    fn output_dimensions_uses_max_even_extent() {
+        let dir = temp_dir("dimensions");
+        let a = dir.join("a.png");
+        let b = dir.join("b.png");
+        write_png(&a, 3, 5);
+        write_png(&b, 8, 6);
+        let frames = vec![
+            TurnFrame { path: a, t_ms: 0 },
+            TurnFrame { path: b, t_ms: 1 },
+        ];
+        assert_eq!(output_dimensions(&frames).unwrap(), (8, 6));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
