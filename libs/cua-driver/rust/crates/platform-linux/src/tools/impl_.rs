@@ -22,15 +22,21 @@ impl Default for DriverConfig {
     fn default() -> Self { Self { capture_mode: "som".into(), max_image_dimension: 1568 } }
 }
 
+/// Tracks the `max_image_dimension` downscale ratio per `(pid, window_id)`,
+/// matching the element cache's keying. Per-pid keying applied a ratio
+/// derived from one window's screenshot to clicks on the pid's OTHER
+/// windows (#16: a main-frame ratio scaled dialog-local coordinates ~2.4×
+/// off-target). A window that was never screenshotted/downscaled has no
+/// entry, so its caller-supplied coordinates pass through unscaled.
 pub struct ResizeRegistry {
-    ratios: std::sync::Mutex<std::collections::HashMap<u32, f64>>,
+    ratios: std::sync::Mutex<std::collections::HashMap<(u32, u64), f64>>,
 }
 
 impl ResizeRegistry {
     pub fn new() -> Self { Self { ratios: std::sync::Mutex::new(Default::default()) } }
-    pub fn set_ratio(&self, pid: u32, ratio: f64) { self.ratios.lock().unwrap().insert(pid, ratio); }
-    pub fn clear_ratio(&self, pid: u32) { self.ratios.lock().unwrap().remove(&pid); }
-    pub fn ratio(&self, pid: u32) -> Option<f64> { self.ratios.lock().unwrap().get(&pid).copied() }
+    pub fn set_ratio(&self, pid: u32, window_id: u64, ratio: f64) { self.ratios.lock().unwrap().insert((pid, window_id), ratio); }
+    pub fn clear_ratio(&self, pid: u32, window_id: u64) { self.ratios.lock().unwrap().remove(&(pid, window_id)); }
+    pub fn ratio(&self, pid: u32, window_id: u64) -> Option<f64> { self.ratios.lock().unwrap().get(&(pid, window_id)).copied() }
 }
 
 /// Per-process zoom context — stores padded crop origin and resize scale from
@@ -491,9 +497,9 @@ impl Tool for GetWindowStateTool {
 
                 if let Some(((b64, file_path), w, h, orig_w, region_crop)) = shot_opt {
                     if let Some(ow) = orig_w {
-                        if w > 0 { state.resize_registry.set_ratio(pid, ow as f64 / w as f64); }
+                        if w > 0 { state.resize_registry.set_ratio(pid, xid, ow as f64 / w as f64); }
                     } else {
-                        state.resize_registry.clear_ratio(pid);
+                        state.resize_registry.clear_ratio(pid, xid);
                     }
                     if let Some(b64) = b64 {
                         content.push(cua_driver_core::protocol::Content::image_png(b64));
@@ -1133,7 +1139,7 @@ impl Tool for ClickTool {
                     format!("from_zoom=true but no zoom context for pid {pid}. Call zoom first.")
                 ),
             }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+        } else if let Some(ratio) = self.state.resize_registry.ratio(pid, xid) {
             x *= ratio;
             y *= ratio;
         }
@@ -1656,7 +1662,7 @@ impl Tool for DoubleClickTool {
                     format!("from_zoom=true but no zoom context for pid {pid}. Call zoom first.")
                 ),
             }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+        } else if let Some(ratio) = self.state.resize_registry.ratio(pid, xid) {
             x *= ratio;
             y *= ratio;
         }
@@ -1764,7 +1770,7 @@ impl Tool for RightClickTool {
                     format!("from_zoom=true but no zoom context for pid {pid}. Call zoom first.")
                 ),
             }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+        } else if let Some(ratio) = self.state.resize_registry.ratio(pid, xid) {
             x *= ratio;
             y *= ratio;
         }
@@ -1854,7 +1860,7 @@ impl Tool for DragTool {
                 }
                 None => return ToolResult::error(format!("from_zoom=true but no zoom context for pid {pid}. Call zoom first.")),
             }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+        } else if let Some(ratio) = self.state.resize_registry.ratio(pid, xid) {
             from_x *= ratio; from_y *= ratio;
             to_x   *= ratio; to_y   *= ratio;
         }
@@ -2768,4 +2774,26 @@ pub fn build_registry(compat: bool) -> ToolRegistry {
     r.register_recording_tools();
     r.register_session_tools();
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #16: a ratio registered from one window's screenshot must never
+    /// scale clicks aimed at another window of the same pid — a window
+    /// with no entry takes its caller-supplied coordinates as given.
+    #[test]
+    fn resize_ratio_is_keyed_per_window_not_per_pid() {
+        let reg = ResizeRegistry::new();
+        reg.set_ratio(100, 1, 2.44);
+        assert_eq!(reg.ratio(100, 1), Some(2.44));
+        assert_eq!(reg.ratio(100, 2), None, "second window of the pid must not inherit the ratio");
+        assert_eq!(reg.ratio(101, 1), None);
+
+        reg.clear_ratio(100, 2); // clearing an absent window entry is a no-op
+        assert_eq!(reg.ratio(100, 1), Some(2.44));
+        reg.clear_ratio(100, 1);
+        assert_eq!(reg.ratio(100, 1), None);
+    }
 }
