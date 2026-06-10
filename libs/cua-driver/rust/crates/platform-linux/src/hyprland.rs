@@ -46,6 +46,8 @@ struct HyprMonitor {
     focused: bool,
     #[serde(default, rename = "activeWorkspace")]
     active_workspace: Option<HyprWorkspaceRef>,
+    #[serde(default, rename = "specialWorkspace")]
+    special_workspace: Option<HyprWorkspaceRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,6 +260,86 @@ pub fn focus_window(address: u64) {
     let _ = hyprctl_dispatch(&legacy);
 }
 
+/// Workspace ids currently visible on any monitor: each monitor's active
+/// workspace, plus its special-workspace overlay when one is open (id 0 =
+/// no special workspace shown). A window whose workspace is in this set is
+/// what a user would call "on screen".
+pub fn visible_workspace_ids() -> Vec<i64> {
+    let Ok(ms) = monitors() else { return Vec::new() };
+    let mut ids = Vec::new();
+    for m in ms {
+        if let Some(w) = m.active_workspace {
+            ids.push(w.id);
+        }
+        if let Some(w) = m.special_workspace {
+            if w.id != 0 {
+                ids.push(w.id);
+            }
+        }
+    }
+    ids
+}
+
+/// Name of the hidden special workspace background launches land on.
+pub const BACKGROUND_WORKSPACE: &str = "special:cua";
+
+/// Launch `shell_cmd` onto the hidden [`BACKGROUND_WORKSPACE`] via
+/// `hyprctl dispatch exec` with a `[workspace special:cua silent]` rule
+/// prefix — the window maps there without a workspace switch or focus
+/// change, so the user's session is untouched (the driver's no-foreground
+/// contract). Hyprland forks the child itself, so the pid is discovered by
+/// diffing the client list: returns the first new window (preferring one
+/// that actually landed on a special workspace, in case the user opened
+/// something mid-poll). `Ok(None)` means the dispatch was accepted but no
+/// new window mapped within the deadline — a slow cold start, or a
+/// single-instance app that routed to an existing process.
+pub fn launch_on_special_workspace(shell_cmd: &str) -> Result<Option<WindowInfo>> {
+    let before: std::collections::HashSet<u64> =
+        list_windows(None).iter().map(|w| w.xid).collect();
+    dispatch_exec_with_rules(
+        &format!("workspace {BACKGROUND_WORKSPACE} silent"),
+        shell_cmd,
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+        let fresh: Vec<WindowInfo> = list_windows(None)
+            .into_iter()
+            .filter(|w| !before.contains(&w.xid))
+            .collect();
+        if fresh.is_empty() {
+            continue;
+        }
+        let on_special = fresh
+            .iter()
+            .find(|w| w.workspace_id.is_some_and(|id| id < 0))
+            .cloned();
+        return Ok(Some(on_special.unwrap_or_else(|| fresh[0].clone())));
+    }
+    Ok(None)
+}
+
+/// `hyprctl dispatch exec` with a window-rule prefix, speaking both
+/// grammars: Hyprland ≥0.55 replaced hyprlang dispatch with Lua —
+/// `dispatch exec "[rules] cmd"` is a parse error there and the modern
+/// form is `hl.dsp.exec_cmd('[rules] cmd')` (verified on 0.55: the rule
+/// prefix rides inside the exec payload in both grammars). Try modern
+/// first, legacy second, mirroring `focus_window` above.
+fn dispatch_exec_with_rules(rules: &str, shell_cmd: &str) -> Result<()> {
+    let payload = format!("[{rules}] {shell_cmd}");
+    let lua = format!(
+        "hl.dsp.exec_cmd('{}')",
+        payload.replace('\\', r"\\").replace('\'', r"\'")
+    );
+    if hyprctl_dispatch(&lua) {
+        return Ok(());
+    }
+    if hyprctl_dispatch(&format!("exec {payload}")) {
+        return Ok(());
+    }
+    bail!("hyprctl dispatch exec was rejected in both the modern (Lua) and legacy grammar");
+}
+
 /// Run `hyprctl dispatch <arg>`; true only when the compositor answered
 /// "ok" (hyprctl can exit 0 while printing an error).
 fn hyprctl_dispatch(arg: &str) -> bool {
@@ -353,6 +435,7 @@ fn list_windows_inner(filter_pid: Option<u32>) -> Result<Vec<WindowInfo>> {
             y: client.at[1],
             width: client.size[0] as u32,
             height: client.size[1] as u32,
+            workspace_id: client.workspace.as_ref().map(|w| w.id),
         });
     }
     Ok(out)

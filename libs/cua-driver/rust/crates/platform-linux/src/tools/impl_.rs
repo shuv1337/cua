@@ -298,11 +298,35 @@ impl Tool for ListWindowsTool {
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         let filter_pid = args.opt_u64("pid").map(|v| v as u32);
-        let windows = tokio::task::spawn_blocking(move || crate::x11::list_windows(filter_pid)).await.unwrap_or_default();
+        let (windows, visible_ws) = tokio::task::spawn_blocking(move || {
+            let windows = crate::x11::list_windows(filter_pid);
+            // Hyprland: which workspaces are currently shown on a monitor,
+            // so callers can tell an on-screen window from one parked on
+            // another (or the hidden special:cua) workspace.
+            let visible_ws = if crate::hyprland::is_hyprland_session() {
+                Some(crate::hyprland::visible_workspace_ids())
+            } else {
+                None
+            };
+            (windows, visible_ws)
+        })
+        .await
+        .unwrap_or_default();
+        let on_current_space = |w: &crate::x11::WindowInfo| -> Option<bool> {
+            match (&visible_ws, w.workspace_id) {
+                (Some(visible), Some(ws)) => Some(visible.contains(&ws)),
+                _ => None,
+            }
+        };
         let mut lines = vec![format!("Found {} windows:", windows.len())];
         for w in &windows {
-            lines.push(format!("  [xid={}] pid={:?} \"{}\" {}x{}+{}+{}",
-                w.xid, w.pid, w.title, w.width, w.height, w.x, w.y));
+            let ws_note = match (w.workspace_id, on_current_space(w)) {
+                (Some(ws), Some(false)) => format!(" [workspace {ws}, off-screen]"),
+                (Some(ws), _) => format!(" [workspace {ws}]"),
+                _ => String::new(),
+            };
+            lines.push(format!("  [xid={}] pid={:?} \"{}\" {}x{}+{}+{}{}",
+                w.xid, w.pid, w.title, w.width, w.height, w.x, w.y, ws_note));
         }
         let structured = json!({ "windows": windows.iter().map(|w| json!({
             "window_id": w.xid,
@@ -310,6 +334,8 @@ impl Tool for ListWindowsTool {
             "title": w.title,
             "x": w.x, "y": w.y,
             "width": w.width, "height": w.height,
+            "workspace_id": w.workspace_id,
+            "on_current_space": on_current_space(w),
         })).collect::<Vec<_>>() });
         ToolResult::text(lines.join("\n")).with_structured(structured)
     }
@@ -515,7 +541,11 @@ impl Tool for LaunchAppTool {
             description: "Launch a Linux app in the background. Provide launch_path (preferred — \
                 round-trip the value from list_apps), name (app name, launched via xdg-open or \
                 direct exec), bundle_id (ignored on Linux), or urls (list of URLs to open). \
-                Resolution precedence: launch_path > name > bundle_id.".into(),
+                Resolution precedence: launch_path > name > bundle_id. Under Hyprland the app \
+                is launched onto the hidden workspace special:cua (silent — no focus or \
+                workspace change for the user) and the result carries the mapped window's \
+                pid + window_id; the window stays fully drivable via get_window_state, \
+                element_index actions, and per-window screenshots.".into(),
             input_schema: json!({"type":"object","properties":{
                 "launch_path":{"type":"string","description":"Round-trip the `launch_path` returned by `list_apps` — the Exec= command from the .desktop file with XDG field codes already stripped. Highest precedence on Linux; spawned directly via the system shell."},
                 "name":{"type":"string","description":"App name or command to launch."},
@@ -556,6 +586,51 @@ impl Tool for LaunchAppTool {
             // canonical form preferred by list_apps callers.
             let command = launch_path_opt.as_deref().or(name_opt.as_deref());
             if let Some(cmd) = command {
+                let shown = if extra_args.is_empty() {
+                    cmd.to_owned()
+                } else {
+                    format!("{cmd} {}", extra_args.join(" "))
+                };
+                // Hyprland: launch onto the hidden `special:cua` workspace so
+                // the window never maps onto the user's active workspace —
+                // the focus-restore guard above only fixes focus, not
+                // placement (issue #3). Any dispatch failure falls through to
+                // the direct spawn below.
+                if crate::hyprland::is_hyprland_session() {
+                    let shell_cmd = build_background_shell_command(cmd, &extra_args);
+                    match crate::hyprland::launch_on_special_workspace(&shell_cmd) {
+                        Ok(Some(w)) => {
+                            return Ok(format!(
+                                "Launched '{}' in the background on hidden workspace {} — \
+                                 pid {}, window_id {} (\"{}\"). The window is intentionally \
+                                 NOT visible on the user's current workspace; drive it with \
+                                 get_window_state / element_index actions and per-window \
+                                 screenshots.",
+                                shown,
+                                crate::hyprland::BACKGROUND_WORKSPACE,
+                                w.pid.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()),
+                                w.xid,
+                                w.title,
+                            ));
+                        }
+                        Ok(None) => {
+                            return Ok(format!(
+                                "Dispatched '{}' to hidden workspace {} but no new window \
+                                 mapped within 10s — the app may still be starting, or it \
+                                 routed to an already-running instance. Poll list_apps / \
+                                 list_windows to find it.",
+                                shown,
+                                crate::hyprland::BACKGROUND_WORKSPACE,
+                            ));
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Hyprland special-workspace launch failed ({e:#}); \
+                                 falling back to direct spawn"
+                            );
+                        }
+                    }
+                }
                 let mut parts = cmd.split_whitespace();
                 let prog = parts.next().unwrap_or(cmd);
                 let rest: Vec<&str> = parts.collect();
@@ -568,11 +643,6 @@ impl Tool for LaunchAppTool {
                 force_accessibility_bridge_for_launched_apps(&mut command);
                 match command.spawn() {
                     Ok(child) => {
-                        let shown = if extra_args.is_empty() {
-                            cmd.to_owned()
-                        } else {
-                            format!("{cmd} {}", extra_args.join(" "))
-                        };
                         return Ok(format!("Launched '{}' with pid {}.", shown, child.id()));
                     }
                     Err(_) if extra_args.is_empty() => {
@@ -663,6 +733,16 @@ fn prefer_xwayland_for_launched_apps(command: &mut std::process::Command) {
 /// (`env GTK_MODULES=... cmd` via launch_path) still wins because env(1)
 /// overrides the spawn-time environment.
 fn force_accessibility_bridge_for_launched_apps(command: &mut std::process::Command) {
+    for (k, v) in accessibility_bridge_env_pairs() {
+        command.env(k, v);
+    }
+}
+
+/// The accessibility-bridge env as key/value pairs, shared between the
+/// direct-spawn path (`Command::env`) and the Hyprland special-workspace
+/// path (where the pairs ride inside the `hyprctl dispatch exec` string,
+/// because Hyprland forks the child — not this process).
+fn accessibility_bridge_env_pairs() -> Vec<(&'static str, String)> {
     // Merge with an inherited GTK_MODULES rather than clobbering it —
     // users legitimately carry other modules (e.g. canberra-gtk-module).
     let gtk_modules = match std::env::var("GTK_MODULES") {
@@ -677,10 +757,52 @@ fn force_accessibility_bridge_for_launched_apps(command: &mut std::process::Comm
         }
         _ => "gail:atk-bridge".to_owned(),
     };
-    command.env("GTK_MODULES", gtk_modules);
-    command.env("NO_AT_BRIDGE", "0");
-    command.env("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1");
-    command.env("QT_ACCESSIBILITY", "1");
+    vec![
+        ("GTK_MODULES", gtk_modules),
+        ("NO_AT_BRIDGE", "0".to_owned()),
+        ("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1".to_owned()),
+        ("QT_ACCESSIBILITY", "1".to_owned()),
+    ]
+}
+
+/// Build the `env … <cmd> <args>` shell line for a Hyprland background
+/// launch. The launch env (XWayland preference + accessibility bridge) must
+/// be inline because the child is forked by Hyprland's exec, not by this
+/// process. `cmd` is an XDG `Exec=`-style line and passes through verbatim;
+/// `extra_args` are shell-quoted individually.
+fn build_background_shell_command(cmd: &str, extra_args: &[String]) -> String {
+    let mut env_pairs: Vec<(&'static str, String)> = Vec::new();
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() && std::env::var_os("DISPLAY").is_some() {
+        // Same rationale as prefer_xwayland_for_launched_apps.
+        env_pairs.push(("GDK_BACKEND", "x11".to_owned()));
+        env_pairs.push(("QT_QPA_PLATFORM", "xcb".to_owned()));
+    }
+    env_pairs.extend(accessibility_bridge_env_pairs());
+    let mut line = String::from("env");
+    for (k, v) in env_pairs {
+        line.push(' ');
+        line.push_str(k);
+        line.push('=');
+        line.push_str(&shell_quote(&v));
+    }
+    line.push(' ');
+    line.push_str(cmd);
+    for arg in extra_args {
+        line.push(' ');
+        line.push_str(&shell_quote(arg));
+    }
+    line
+}
+
+/// Minimal POSIX single-quote escaping; leaves obviously-safe tokens bare
+/// for readability.
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=,+@%".contains(c))
+    {
+        return s.to_owned();
+    }
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// Resolve an AT-SPI element's center in window-local X11 coordinates.

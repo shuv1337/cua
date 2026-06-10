@@ -18,6 +18,11 @@ pub struct WindowInfo {
     pub y: i32,
     pub width: u32,
     pub height: u32,
+    /// Compositor workspace the window sits on. Populated for Hyprland
+    /// clients (negative ids = special workspaces, e.g. the hidden
+    /// `special:cua` background-launch workspace); `None` on plain X11
+    /// where the enumeration doesn't track desktops.
+    pub workspace_id: Option<i64>,
 }
 
 /// List top-level windows, optionally filtered by pid.
@@ -27,7 +32,13 @@ pub fn list_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
         Err(_) => Vec::new(),
     };
     for window in crate::hyprland::list_windows(filter_pid) {
-        if windows.iter().any(|existing| same_window(existing, &window)) {
+        if let Some(existing) = windows.iter_mut().find(|existing| same_window(existing, &window)) {
+            // The X11 entry wins the dedupe (real XIDs work for pixel input)
+            // but only the compositor knows workspace placement — merge it
+            // in so XWayland windows still report on_current_space.
+            if existing.workspace_id.is_none() {
+                existing.workspace_id = window.workspace_id;
+            }
             continue;
         }
         windows.push(window);
@@ -67,7 +78,9 @@ fn list_windows_inner(filter_pid: Option<u32>) -> Result<Vec<WindowInfo>> {
             (0, 0, 0, 0)
         };
 
-        result.push(WindowInfo { xid: xid as u64, pid, title, x, y, width: w, height: h });
+        result.push(WindowInfo {
+            xid: xid as u64, pid, title, x, y, width: w, height: h, workspace_id: None,
+        });
     }
 
     Ok(result)
