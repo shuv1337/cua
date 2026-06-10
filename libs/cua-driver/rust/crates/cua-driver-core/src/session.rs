@@ -114,6 +114,45 @@ pub fn touch_session(session_id: &str) {
         .insert(session_id.to_owned(), Instant::now());
 }
 
+/// Re-declare a session id, clearing any tombstone left by a previous end
+/// (explicit `end_session`, idle-TTL reclaim, or control-connection EOF) and
+/// starting a fresh idle-TTL clock. Returns `true` when a tombstone was
+/// cleared. This is the `start_session` path: re-declaration wins over the
+/// tombstone, because the alternative — permanently burned ids — leaves an
+/// agent whose session was TTL-reclaimed mid-run with no recovery path
+/// except guessing a fresh id. Session-owned state (cursor, recording,
+/// config overrides) was already cleaned up when the previous incarnation
+/// ended, so the revived id starts from scratch like any new session.
+/// No-op (returns `false`) for the anonymous fallback.
+pub fn revive_session(session_id: &str) -> bool {
+    if !is_trackable(session_id) {
+        return false;
+    }
+    let was_ended = ended_sessions().lock().unwrap().remove(session_id);
+    activity()
+        .lock()
+        .unwrap()
+        .insert(session_id.to_owned(), Instant::now());
+    was_ended
+}
+
+/// Default idle-TTL for a caller-declared session (seconds). A session that
+/// isn't touched for this long is reclaimed by the daemon's idle sweep.
+pub const SESSION_IDLE_TTL_SECS_DEFAULT: u64 = 300;
+
+/// Effective session idle-TTL in seconds: `CUA_DRIVER_RS_SESSION_IDLE_TTL_SECS`
+/// when set to a positive integer, else [`SESSION_IDLE_TTL_SECS_DEFAULT`].
+/// Lives here (rather than the daemon crate) so `get_config` on the platform
+/// crates can report it — agents need the TTL to be discoverable to plan
+/// around mid-run reclaims.
+pub fn session_idle_ttl_secs() -> u64 {
+    std::env::var("CUA_DRIVER_RS_SESSION_IDLE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(SESSION_IDLE_TTL_SECS_DEFAULT)
+}
+
 /// End a session explicitly (the `end_session` tool / `session end` CLI verb):
 /// drop its idle-TTL entry and fan `fire_session_end` out to every cleanup hook
 /// (overlay remove, recording stop, config-override clear). Idempotent via
@@ -204,6 +243,36 @@ mod tests {
         // Neither shows up under a zero-TTL sweep (they were never inserted).
         let evicted = evict_idle(Duration::ZERO);
         assert!(!evicted.iter().any(|s| s == "default" || s.is_empty()));
+    }
+
+    #[test]
+    fn revive_clears_tombstone_and_restarts_ttl_clock() {
+        let sid = "test-revive-session-445566";
+        touch_session(sid);
+        end_session(sid);
+        assert!(is_session_ended(sid));
+        // touch on a tombstoned id stays a no-op…
+        touch_session(sid);
+        assert!(is_session_ended(sid));
+        // …but an explicit re-declaration clears the tombstone and the id is
+        // live again with a fresh activity entry.
+        assert!(revive_session(sid), "revive must report the tombstone it cleared");
+        assert!(!is_session_ended(sid));
+        assert!(
+            evict_idle(Duration::ZERO).iter().any(|s| s == sid),
+            "revived session must be back under idle-TTL tracking"
+        );
+    }
+
+    #[test]
+    fn revive_on_fresh_or_anonymous_id() {
+        // Fresh id: no tombstone to clear, but it becomes tracked.
+        let sid = "test-revive-fresh-778899";
+        assert!(!revive_session(sid));
+        assert!(evict_idle(Duration::ZERO).iter().any(|s| s == sid));
+        // Anonymous ids are never tracked nor revived.
+        assert!(!revive_session("default"));
+        assert!(!revive_session(""));
     }
 
     #[test]

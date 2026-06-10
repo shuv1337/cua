@@ -139,18 +139,24 @@ fn spawn_recording_idle_backstop(
     });
 }
 
-/// Default idle-TTL for a caller-declared session (seconds). A session that
+/// Effective idle-TTL for a caller-declared session (seconds). A session that
 /// isn't touched (no tool call carrying its `session`) for this long is reclaimed
 /// by [`spawn_session_idle_sweep`] — its cursor removed, recording stopped,
-/// config cleared. Overridable via `CUA_DRIVER_RS_SESSION_IDLE_TTL_SECS`.
-const SESSION_IDLE_TTL_SECS_DEFAULT: u64 = 300;
-
+/// config cleared. Value + `CUA_DRIVER_RS_SESSION_IDLE_TTL_SECS` override live
+/// in core so platform `get_config` tools can report it.
 fn session_idle_ttl_secs() -> u64 {
-    std::env::var("CUA_DRIVER_RS_SESSION_IDLE_TTL_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(SESSION_IDLE_TTL_SECS_DEFAULT)
+    cua_driver_core::session::session_idle_ttl_secs()
+}
+
+/// Gate message for a tool call carrying an ended session id. Names the
+/// session and the remedy — agents hitting a TTL-reclaimed id mid-run need
+/// to know `start_session` (same id or a new one) is the recovery path.
+fn session_ended_message(sid: &str) -> String {
+    format!(
+        "Session '{sid}' has ended (end_session, idle-TTL reclaim, or client disconnect); \
+         this tool call was ignored. Call start_session with this id to begin a fresh \
+         session under it, or switch to a new session id."
+    )
 }
 
 /// Spawn the detached idle-TTL sweep for caller-declared sessions.
@@ -603,13 +609,19 @@ pub async fn run_serve(
                                 // would re-create session-owned state (cursor,
                                 // config override, recording) the reaper already
                                 // passed. Skip + benign ok. Live and anonymous
-                                // calls pass through unchanged.
+                                // calls pass through unchanged. `start_session`
+                                // is exempt: re-declaring an ended id clears the
+                                // tombstone and starts a fresh session (see
+                                // session::revive_session) — without the
+                                // exemption a TTL-reclaimed id is burned forever.
                                 if let Some(sid) = &effective_session {
-                                    if cua_driver_core::session::is_session_ended(sid) {
+                                    if tool_name != "start_session"
+                                        && cua_driver_core::session::is_session_ended(sid)
+                                    {
                                         let resp = DaemonResponse::ok(serde_json::json!({
                                             "content": [{
                                                 "type": "text",
-                                                "text": "session ended; tool call ignored"
+                                                "text": session_ended_message(sid)
                                             }],
                                             "isError": false,
                                             "sessionEnded": true
@@ -1107,13 +1119,16 @@ pub async fn run_serve(
                                 // (see the unix branch + apply_session_identity).
                                 let effective_session =
                                     apply_session_identity(&mut args, &req.session_id);
-                                // Resurrection guard on the effective session.
+                                // Resurrection guard on the effective session
+                                // (start_session exempt — see the unix branch).
                                 if let Some(sid) = &effective_session {
-                                    if cua_driver_core::session::is_session_ended(sid) {
+                                    if tool_name != "start_session"
+                                        && cua_driver_core::session::is_session_ended(sid)
+                                    {
                                         let resp = DaemonResponse::ok(serde_json::json!({
                                             "content": [{
                                                 "type": "text",
-                                                "text": "session ended; tool call ignored"
+                                                "text": session_ended_message(sid)
                                             }],
                                             "isError": false,
                                             "sessionEnded": true
@@ -1444,6 +1459,7 @@ mod gate_tests {
 
         let mut reg = ToolRegistry::new();
         reg.register(Box::new(ProbeTool::new()));
+        reg.register_session_tools();
         let registry = Arc::new(reg);
 
         // Unique temp socket — never the default socket / CuaDriver.app daemon.
@@ -1521,7 +1537,48 @@ mod gate_tests {
             "ended-session call must be a no-op (counter unchanged) — resurrection closed"
         );
 
-        // 4. Anonymous call (no session id) still passes — no false positive.
+        // 4. start_session with the SAME ended sid → passes the gate (exempt)
+        //    and revives the id as a fresh session.
+        let socket4a = socket.clone();
+        let s4 = sid.to_owned();
+        let resp = tokio::task::spawn_blocking(move || {
+            send_request(
+                &socket4a,
+                &DaemonRequest {
+                    method: "call".into(),
+                    name: Some("start_session".into()),
+                    args: Some(serde_json::json!({ "session": s4 })),
+                    session_id: Some(s4.clone()),
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .expect("start_session response");
+        assert!(resp.ok, "start_session on an ended id must succeed");
+        let gated = resp
+            .result
+            .as_ref()
+            .and_then(|r| r.get("sessionEnded"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(!gated, "start_session must not be gated by the tombstone");
+
+        // 5. The revived session's calls run again.
+        let socket5a = socket.clone();
+        let s5 = sid.to_owned();
+        let resp = tokio::task::spawn_blocking(move || send_request(&socket5a, &call_req(Some(&s5))))
+            .await
+            .unwrap()
+            .expect("revived call response");
+        assert!(resp.ok, "revived-session call should succeed");
+        assert_eq!(
+            PROBE_INVOCATIONS.load(Ordering::SeqCst),
+            2,
+            "revived-session call must invoke the tool again"
+        );
+
+        // 6. Anonymous call (no session id) still passes — no false positive.
         let socket4 = socket.clone();
         let resp = tokio::task::spawn_blocking(move || send_request(&socket4, &call_req(None)))
             .await
@@ -1530,7 +1587,7 @@ mod gate_tests {
         assert!(resp.ok, "anonymous call should succeed");
         assert_eq!(
             PROBE_INVOCATIONS.load(Ordering::SeqCst),
-            2,
+            3,
             "anonymous (no session id) call must still invoke the tool"
         );
 
