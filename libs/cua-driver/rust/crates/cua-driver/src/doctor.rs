@@ -452,6 +452,64 @@ fn append_platform_probes(report: &mut Report) {
             }
         }
     }
+
+    // Toolkit-accessibility probe. GTK3/wx apps only load the atk-bridge
+    // (and thus appear on the AT-SPI bus) when this gsettings flag is on.
+    // launch_app forces the bridge via env for apps *it* spawns, so a
+    // disabled flag only degrades pre-existing processes — hence warn, not
+    // error. Missing gsettings (non-GLib desktop) is skipped silently.
+    if let Some(enabled) = probe_toolkit_accessibility_gsetting(std::time::Duration::from_secs(3)) {
+        if enabled {
+            report.push(Probe::ok(
+                "toolkit accessibility",
+                "org.gnome.desktop.interface toolkit-accessibility is enabled",
+            ));
+        } else {
+            report.push(
+                Probe::warn(
+                    "toolkit accessibility",
+                    "org.gnome.desktop.interface toolkit-accessibility is disabled",
+                )
+                .with_detail(
+                    "GTK3/wxWidgets apps started outside cua-driver won't register on the AT-SPI bus (empty get_window_state trees). Apps launched via launch_app get the atk-bridge forced through their environment, or enable globally: gsettings set org.gnome.desktop.interface toolkit-accessibility true",
+                ),
+            );
+        }
+    }
+}
+
+/// Read `org.gnome.desktop.interface toolkit-accessibility` via gsettings.
+/// Returns `None` when gsettings is missing, times out, errors, or prints
+/// something unexpected — callers treat that as "not determinable, skip".
+#[cfg(target_os = "linux")]
+fn probe_toolkit_accessibility_gsetting(timeout: std::time::Duration) -> Option<bool> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use wait_timeout::ChildExt;
+
+    let mut child = Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "toolkit-accessibility"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    match child.wait_timeout(timeout) {
+        Ok(Some(status)) if status.success() => {
+            let mut out = String::new();
+            child.stdout.take()?.read_to_string(&mut out).ok()?;
+            match out.trim() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            }
+        }
+        Ok(Some(_)) => None,
+        _ => {
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
