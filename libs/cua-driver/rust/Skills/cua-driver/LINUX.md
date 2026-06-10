@@ -165,8 +165,23 @@ printer host" modal: opening a wx modal dialog **drops the entire
 application off the accessibility bus** — not just the dialog. The
 previously 203-element main window and the dialog both return
 1-element trees, and an external pyatspi probe shows the pid absent
-from `org.a11y.Bus` entirely. Every no-foreground input path
-dead-ends on such a dialog (all verified):
+from `org.a11y.Bus` entirely.
+
+The driver detects this (shuv1337/cua#17): it remembers the most
+elements it ever saw for the pid, and a near-empty snapshot from a
+previously-populated app is reported as a likely modal collapse
+(`atspi_tree_collapsed: true` + the peak count in `get_window_state`,
+and a matching warning on unverified XSendEvent clicks). **Do not
+relaunch the app when you see that warning** — the accessibility
+bridge is fine and a relaunch destroys in-memory state (a finished
+slice, an open document). Recovery: close or complete the dialog by
+other means — keyboard commit, the app's own API (rung 5 below), or
+cancel it — and the tree returns when the modal closes. The
+"relaunch via launch_app" advice now only appears for pids that
+never produced a populated tree (a real launch-env problem).
+
+Every no-foreground input path dead-ends on such a dialog (all
+verified):
 
 - XSendEvent mouse + keyboard → silently ignored (wx filters
   `send_event=true`)
