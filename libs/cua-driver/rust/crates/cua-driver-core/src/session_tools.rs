@@ -45,9 +45,11 @@ impl Tool for StartSessionTool {
                  The cursor's color is derived from the id, so distinct runs are visually \
                  distinct. A cursor is shown only for a declared session — call this (or \
                  pass `session` on your first action) to opt in. Idempotent: re-calling \
-                 with the same id just refreshes its idle-TTL. End it with `end_session` \
-                 (or let the idle-TTL reclaim it). Concurrent runs/subagents each pass \
-                 their own `session` to get their own cursor."
+                 with the same id just refreshes its idle-TTL, and re-declaring an id \
+                 that has ended (end_session or idle-TTL reclaim) starts a fresh session \
+                 under the same id. End it with `end_session` (or let the idle-TTL \
+                 reclaim it). Concurrent runs/subagents each pass their own `session` \
+                 to get their own cursor."
                     .into(),
             input_schema: json!({
                 "type": "object",
@@ -73,11 +75,26 @@ impl Tool for StartSessionTool {
                 "start_session requires a non-empty `session` id.",
             );
         };
-        // Refresh (or begin) the session's idle-TTL clock. The cursor appears on
-        // the first action carrying this `session`.
-        crate::session::touch_session(&id);
-        ToolResult::text(format!("✅ Session '{id}' is active."))
-            .with_structured(json!({ "session": id, "active": true }))
+        // Begin (or refresh) the session's idle-TTL clock. Re-declaration wins
+        // over a tombstone: an id ended by end_session / the idle-TTL sweep
+        // starts over as a fresh session instead of being burned forever.
+        // The cursor appears on the first action carrying this `session`.
+        let revived = crate::session::revive_session(&id);
+        let ttl = crate::session::session_idle_ttl_secs();
+        let msg = if revived {
+            format!(
+                "✅ Session '{id}' is active (fresh session — the previous '{id}' had ended; \
+                 its cursor/recording/config did not carry over)."
+            )
+        } else {
+            format!("✅ Session '{id}' is active.")
+        };
+        ToolResult::text(msg).with_structured(json!({
+            "session": id,
+            "active": true,
+            "revived": revived,
+            "idle_ttl_secs": ttl
+        }))
     }
 }
 
