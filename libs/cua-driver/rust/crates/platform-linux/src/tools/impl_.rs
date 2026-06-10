@@ -565,6 +565,7 @@ impl Tool for LaunchAppTool {
                 // splitting), so values with spaces survive intact.
                 command.args(&extra_args);
                 prefer_xwayland_for_launched_apps(&mut command);
+                force_accessibility_bridge_for_launched_apps(&mut command);
                 match command.spawn() {
                     Ok(child) => {
                         let shown = if extra_args.is_empty() {
@@ -620,6 +621,36 @@ fn prefer_xwayland_for_launched_apps(command: &mut std::process::Command) {
     // still wins, e.g. env GDK_BACKEND=wayland ... .
     command.env("GDK_BACKEND", "x11");
     command.env("QT_QPA_PLATFORM", "xcb");
+}
+
+/// The element_index action path requires the target to register on the
+/// AT-SPI bus, but GTK3/wxWidgets only load the atk-bridge when the
+/// `org.gnome.desktop.interface toolkit-accessibility` gsettings flag is on
+/// (commonly off outside GNOME), and Qt gates on its own env switch. Force
+/// the bridge for driver-launched apps so the first `get_window_state`
+/// returns a populated tree instead of a bare window node. GTK4 connects
+/// unconditionally and ignores these. Explicit env in the user's command
+/// (`env GTK_MODULES=... cmd` via launch_path) still wins because env(1)
+/// overrides the spawn-time environment.
+fn force_accessibility_bridge_for_launched_apps(command: &mut std::process::Command) {
+    // Merge with an inherited GTK_MODULES rather than clobbering it —
+    // users legitimately carry other modules (e.g. canberra-gtk-module).
+    let gtk_modules = match std::env::var("GTK_MODULES") {
+        Ok(existing) if !existing.is_empty() => {
+            let mut modules: Vec<&str> = existing.split(':').filter(|m| !m.is_empty()).collect();
+            for required in ["gail", "atk-bridge"] {
+                if !modules.contains(&required) {
+                    modules.push(required);
+                }
+            }
+            modules.join(":")
+        }
+        _ => "gail:atk-bridge".to_owned(),
+    };
+    command.env("GTK_MODULES", gtk_modules);
+    command.env("NO_AT_BRIDGE", "0");
+    command.env("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1");
+    command.env("QT_ACCESSIBILITY", "1");
 }
 
 /// Resolve an AT-SPI element's center in window-local X11 coordinates.
