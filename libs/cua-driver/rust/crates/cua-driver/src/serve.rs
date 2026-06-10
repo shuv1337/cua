@@ -387,6 +387,101 @@ pub fn send_request(socket_path: &str, req: &DaemonRequest) -> anyhow::Result<Da
     Ok(resp)
 }
 
+/// Like [`send_request`], but rides out transient failures instead of giving
+/// up on the first EAGAIN:
+///
+/// - **connect**: retries `ConnectionRefused` / `WouldBlock` / `Interrupted`
+///   for up to ~1.5 s (50 ms backoff) — parity with the Windows named-pipe
+///   open loop. `NotFound` (no socket file) still fails immediately so a
+///   stopped daemon stays a fast check.
+/// - **read**: a busy daemon (long AT-SPI walk, slow screenshot) can exceed
+///   the per-read SO_RCVTIMEO, which surfaces as EAGAIN ("Resource
+///   temporarily unavailable") even though the daemon is healthy and the
+///   reply is coming. Resume reading until an overall reply deadline
+///   (default 60 s, `CUA_DRIVER_RS_DAEMON_REPLY_TIMEOUT_SECS` override)
+///   instead of declaring the daemon dead. Resuming a read never re-sends
+///   the request, so a non-idempotent tool can't run twice.
+///
+/// Use this for per-call proxying (the CLI `run_call` path); keep plain
+/// `send_request` for fast existence probes like `is_daemon_listening`.
+#[cfg(unix)]
+pub fn send_request_resilient(
+    socket_path: &str,
+    req: &DaemonRequest,
+) -> anyhow::Result<DaemonResponse> {
+    use std::io::{ErrorKind, Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    let connect_deadline = Instant::now() + Duration::from_millis(1500);
+    let mut stream = loop {
+        match UnixStream::connect(socket_path) {
+            Ok(s) => break s,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::ConnectionRefused
+                        | ErrorKind::WouldBlock
+                        | ErrorKind::Interrupted
+                ) && Instant::now() < connect_deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => anyhow::bail!("connect to {socket_path}: {e}"),
+        }
+    };
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    // Short per-read timeout so the resume loop can check the overall
+    // deadline; this is NOT the reply budget.
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+
+    let line = serde_json::to_string(req)? + "\n";
+    stream.write_all(line.as_bytes())?;
+    stream.flush()?;
+
+    let reply_budget_secs = std::env::var("CUA_DRIVER_RS_DAEMON_REPLY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(60);
+    let reply_deadline = Instant::now() + Duration::from_secs(reply_budget_secs);
+    let mut raw: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while !raw.contains(&b'\n') {
+        match stream.read(&mut chunk) {
+            Ok(0) => anyhow::bail!("daemon closed connection without response"),
+            Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) =>
+            {
+                if Instant::now() >= reply_deadline {
+                    anyhow::bail!(
+                        "no daemon reply within {reply_budget_secs}s (socket alive but \
+                         the connection task may be wedged — try `cua-driver status`)"
+                    );
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let nl = raw.iter().position(|b| *b == b'\n').unwrap_or(raw.len());
+    let resp: DaemonResponse = serde_json::from_slice(&raw[..nl])?;
+    Ok(resp)
+}
+
+/// Non-unix passthrough: the Windows named-pipe `send_request` already
+/// retries opens for 3 s, which covers the transient-failure window.
+#[cfg(not(unix))]
+pub fn send_request_resilient(
+    socket_path: &str,
+    req: &DaemonRequest,
+) -> anyhow::Result<DaemonResponse> {
+    send_request(socket_path, req)
+}
+
 #[cfg(not(unix))]
 pub fn send_request(socket_path: &str, req: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
     #[cfg(target_os = "windows")]
@@ -552,6 +647,27 @@ pub async fn run_serve(
                                     }))
                                     .collect();
                                 let resp = DaemonResponse::ok(serde_json::json!({"tools": tools}));
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "status" => {
+                                // Daemon-side health snapshot: a successful
+                                // round-trip proves a connection task serviced
+                                // the request (not merely that the socket file
+                                // exists), and the payload lets the CLI surface
+                                // recording/session state.
+                                let rec = reg.recording.current_state();
+                                let resp = DaemonResponse::ok(serde_json::json!({
+                                    "pid": std::process::id(),
+                                    "version": env!("CARGO_PKG_VERSION"),
+                                    "active_sessions": cua_driver_core::session::active_session_count(),
+                                    "recording": {
+                                        "enabled": rec.enabled,
+                                        "output_dir": rec.output_dir,
+                                        "next_turn": rec.next_turn,
+                                    },
+                                }));
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
@@ -1090,6 +1206,23 @@ pub async fn run_serve(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
                             }
+                            "status" => {
+                                // Daemon-side health snapshot (see unix arm).
+                                let rec = reg.recording.current_state();
+                                let resp = DaemonResponse::ok(serde_json::json!({
+                                    "pid": std::process::id(),
+                                    "version": env!("CARGO_PKG_VERSION"),
+                                    "active_sessions": cua_driver_core::session::active_session_count(),
+                                    "recording": {
+                                        "enabled": rec.enabled,
+                                        "output_dir": rec.output_dir,
+                                        "next_turn": rec.next_turn,
+                                    },
+                                }));
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
                             "describe" => {
                                 let name = req.name.as_deref().unwrap_or("");
                                 let resp = match reg.get_def(name) {
@@ -1376,17 +1509,64 @@ pub fn run_stop_cmd(socket_path: &str) {
 
 /// `cua-driver status` implementation.
 pub fn run_status_cmd(socket_path: &str, pid_file_path: &str) {
-    if is_daemon_listening(socket_path) {
-        println!("Cua Driver daemon is running");
-        println!("  socket: {socket_path}");
-        if let Some(pid) = read_pid_file(pid_file_path) {
-            println!("  pid: {pid}");
-        } else {
-            println!("  pid: unknown (no pid file)");
+    // A full request/response round-trip is the health signal — a socket
+    // file (or even a successful connect) can exist while every connection
+    // task is wedged, which is exactly the state that made the CLI fall
+    // back in-process mid-recording. Measure the round-trip so slowness is
+    // visible too.
+    let req = DaemonRequest { method: "status".into(), name: None, args: None, session_id: None };
+    let started = std::time::Instant::now();
+    match send_request(socket_path, &req) {
+        Ok(resp) if resp.ok => {
+            let rtt_ms = started.elapsed().as_millis();
+            println!("Cua Driver daemon is running and responding ({rtt_ms} ms round-trip)");
+            println!("  socket: {socket_path}");
+            let r = resp.result.unwrap_or_default();
+            match r.get("pid").and_then(|v| v.as_u64()) {
+                Some(pid) => println!("  pid: {pid}"),
+                None => match read_pid_file(pid_file_path) {
+                    Some(pid) => println!("  pid: {pid}"),
+                    None => println!("  pid: unknown (no pid file)"),
+                },
+            }
+            if let Some(v) = r.get("version").and_then(|v| v.as_str()) {
+                println!("  version: {v}");
+            }
+            if let Some(n) = r.get("active_sessions").and_then(|v| v.as_u64()) {
+                println!("  active sessions: {n}");
+            }
+            if let Some(rec) = r.get("recording") {
+                let enabled = rec.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+                if enabled {
+                    println!(
+                        "  recording: active (output_dir: {})",
+                        rec.get("output_dir").and_then(|v| v.as_str()).unwrap_or("?")
+                    );
+                } else {
+                    println!("  recording: off");
+                }
+            }
         }
-    } else {
-        eprintln!("Cua Driver daemon is not running");
-        std::process::exit(1);
+        Ok(_) => {
+            // Older daemon without the `status` method still answered the
+            // request — it's alive, just predates the richer payload.
+            println!("Cua Driver daemon is running (older build without status payload)");
+            println!("  socket: {socket_path}");
+            if let Some(pid) = read_pid_file(pid_file_path) {
+                println!("  pid: {pid}");
+            }
+        }
+        Err(e) => {
+            if let Some(pid) = read_pid_file(pid_file_path) {
+                eprintln!(
+                    "Cua Driver daemon is NOT responding (pid file says {pid}; {e}).\n\
+                     The process may be wedged — restart it: cua-driver stop && cua-driver serve"
+                );
+            } else {
+                eprintln!("Cua Driver daemon is not running");
+            }
+            std::process::exit(1);
+        }
     }
 }
 
