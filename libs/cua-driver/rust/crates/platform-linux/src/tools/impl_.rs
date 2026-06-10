@@ -466,6 +466,24 @@ impl Tool for GetWindowStateTool {
                     let header = format!("window_id={xid} pid={pid} elements={count}\n\n");
                     content.push(cua_driver_core::protocol::Content::text(header + &tr.tree_markdown));
                     state.element_cache.update(pid, xid, &tr.nodes);
+                    // A near-empty tree from a pid that WAS richly populated
+                    // is almost always a wx-style modal suppressing the whole
+                    // app's a11y registration, not a launch-env problem —
+                    // say so before anyone reaches for a destructive
+                    // relaunch (#17). The peak is per pid, so this also
+                    // fires for a modal's own never-populated window.
+                    let peak = state.element_cache.peak_element_count(pid);
+                    if count <= 1 && peak > 1 {
+                        content.push(cua_driver_core::protocol::Content::text(format!(
+                            "⚠️ This app WAS exposing {peak} AT-SPI elements but this snapshot \
+                             has {count} — a modal dialog has likely suppressed the whole app's \
+                             accessibility registration (wxWidgets does this). Close or complete \
+                             the dialog rather than relaunching; the tree should return once \
+                             the modal is gone."
+                        )));
+                        structured["atspi_tree_collapsed"] = json!(true);
+                        structured["atspi_peak_element_count"] = json!(peak);
+                    }
                     structured["element_count"] = json!(count);
                     structured["tree_markdown"] = json!(tr.tree_markdown);
 
@@ -694,22 +712,42 @@ fn native_wayland_input_error(action: &str) -> ToolResult {
 ///
 /// When the cached AT-SPI tree for the target window has no actionable
 /// elements (≤1 entry — a bare window node, or no snapshot at all), the
-/// target very likely never registered on the accessibility bus, which is
-/// exactly the population that ignores synthetic events — append an explicit
-/// warning with the recovery path. Cost: one hash-map lookup, no D-Bus.
+/// warning depends on the pid's history (#17). A pid that NEVER produced a
+/// populated tree very likely never registered on the accessibility bus —
+/// exactly the population that ignores synthetic events — so the recovery
+/// is a relaunch with the forced bridge env. But a pid that WAS exposing
+/// elements has most likely been suppressed by a modal dialog (wxWidgets
+/// drops the whole app off the a11y bus while a modal is up — verified
+/// with an external pyatspi probe against PrusaSlicer 2.9.5), and there a
+/// relaunch is DESTRUCTIVE advice: it discards in-memory state (a finished
+/// slice, an open document) to fix a bridge that was never broken. Cost:
+/// two hash-map lookups, no D-Bus.
 fn xsend_unverified_message(state: &ToolState, base: String, pid: u32, xid: u64) -> String {
     let mut msg = format!(
         "🛰️ {base} via XSendEvent — synthetic-event delivery is best-effort and UNVERIFIED; \
          re-snapshot with get_window_state and diff to confirm the UI actually changed."
     );
     if state.element_cache.element_count(pid, xid) <= 1 {
-        msg.push_str(
-            "\n⚠️ No actionable AT-SPI elements are cached for this window — toolkits that \
-             don't register on the accessibility bus (wxWidgets, GTK3 without the atk-bridge) \
-             commonly ignore synthetic XSendEvent clicks entirely. If nothing changed, \
-             relaunch the app via launch_app (which forces the accessibility bridge into the \
-             child environment) and use element_index actions instead.",
-        );
+        let peak = state.element_cache.peak_element_count(pid);
+        if peak > 1 {
+            msg.push_str(&format!(
+                "\n⚠️ No actionable AT-SPI elements are cached for this window, but this app \
+                 WAS exposing {peak} elements — a modal dialog has likely suppressed the whole \
+                 app's accessibility registration (wxWidgets does this). Do NOT relaunch: that \
+                 discards the app's in-memory state and the accessibility bridge was never the \
+                 problem. Close or complete the dialog instead (press_key, the app's own \
+                 API/CLI, or cancel it); element_index actions should return once the modal \
+                 is gone.",
+            ));
+        } else {
+            msg.push_str(
+                "\n⚠️ No actionable AT-SPI elements are cached for this window — toolkits that \
+                 don't register on the accessibility bus (wxWidgets, GTK3 without the atk-bridge) \
+                 commonly ignore synthetic XSendEvent clicks entirely. If nothing changed, \
+                 relaunch the app via launch_app (which forces the accessibility bridge into the \
+                 child environment) and use element_index actions instead.",
+            );
+        }
     }
     msg
 }
