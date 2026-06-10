@@ -494,8 +494,10 @@ Session-scoped action recording + replay, for demos, regressions,
 and training data. Only invoke when the user explicitly asks to
 record a session — the skill does not auto-enable this. CLI surface:
 `cua-driver recording start|stop|status`; raw tools:
-`start_recording` / `stop_recording`. Video capture (main display →
-`recording.mp4`) is on by default; pass `record_video: false` to opt out.
+`start_recording` / `stop_recording`. The daemon must be started with
+`--allow-recording` or `CUA_RECORDING_ENABLED=1` (recording is denied by
+default). Video capture (main display → `recording.mp4`) is off by
+default; pass `record_video: true` to capture it.
 
 See **`RECORDING.md`** for the full flow: enable/disable, turn folder
 contents, replay via `replay_trajectory`, and the element_index

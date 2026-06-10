@@ -1,9 +1,14 @@
 # Recording & replaying trajectories
 
 > **Cross-platform.** Recording is available on macOS (native
-> ScreenCaptureKit), Windows (ffmpeg + `gdigrab`), and Linux (ffmpeg;
-> wlr-screencopy frames on Wayland, `x11grab` on X11). Replay is
-> cross-platform as long as the recorded artifacts are present.
+> ScreenCaptureKit), Windows (ffmpeg + `gdigrab`), and Linux (Wayland
+> wlr-screencopy piped to ffmpeg; `x11grab` on pure-X11 sessions). Replay
+> is cross-platform as long as the recorded artifacts are present.
+>
+> **Opt-in required (daemon).** Recording is disabled by default: start
+> the daemon with `--allow-recording` or `CUA_RECORDING_ENABLED=1`. On
+> Linux the AT-SPI `app_state.json` capture is separately gated behind
+> `CUA_RECORDING_CAPTURE_AX=1` (default off).
 
 Session-scoped capture of action sequences + pre/post state, suitable
 for demos, regression diffs, and training data. Invoked only when the
@@ -17,10 +22,10 @@ turn folder under a caller-chosen output directory. Read-only tools
 permission probes, agent-cursor getters / setters, and the recording
 controls themselves) are not recorded.
 
-**Video off by default.** Pass `record_video: true` to also capture
-the main display to `<output_dir>/recording.mp4` (H.264 / 30 fps) for
-the lifetime of the session. The mp4 is finalized on
-`stop_recording`.
+**Video off by default.** Pass `record_video: true` so `start_recording` also captures the main
+display to `<output_dir>/recording.mp4` (H.264 / 30 fps) for the
+lifetime of the session. The mp4 is finalized on `stop_recording`.
+(Default flipped from on to off in #1776 — older docs disagree.)
 
 **macOS — native ScreenCaptureKit, zero-config.** On macOS the
 recorder uses an in-process `SCStream` + `SCRecordingOutput`, so it
@@ -29,8 +34,7 @@ subprocess prompt, no fast-fail, no second TCC dance. Requires macOS
 15.0+ (SCRecordingOutput introduced in macOS 15). No ffmpeg needed.
 
 **Windows / Linux — ffmpeg subprocess.** Outside macOS the recorder
-shells to ffmpeg with `gdigrab` (Windows), wlr-screencopy frames
-piped to ffmpeg (Linux Wayland), or `x11grab` (Linux X11). The
+shells to ffmpeg with `gdigrab` (Windows) or `x11grab` (Linux). The
 binary needs to be on PATH (`winget install Gyan.FFmpeg` /
 `apt install ffmpeg`); when missing, the per-turn capture continues
 without video and `last_error` carries the install hint. ffmpeg
@@ -44,18 +48,15 @@ tools, or the friendlier `cua-driver recording` subcommand group
 
 ```
 cua-driver recording start ~/cua-trajectories/run-1 --video
-# … run the workflow …
+# … run the workflow … (omit --video for screenshots+JSON only)
 cua-driver recording status    # -> enabled / disabled, next_turn, output_dir
 cua-driver recording stop      # -> "Recording stopped. (video → recording.mp4)"
 ```
 
-`--video` opts in to display capture (video is off by default); omit
-it for per-turn screenshots + JSON only.
-
 Raw-tool equivalent:
 
 ```
-cua-driver start_recording '{"output_dir":"~/cua-trajectories/run-1","record_video":true}'
+cua-driver start_recording '{"output_dir":"~/cua-trajectories/run-1"}'
 cua-driver get_recording_state
 cua-driver stop_recording '{}'
 ```
@@ -77,12 +78,8 @@ Each action writes to `turn-NNNNN/` (five-digit zero-padded counter):
   screenshot fields — those live in `screenshot.png`). On macOS the
   recorder resolves a frontmost window internally when the action's
   args don't carry one; on Windows it uses the first window of the
-  target pid. On Linux the snapshot is the AT-SPI tree (same shape as
-  macOS); editable / text widgets surface their Text-interface
-  content as `value="…"` even when the widget has a name, so typed /
-  set text is verifiable from the tree. Expect it to be **absent on
-  `launch_app` turns**: the snapshot hook needs a mapped window, and
-  launch returns before the new window maps.
+  target pid. **Omitted on Linux** — ATSPI doesn't expose a cheap
+  whole-tree snapshot, and the file is left out rather than faked.
 - `screenshot.png` — post-action capture of the target window.
   Omitted when the pid has no visible window.
 - `action.json` — the tool name, full input arguments, result
@@ -110,8 +107,8 @@ Each action writes to `turn-NNNNN/` (five-digit zero-padded counter):
 This skill does **not** auto-enable recording. The client invokes
 `start_recording` explicitly when the user asks to capture a session.
 If the user says "record this session" or similar, call
-`start_recording({output_dir:…})` before the first action (video off
-by default; pass `record_video: true` to capture it), and
+`start_recording({output_dir:…})` before the first action (video on
+by default; pass `record_video: false` to opt out), and
 `stop_recording({})` when done.
 
 ## Replaying a recorded trajectory

@@ -32,18 +32,25 @@ behaviors that the macOS / Windows skills consider table-stakes are
 - **UIA / AX-tree equivalent**: AT-SPI when available, otherwise
   empty. Many GTK4 / Qt6 apps populate AT-SPI lazily; agents should
   expect partial trees and re-snapshot.
-- **launch_app**: backed by `xdg-open` / `gtk-launch` / `dbus-send`
-  with display-environment scrubbing to avoid stealing the user's
-  workspace. Not yet equivalent to macOS `FocusRestoreGuard`.
-- **Recording**: supported. Per-turn screenshots + `app_state.json`
-  (AT-SPI tree) + video. Video uses wlr-screencopy on Wayland and
-  `x11grab` on X11; requires ffmpeg on PATH.
+- **launch_app**: true background launch on Hyprland — the app is
+  dispatched onto the hidden `special:cua` workspace with no focus or
+  workspace change, and the child env gets the AT-SPI bridge forced
+  (`GTK_MODULES=gail:atk-bridge`, `NO_AT_BRIDGE=0`, Qt a11y vars) plus
+  an XWayland preference (`GDK_BACKEND=x11`, `QT_QPA_PLATFORM=xcb`) so
+  the first `get_window_state` returns a populated tree. Known gap:
+  windows the app maps LATER (modal dialogs) can still land on the
+  user's active workspace (shuv1337/cua#15).
+- **Recording**: supported but **opt-in** — the daemon must be started
+  with `--allow-recording` / `CUA_RECORDING_ENABLED=1`
+  (+`CUA_RECORDING_CAPTURE_AX=1` for `app_state.json`). Per-turn
+  screenshots + video; wlr-screencopy on Wayland, `x11grab` on X11;
+  ffmpeg on PATH.
 
 See `SKILL.md` (macOS) and `WINDOWS.md` (Windows) for the full
-patterns. This file will grow as the Linux backend reaches GA. For
-now, **prefer macOS / Windows hosts** for agent-driven GUI tasks; use
-the Linux daemon for read-only inspection (screenshot,
-list_windows, get_window_state) when running on a Linux host.
+patterns. On **Hyprland** the backend is first-class for background
+element_index workflows (launch → snapshot → act → verify, all
+invisible to the user); on other Wayland compositors prefer read-only
+inspection (screenshot, list_windows, get_window_state).
 
 ## Quick triage
 
@@ -76,9 +83,29 @@ specific to it:
   region-crop is the fallback when the protocol is unavailable.
 - **Input**: native-Wayland windows accept `element_index` actions
   (AT-SPI) but not pixel input.
-- **launch_app**: if a newly launched window steals focus, the driver
-  restores the previously active window. Best-effort, watches for
-  ~2 s after launch.
+- **launch_app = background launch**: the command is dispatched via
+  `hyprctl dispatch exec "[workspace special:cua silent] env … <cmd>"`
+  (modern ≥0.55 Lua grammar `hl.dsp.exec_cmd('…')` with legacy
+  fallback), so the window maps onto the hidden `special:cua`
+  workspace. Hyprland forks the child, so the result's pid/window come
+  from a client-list diff (≤10 s poll). A placement guard re-sweeps
+  the pid's windows for ~20 s because splash screens consume the exec
+  rule (the rule only covers the FIRST window the pid maps —
+  PrusaSlicer's main frame arrives ~6 s after its splash). Caveat:
+  dialogs mapped after the guard window can land on the user's active
+  workspace (shuv1337/cua#15).
+- **list_windows** reports `workspace_id` (negative = special
+  workspaces) and `on_current_space` — use these to find the hidden
+  window and to detect placement leaks.
+- **Sweeping windows back by hand**: `hl.dsp.window.move` ALWAYS
+  reveals the target special workspace (its `silent` key is accepted
+  but ignored) — the driver uses an atomic move-then-
+  `workspace.toggle_special('<name>')` Lua payload so no frame renders
+  with the overlay visible. If you script hyprctl directly, do the
+  same or you will pop the hidden workspace over the user's session.
+- **launch_app focus guard**: if a newly launched window steals focus,
+  the driver restores the previously active window. Best-effort,
+  watches for ~2 s after launch.
 - **Recording**: opt-in — `start_recording` errors unless the daemon
   was started with `--allow-recording` (or `CUA_RECORDING_ENABLED=1`);
   the per-turn AT-SPI `app_state.json` dump additionally requires
@@ -118,10 +145,93 @@ bus, which correlates strongly with dropping synthetic events.
 | Native-Wayland surfaces | ❌ rejected (no X window to address) |
 | GTK4 / Qt5 / Qt6 / Chromium & Electron (XWayland) | ⚠️ typically processed — still verify via re-snapshot |
 
-Recovery when a pixel click no-ops: relaunch the app via
-`launch_app` (it forces the atk-bridge into the child environment so
-the AT-SPI tree populates) and drive it with `element_index` actions,
-which use AT-SPI `doAction` instead of synthetic X events.
+Recovery when a pixel click no-ops **and the app never had a
+populated tree**: relaunch via `launch_app` (it forces the atk-bridge
+into the child environment) and drive it with `element_index`
+actions. But if the app's tree WAS populated and suddenly collapsed,
+do NOT relaunch — see "Modal dialogs collapse the AT-SPI tree" below;
+relaunching throws away the app's in-memory state for nothing.
+
+Known coordinate hazard: the pixel path's resize-ratio correction is
+keyed per-pid, so after the main window has been resized, clicks
+aimed at a *second* window (a dialog) get scaled by the wrong factor
+and miss entirely (shuv1337/cua#16). Check the coords echoed in the
+result message against what you passed.
+
+## Modal dialogs (wx) collapse the AT-SPI tree
+
+Confirmed 2026-06-10 against PrusaSlicer 2.9.5's "Send G-Code to
+printer host" modal: opening a wx modal dialog **drops the entire
+application off the accessibility bus** — not just the dialog. The
+previously 203-element main window and the dialog both return
+1-element trees, and an external pyatspi probe shows the pid absent
+from `org.a11y.Bus` entirely. Every no-foreground input path
+dead-ends on such a dialog (all verified):
+
+- XSendEvent mouse + keyboard → silently ignored (wx filters
+  `send_event=true`)
+- XTest mouse (xdotool) → lands on the wrong surface (XWayland's
+  coordinate space disagrees with Hyprland's scaled multi-monitor
+  layout)
+- XTest keyboard with confirmed X focus → never reaches the real
+  Wayland input focus
+- Real kernel input (ydotool/uinput) → routes correctly ONLY when the
+  window is visible and Hyprland agrees on focus; a modal orphaned
+  from its parent (split across workspaces) reports
+  `activewindow: None` and swallows even genuine clicks
+
+**The escalation ladder** (stop at the first rung that works):
+
+1. `element_index` (AT-SPI `doAction`) — background-safe, the default
+2. Keyboard commit (`press_key` / `set_value`) — background-safe
+3. Pixel `click` via XSendEvent — verify by re-snapshot diff, expect
+   failure on wx/GTK3
+4. Real input (uinput-class, visible window, focus-disturbing — a
+   deliberate, labeled escalation; tracked as shuv1337/cua#18)
+5. **The app's own API or config** — often the cleanest exit. The
+   dialog above only existed to PUT a file to PrusaLink; the stored
+   credentials in `~/.config/PrusaSlicer/physical_printer/*.ini` plus
+   one `curl -X PUT -H "X-Api-Key: …" -H "Print-After-Upload: ?1"
+   --data-binary @file http://<host>/api/v1/files/usb/<name>` did the
+   whole job. When a dialog's only purpose is a network call, check
+   whether you can make that call directly.
+
+## Verify with closed-loop signals, never tool return values
+
+Every silent failure in the 2026-06 dogfood runs was caught by a
+read-back, never by a tool result:
+
+- **Did the click land?** Screenshot before/after +
+  `PIL.ImageChops.difference(a, b).getbbox()` — `None` means nothing
+  changed, whatever the tool said.
+- **Is the pointer where you think?** `hyprctl cursorpos` (logical
+  coords) after any pointer move; calibrate against it in a closed
+  loop before clicking with real input.
+- **Does focus exist at all?** `hyprctl activewindow -j` — `None`
+  means the compositor will route input nowhere.
+- **Did the window end up where intended?** `list_windows` →
+  `workspace_id` / `on_current_space`, or `hyprctl clients -j`.
+
+## Sessions, idle-TTL, and recording ownership
+
+- Sessions idle out after **300 s** without a tool call carrying
+  their `session` id (`CUA_DRIVER_RS_SESSION_IDLE_TTL_SECS`
+  overrides; the effective value is in `get_config` and in
+  `start_session`'s structured output as `idle_ttl_secs`). Pass
+  `session` on every call — including read-only ones — to keep the
+  clock fresh during long investigations.
+- A TTL'd or ended id is recoverable: `start_session` with the SAME
+  id starts a fresh session under it (`revived: true`). The gate
+  error on a dead session names the id and this remedy.
+- **Caveat:** the TTL reclaim also stops any recording the session
+  owned — silently (shuv1337/cua#19). After a revival, run
+  `cua-driver status` (it does a real daemon round-trip and reports
+  recording state) and restart recording if needed; expect the
+  trajectory to be split across output dirs when this bites.
+- If the daemon socket fails while a recording is live, the CLI
+  refuses the in-process fallback (exit 70) instead of punching holes
+  in the trajectory — `CUA_DRIVER_RS_ALLOW_DEGRADED_FALLBACK=1`
+  overrides.
 
 ## Forbidden vectors
 
@@ -148,8 +258,9 @@ ask the user.
 | Hotkey | ⚠️ XTest, focus-sensitive |
 | Screenshot full-display | ✅ X11 (xshm); ✅ Wayland via grim (no portal) |
 | Screenshot per-window | ✅ X11; ✅ Hyprland via toplevel-export (correct even when occluded); other Wayland TBD |
-| launch_app | ✅ direct exec / xdg-open; focus-restore guard on Hyprland (see Hyprland section) |
-| Recording | ✅ wlr-screencopy on Wayland / `x11grab` on X11; ffmpeg required |
+| launch_app | ✅ Hyprland: hidden `special:cua` background launch + a11y env injection + placement guard; elsewhere direct exec / xdg-open. Late dialogs may leak to the active workspace (#15) |
+| Session lifecycle | ✅ idle-TTL 300s, revivable ids (`start_session` same id), TTL discoverable; TTL reclaim kills owned recordings (#19) |
+| Recording | ✅ opt-in (`CUA_RECORDING_ENABLED=1`); wlr-screencopy on Wayland / `x11grab` on X11; ffmpeg required |
 
 Until Linux reaches GA, treat this doc as a planning placeholder
 rather than a contract.
