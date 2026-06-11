@@ -920,6 +920,78 @@ fn window_local_to_screen(xid: u64, x: f64, y: f64) -> anyhow::Result<(f64, f64)
     Ok((reply.dst_x as f64 + x, reply.dst_y as f64 + y))
 }
 
+/// Execute a `dispatch:"real"` click via the kernel-level uinput tier
+/// (shuv1337/cua#18). Blocking — call inside `spawn_blocking`.
+///
+/// `window_local` is the resize-adjusted window-local pixel coordinate (the
+/// same value the XSendEvent path uses). The flow: map the X11 window to its
+/// Hyprland client (by pid+title), reveal it if hidden, convert window-local
+/// → logical screen coords (`hyprland_at + local/scale`), closed-loop place
+/// the real pointer with compositor readback, click, then restore the
+/// pointer and re-hide. This DELIBERATELY breaks the no-foreground contract.
+fn real_dispatch_click(
+    pid: u32,
+    xid: u64,
+    window_local: (f64, f64),
+    button: u8,
+    count: usize,
+) -> anyhow::Result<String> {
+    use crate::input::real::{cursorpos, RealInput};
+
+    let real = RealInput::detect()?; // actionable error when no backend
+
+    // The X11 window carries physical-pixel geometry; its Hyprland client
+    // carries the logical geometry the compositor (and cursorpos) speak in.
+    let win = crate::x11::list_windows(Some(pid))
+        .into_iter()
+        .find(|w| w.xid == xid)
+        .ok_or_else(|| anyhow::anyhow!("window {xid} not found for pid {pid}"))?;
+    let title = win.title.clone();
+
+    let pre = crate::hyprland::client_geom_for(pid, &title).ok_or_else(|| {
+        anyhow::anyhow!("no Hyprland client found for pid {pid} (title {title:?})")
+    })?;
+    let needs_reveal = !pre.visible;
+    let reveal = if needs_reveal {
+        crate::hyprland::reveal_background_window(pre.address)
+    } else {
+        None
+    };
+    // Re-read geometry after a reveal (position can shift across workspaces).
+    let geom = crate::hyprland::client_geom_for(pid, &title).unwrap_or(pre);
+    // Derive the monitor scale from physical/logical width — robust without
+    // a monitor lookup (which can't key off an X11 xid). window-local coords
+    // are physical pixels; logical = physical / scale.
+    let scale = if geom.size.0 > 0.0 { win.width as f64 / geom.size.0 } else { 1.0 };
+    let (lx, ly) = window_local;
+    let target = (geom.at.0 + lx / scale, geom.at.1 + ly / scale);
+
+    // Save the real pointer, place+click (closed-loop), restore, re-hide —
+    // restore/re-hide run even if placement fails.
+    let saved = cursorpos().ok();
+    let placed = real.click_at_logical(target, button, count);
+    if let Some(p) = saved {
+        let _ = real.move_to_logical(p);
+    }
+    if let Some(st) = reveal {
+        crate::hyprland::rehide_background_window(st);
+    }
+
+    let p = placed?;
+    Ok(format!(
+        "🖱️ Clicked at logical ({:.0},{:.0}) via {} — REAL kernel input (closed-loop \
+         verified on target in {} iteration{}). ⚠️ This tier intentionally bypasses the \
+         no-foreground contract: the window was {}focused and the real pointer moved \
+         (restored afterward). Mechanism: via uinput.",
+        p.logical_x,
+        p.logical_y,
+        real.backend_name(),
+        p.iterations,
+        if p.iterations == 1 { "" } else { "s" },
+        if needs_reveal { "temporarily revealed and " } else { "" },
+    ))
+}
+
 async fn overlay_glide_to(sx: f64, sy: f64) {
     if !crate::overlay::is_enabled() {
         return;
@@ -1086,7 +1158,8 @@ impl Tool for ClickTool {
                     "element_index":{"type":"integer","description":"AT-SPI element index from get_window_state."},
                     "button":{"type":"string","enum":["left","right","middle"]},
                     "count":{"type":"integer"},
-                    "from_zoom":{"type":"boolean","description":"Set true after a zoom call to auto-translate zoom-image pixel coordinates back to full-window space."}
+                    "from_zoom":{"type":"boolean","description":"Set true after a zoom call to auto-translate zoom-image pixel coordinates back to full-window space."},
+                    "dispatch":{"type":"string","enum":["auto","real"],"description":"Input tier for pixel (x/y) clicks. 'auto' (default) = XSendEvent, background-safe but dropped by wx/GTK3 toolkits. 'real' = kernel-level uinput: reliably drives Wayland/wx targets BUT intentionally breaks the no-foreground contract (reveals + focuses the window, moves the real pointer, then restores). Use 'real' only after 'auto' fails to land. Requires ydotoold; see cua-driver doctor."}
                 },"additionalProperties":false
             }),
             read_only: false, destructive: true, idempotent: false, open_world: true,
@@ -1180,6 +1253,20 @@ impl Tool for ClickTool {
         } else if let Some(ratio) = self.state.resize_registry.ratio(pid, xid) {
             x *= ratio;
             y *= ratio;
+        }
+
+        // Opt-in real (uinput) tier — kernel input for targets XSendEvent
+        // can't reach, at the cost of the no-foreground contract (#18).
+        if args.str_or("dispatch", "auto") == "real" {
+            return match tokio::task::spawn_blocking(move || {
+                real_dispatch_click(pid, xid, (x, y), button, count)
+            })
+            .await
+            {
+                Ok(Ok(msg)) => ToolResult::text(msg),
+                Ok(Err(e)) => ToolResult::error(format!("real-input click failed: {e:#}")),
+                Err(e) => ToolResult::error(format!("Task error: {e}")),
+            };
         }
 
         crate::overlay::send_command(cursor_overlay::OverlayCommand::PinAbove(xid));

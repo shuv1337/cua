@@ -522,6 +522,96 @@ pub fn move_window_to_background_workspace(address: u64) -> bool {
     hyprctl_dispatch(&format!("movetoworkspacesilent {workspace},address:0x{address:x}"))
 }
 
+/// What [`reveal_background_window`] changed, so [`rehide_background_window`]
+/// can undo it.
+pub struct RevealState {
+    address: u64,
+    prev_active: Option<u64>,
+}
+
+/// Reveal a window that lives on [`BACKGROUND_WORKSPACE`] so the real-input
+/// (uinput) tier can drive it: real input only routes when the compositor
+/// agrees on focus, which a hidden special-workspace window never has. This
+/// is the DELIBERATE, temporary no-foreground-contract break the
+/// `dispatch:"real"` tier opts into (#18) — the window is moved onto the
+/// focused monitor's active workspace and focused, then [`rehide_background_window`]
+/// puts it back and restores the prior focus.
+///
+/// `Some` only on Hyprland with a resolvable focused workspace; `None`
+/// otherwise (the caller should not proceed with a real click).
+pub fn reveal_background_window(address: u64) -> Option<RevealState> {
+    if !is_hyprland_session() {
+        return None;
+    }
+    let prev_active = active_window_address();
+    let ws = focused_monitor_active_workspace_id()?;
+    // Move the hidden window onto the visible workspace and focus it. Unlike
+    // the background sweep this is intentionally NOT silent — the window must
+    // become genuinely visible and focused for the kernel input to land.
+    let moved = hyprctl_dispatch(&format!(
+        "hl.dsp.window.move({{ workspace = '{ws}', window = 'address:0x{address:x}' }})"
+    )) || hyprctl_dispatch(&format!("movetoworkspace {ws},address:0x{address:x}"));
+    if !moved {
+        return None;
+    }
+    focus_window(address);
+    Some(RevealState { address, prev_active })
+}
+
+/// Undo [`reveal_background_window`]: move the window back onto
+/// [`BACKGROUND_WORKSPACE`] and restore the previously-focused window.
+pub fn rehide_background_window(state: RevealState) {
+    move_window_to_background_workspace(state.address);
+    if let Some(prev) = state.prev_active {
+        focus_window(prev);
+    }
+}
+
+/// A Hyprland client's logical geometry and visibility, looked up for the
+/// real-input tier. Hyprland's `at`/`size` are LOGICAL pixels; an X11
+/// window's geometry is physical (logical × monitor scale).
+pub struct ClientGeom {
+    pub address: u64,
+    /// Logical top-left.
+    pub at: (f64, f64),
+    /// Logical size.
+    pub size: (f64, f64),
+    /// On a currently-visible workspace (no reveal needed).
+    pub visible: bool,
+}
+
+/// Find a pid's Hyprland client by title — the bridge from an X11
+/// `window_id` to its Hyprland address, since `hyprctl clients` carries no
+/// X11 xid. Prefers an exact title match; falls back to the pid's only
+/// client when the title doesn't line up (e.g. a just-changed title).
+/// `None` when the pid has no client.
+pub fn client_geom_for(pid: u32, title: &str) -> Option<ClientGeom> {
+    let visible = visible_workspace_ids();
+    let mine: Vec<HyprClient> =
+        clients().ok()?.into_iter().filter(|c| c.pid == pid as i64).collect();
+    let chosen = mine
+        .iter()
+        .find(|c| c.title == title)
+        .or_else(|| if mine.len() == 1 { mine.first() } else { None })?;
+    Some(ClientGeom {
+        address: parse_address(&chosen.address)?,
+        at: (chosen.at[0] as f64, chosen.at[1] as f64),
+        size: (chosen.size[0] as f64, chosen.size[1] as f64),
+        visible: chosen.workspace.as_ref().is_some_and(|w| visible.contains(&w.id)),
+    })
+}
+
+/// Active workspace id of the focused monitor (where a revealed window
+/// should land).
+fn focused_monitor_active_workspace_id() -> Option<i64> {
+    monitors()
+        .ok()?
+        .into_iter()
+        .find(|m| m.focused)
+        .and_then(|m| m.active_workspace)
+        .map(|w| w.id)
+}
+
 /// `hyprctl dispatch exec` with a window-rule prefix, speaking both
 /// grammars: Hyprland ≥0.55 replaced hyprlang dispatch with Lua —
 /// `dispatch exec "[rules] cmd"` is a parse error there and the modern

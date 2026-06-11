@@ -18,6 +18,16 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 use x11rb::rust_connection::RustConnection;
 
+/// Opt-in kernel-level (uinput) input tier — the `dispatch:"real"` path
+/// (shuv1337/cua#18). Breaks the no-foreground contract by design; see the
+/// module docs.
+pub mod real;
+/// Key-name → evdev keycode table used by [`real`].
+pub mod evdev;
+/// Direct `/dev/uinput` backend for [`real`] — tracked follow-up, not yet
+/// selected.
+mod uinput_device;
+
 const CLICK_DELAY_MS: u64 = 35;
 const KEY_DELAY_MS: u64 = 10;
 
