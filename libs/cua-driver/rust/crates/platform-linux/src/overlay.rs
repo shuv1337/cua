@@ -230,18 +230,22 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayCo
         title.as_bytes(),
     ).ok();
 
-    // Make the window fully click-through using the Shape extension (empty input region).
-    // This is the X11 equivalent of WS_EX_TRANSPARENT on Windows.
-    let empty_region_pixmap = conn.generate_id().unwrap();
-    conn.create_pixmap(1, empty_region_pixmap, root, 1, 1).ok();
-    conn.shape_mask(
+    // Make the window fully click-through by setting an EMPTY input region
+    // (the X11 equivalent of WS_EX_TRANSPARENT on Windows). `shape_mask` with
+    // a `None` source sets the input shape to the WHOLE window — the opposite
+    // of click-through — so the overlay was silently input-opaque and ate real
+    // pointer clicks on any XWayland window beneath it (it never surfaced
+    // before the uinput tier because XSendEvent bypasses pointer routing, and
+    // native-Wayland windows stack above this XWayland overlay in Hyprland).
+    // `shape_rectangles` with zero rectangles is the correct empty-region idiom.
+    conn.shape_rectangles(
         x11rb::protocol::shape::SO::SET,
         x11rb::protocol::shape::SK::INPUT,
+        x11rb::protocol::xproto::ClipOrdering::UNSORTED,
         win,
         0, 0,
-        x11rb::NONE,
+        &[],
     ).ok();
-    conn.free_pixmap(empty_region_pixmap).ok();
 
     conn.map_window(win).ok();
     conn.flush().ok();
