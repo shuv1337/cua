@@ -32,6 +32,13 @@ static RENDER: Mutex<Option<RenderState>> = Mutex::new(None);
 static ARRIVAL_TX: Mutex<Option<tokio::sync::oneshot::Sender<()>>> = Mutex::new(None);
 
 pub fn init(cfg: CursorConfig) {
+    // No agent-cursor overlay in headless-X mode: there is no user watching
+    // the off-screen Xvfb, and a full-desktop ARGB override window on an
+    // UNCOMPOSITED Xvfb draws black over everything in `import -window root`
+    // captures (#18). Skipping init leaves the overlay fully inert.
+    if crate::headless_x::is_active() {
+        return;
+    }
     let (tx, rx) = std::sync::mpsc::sync_channel(4096);
     let _ = CMD_TX.set(tx);
     *CMD_RX_CELL.lock().unwrap() = Some(rx);
@@ -39,6 +46,9 @@ pub fn init(cfg: CursorConfig) {
 }
 
 pub fn send_command(cmd: OverlayCommand) {
+    if crate::headless_x::is_active() {
+        return;
+    }
     if let Some(tx) = CMD_TX.get() {
         let _ = tx.try_send(cmd);
     }

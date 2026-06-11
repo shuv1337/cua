@@ -49,6 +49,9 @@ pub mod capture;
 #[cfg(target_os = "linux")]
 pub mod atspi;
 
+#[cfg(target_os = "linux")]
+pub mod headless_x;
+
 pub fn register_tools() -> ToolRegistry {
     tools::build_registry(false)
 }

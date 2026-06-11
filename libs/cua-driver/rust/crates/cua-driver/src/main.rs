@@ -603,6 +603,33 @@ fn main() -> anyhow::Result<()> {
             // so the flag is accepted-and-ignored here for CLI uniformity.
             let _ = no_permissions_gate;
             let _ = claude_code_compat;
+            // Opt-in headless-X backend (#18): run stubborn X11/wx apps
+            // (PrusaSlicer) in a private off-screen Xvfb driven by XTest —
+            // true background "real input" with zero compositor risk. MUST run
+            // before any X connection (it repoints $DISPLAY at the Xvfb and
+            // clears the Wayland/Hyprland env so the X11 code paths are taken).
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(arg) =
+                    std::env::args().find(|a| a == "--headless-x" || a.starts_with("--headless-x="))
+                {
+                    let (w, h) = arg
+                        .split_once('=')
+                        .and_then(|(_, g)| g.split_once('x'))
+                        .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+                        .unwrap_or((1920u32, 1080u32));
+                    match platform_linux::headless_x::activate(w, h) {
+                        Ok(dpy) => eprintln!(
+                            "cua-driver: headless-X backend active on {dpy} ({w}x{h}, Xvfb + XTest); \
+                             apps launch off-screen and never touch the user's session"
+                        ),
+                        Err(e) => {
+                            eprintln!("cua-driver: --headless-x failed: {e:#}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
             // Serve mode needs the cursor overlay just like MCP mode.
             let cursor_cfg = cursor_overlay::CursorConfig::from_args();
             let reg = Arc::new(build_registry(cursor_cfg));

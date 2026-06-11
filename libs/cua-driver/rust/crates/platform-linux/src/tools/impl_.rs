@@ -723,6 +723,16 @@ fn native_wayland_input_error(action: &str) -> ToolResult {
 /// slice, an open document) to fix a bridge that was never broken. Cost:
 /// two hash-map lookups, no D-Bus.
 fn xsend_unverified_message(state: &ToolState, base: String, pid: u32, xid: u64) -> String {
+    // In headless-X mode, input goes via XTest into a private Xvfb where the
+    // target is the focused window — genuine input that wx/GTK3 accept (the
+    // whole reason for the backend), so this is NOT the unverified-XSendEvent
+    // caveat. Still suggest a re-snapshot as the success signal.
+    if crate::headless_x::is_active() {
+        return format!(
+            "🖱️ {base} via XTest (headless-X) — real input delivered to the off-screen \
+             Xvfb; re-snapshot with get_window_state to confirm the UI changed."
+        );
+    }
     let mut msg = format!(
         "🛰️ {base} via XSendEvent — synthetic-event delivery is best-effort and UNVERIFIED; \
          re-snapshot with get_window_state and diff to confirm the UI actually changed."
