@@ -53,7 +53,8 @@ impl HeadlessXSession {
     /// best-effort — Xvfb alone still serves input/capture.
     pub fn start(width: u32, height: u32) -> Result<Self> {
         let display = pick_free_display()?;
-        let xvfb = Command::new("Xvfb")
+        let mut xvfb_cmd = Command::new("Xvfb");
+        xvfb_cmd
             .args([
                 &display,
                 "-screen",
@@ -67,7 +68,9 @@ impl HeadlessXSession {
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        die_with_parent(&mut xvfb_cmd);
+        let xvfb = xvfb_cmd
             .spawn()
             .context("spawning Xvfb — is it installed? (pacman -S xorg-server-xvfb)")?;
 
@@ -79,15 +82,32 @@ impl HeadlessXSession {
         }
 
         // Minimal WM so toplevels (esp. wx modals) get focus and stacking.
-        session.wm = Command::new("openbox")
+        let mut wm_cmd = Command::new("openbox");
+        wm_cmd
             .env("DISPLAY", &display)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok();
+            .stderr(Stdio::null());
+        die_with_parent(&mut wm_cmd);
+        session.wm = wm_cmd.spawn().ok();
 
         Ok(session)
+    }
+}
+
+/// Ask the kernel to SIGTERM this child when the daemon (its parent) dies.
+/// `Drop` never runs on process exit / SIGKILL / crash, so this is what
+/// actually guarantees the Xvfb + WM don't leak when `cua-driver serve`
+/// stops by any means. `PR_SET_PDEATHSIG` is relative to the spawning
+/// THREAD — `activate()` runs on the main thread, which lives for the
+/// daemon's whole lifetime, so the signal fires exactly at daemon exit.
+fn die_with_parent(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong);
+            Ok(())
+        });
     }
 }
 
