@@ -61,6 +61,9 @@ pub fn send_focus_out(xid: u64) -> Result<()> {
 
 /// Send a button click (down + up) to a window at window-local coordinates.
 pub fn send_click(xid: u64, x: i32, y: i32, count: usize, button: u8) -> Result<()> {
+    if crate::headless_x::is_active() {
+        return xtest::click(xid, x, y, count, button);
+    }
     let (conn, _) = RustConnection::connect(None)?;
     let window = xid as u32;
 
@@ -125,6 +128,9 @@ pub fn send_drag(
     steps: usize,
     button: u8,
 ) -> Result<()> {
+    if crate::headless_x::is_active() {
+        return xtest::drag(xid, from_x, from_y, to_x, to_y, duration_ms, steps, button);
+    }
     let (conn, _) = RustConnection::connect(None)?;
     let window = xid as u32;
     let root = conn.setup().roots[0].root;
@@ -194,6 +200,9 @@ pub fn send_type_text(xid: u64, text: &str) -> Result<()> {
 
 /// Type a string with an additional `inter_char_ms` delay between each character.
 pub fn send_type_text_with_delay(xid: u64, text: &str, inter_char_ms: u64) -> Result<()> {
+    if crate::headless_x::is_active() {
+        return xtest::type_text(text, inter_char_ms);
+    }
     let (conn, _) = RustConnection::connect(None)?;
     let window = xid as u32;
     let root = conn.setup().roots[0].root;
@@ -242,6 +251,9 @@ pub fn send_type_text_with_delay(xid: u64, text: &str, inter_char_ms: u64) -> Re
 
 /// Send a named key press to a window.
 pub fn send_key(xid: u64, key: &str, modifiers: &[&str]) -> Result<()> {
+    if crate::headless_x::is_active() {
+        return xtest::key(key, modifiers);
+    }
     let (conn, _) = RustConnection::connect(None)?;
     let window = xid as u32;
     let root = conn.setup().roots[0].root;
@@ -447,5 +459,138 @@ exit 0"#,
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
+    }
+}
+
+/// XTest input path for the headless-X backend (`crate::headless_x`).
+///
+/// Unlike the XSendEvent path above, XTest (`XTestFakeInput`) generates input
+/// at the X server with `send_event=false` — the exact bit wx/GTK3 filter on
+/// to drop synthetic clicks/keys. On the shared `:0` that would steal the
+/// user's focus, but the headless backend owns a private Xvfb where the target
+/// IS the focused window, so XTest is both correct and effective there. These
+/// functions are only reached while `crate::headless_x::is_active()`.
+mod xtest {
+    use super::{char_to_keycode_shift, key_name_to_keycode, CLICK_DELAY_MS};
+    use anyhow::Result;
+    use std::thread::sleep;
+    use std::time::Duration;
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{
+        ConnectionExt as _, BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, KEY_PRESS_EVENT,
+        KEY_RELEASE_EVENT, MOTION_NOTIFY_EVENT,
+    };
+    use x11rb::protocol::xtest::ConnectionExt as _;
+    use x11rb::rust_connection::RustConnection;
+
+    /// window-local (x,y) → root-absolute coords for `XTestFakeInput` motion.
+    fn to_root(conn: &RustConnection, root: u32, xid: u64, x: i32, y: i32) -> (i16, i16) {
+        if xid != 0 {
+            if let Ok(cookie) = conn.translate_coordinates(xid as u32, root, x as i16, y as i16) {
+                if let Ok(reply) = cookie.reply() {
+                    return (reply.dst_x, reply.dst_y);
+                }
+            }
+        }
+        (x as i16, y as i16)
+    }
+
+    pub fn click(xid: u64, x: i32, y: i32, count: usize, button: u8) -> Result<()> {
+        let (conn, screen_num) = RustConnection::connect(None)?;
+        let root = conn.setup().roots[screen_num].root;
+        let (rx, ry) = to_root(&conn, root, xid, x, y);
+        for _ in 0..count.max(1) {
+            conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, rx, ry, 0)?;
+            conn.xtest_fake_input(BUTTON_PRESS_EVENT, button, 0, root, rx, ry, 0)?;
+            conn.flush()?;
+            sleep(Duration::from_millis(CLICK_DELAY_MS));
+            conn.xtest_fake_input(BUTTON_RELEASE_EVENT, button, 0, root, rx, ry, 0)?;
+            conn.flush()?;
+            if count > 1 {
+                sleep(Duration::from_millis(80));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn drag(
+        xid: u64,
+        from_x: i32,
+        from_y: i32,
+        to_x: i32,
+        to_y: i32,
+        duration_ms: u64,
+        steps: usize,
+        button: u8,
+    ) -> Result<()> {
+        let (conn, screen_num) = RustConnection::connect(None)?;
+        let root = conn.setup().roots[screen_num].root;
+        let (fx, fy) = to_root(&conn, root, xid, from_x, from_y);
+        let (tx, ty) = to_root(&conn, root, xid, to_x, to_y);
+        let steps = steps.max(1);
+        let step_delay = if steps > 1 { duration_ms / steps as u64 } else { duration_ms };
+        conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, fx, fy, 0)?;
+        conn.xtest_fake_input(BUTTON_PRESS_EVENT, button, 0, root, fx, fy, 0)?;
+        conn.flush()?;
+        sleep(Duration::from_millis(CLICK_DELAY_MS));
+        for i in 1..=steps {
+            let t = i as f64 / steps as f64;
+            let ix = fx + ((tx - fx) as f64 * t).round() as i16;
+            let iy = fy + ((ty - fy) as f64 * t).round() as i16;
+            conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, ix, iy, 0)?;
+            conn.flush()?;
+            if step_delay > 0 {
+                sleep(Duration::from_millis(step_delay));
+            }
+        }
+        conn.xtest_fake_input(BUTTON_RELEASE_EVENT, button, 0, root, tx, ty, 0)?;
+        conn.flush()?;
+        Ok(())
+    }
+
+    pub fn key(key: &str, modifiers: &[&str]) -> Result<()> {
+        let (conn, screen_num) = RustConnection::connect(None)?;
+        let root = conn.setup().roots[screen_num].root;
+        let keycode = key_name_to_keycode(&conn, key)?;
+        let mods: Vec<u8> = modifiers
+            .iter()
+            .filter_map(|m| key_name_to_keycode(&conn, m).ok())
+            .collect();
+        for m in &mods {
+            conn.xtest_fake_input(KEY_PRESS_EVENT, *m, 0, root, 0, 0, 0)?;
+        }
+        conn.xtest_fake_input(KEY_PRESS_EVENT, keycode, 0, root, 0, 0, 0)?;
+        conn.xtest_fake_input(KEY_RELEASE_EVENT, keycode, 0, root, 0, 0, 0)?;
+        for m in mods.iter().rev() {
+            conn.xtest_fake_input(KEY_RELEASE_EVENT, *m, 0, root, 0, 0, 0)?;
+        }
+        conn.flush()?;
+        Ok(())
+    }
+
+    pub fn type_text(text: &str, inter_char_ms: u64) -> Result<()> {
+        let (conn, screen_num) = RustConnection::connect(None)?;
+        let root = conn.setup().roots[screen_num].root;
+        let mapping = conn.get_keyboard_mapping(8, 248)?.reply()?;
+        let shift_kc = key_name_to_keycode(&conn, "shift").ok();
+        for ch in text.chars() {
+            let Some((kc, needs_shift)) = char_to_keycode_shift(&mapping, ch as u32) else {
+                continue;
+            };
+            let shift = if needs_shift { shift_kc } else { None };
+            if let Some(s) = shift {
+                conn.xtest_fake_input(KEY_PRESS_EVENT, s, 0, root, 0, 0, 0)?;
+            }
+            conn.xtest_fake_input(KEY_PRESS_EVENT, kc, 0, root, 0, 0, 0)?;
+            conn.xtest_fake_input(KEY_RELEASE_EVENT, kc, 0, root, 0, 0, 0)?;
+            if let Some(s) = shift {
+                conn.xtest_fake_input(KEY_RELEASE_EVENT, s, 0, root, 0, 0, 0)?;
+            }
+            conn.flush()?;
+            if inter_char_ms > 0 {
+                sleep(Duration::from_millis(inter_char_ms));
+            }
+        }
+        Ok(())
     }
 }

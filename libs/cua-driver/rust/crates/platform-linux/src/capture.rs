@@ -55,8 +55,18 @@ pub fn screenshot_window(xid: u64) -> Result<(String, u32, u32)> {
 }
 
 fn capture_via_import(xid: u64) -> Result<Vec<u8>> {
+    // Headless-X (#18): `import -window <xid>` (XGetImage of the window's own
+    // drawable) returns BLACK for an OpenGL window under llvmpipe on Xvfb —
+    // the GL content lands in the framebuffer, not the X drawable. Capture the
+    // private root and crop to the window's geometry instead.
+    if crate::headless_x::is_active() {
+        return capture_window_via_root_crop(xid);
+    }
+    // `png:color-type=2` forces a truecolor PNG — without it ImageMagick
+    // optimizes a near-gray window to an L8 grayscale PNG, dropping colour
+    // (e.g. orange highlights) the agent needs.
     let out = Command::new("import")
-        .args(["-window", &xid.to_string(), "png:-"])
+        .args(["-window", &xid.to_string(), "-define", "png:color-type=2", "png:-"])
         .output()?;
     if !out.status.success() || out.stdout.is_empty() {
         bail!("import failed");
@@ -103,6 +113,41 @@ fn capture_via_xgetimage(xid: u64) -> Result<(String, u32, u32)> {
 
     let png = cua_driver_core::image_utils::encode_rgba_to_png(&rgba, w, h)?;
     Ok((BASE64.encode(&png), w, h))
+}
+
+/// Capture a window by cropping a root-window screenshot to the window's
+/// root-relative geometry — the headless-X path, where a direct per-window
+/// XGetImage is black for OpenGL drawables (see [`capture_via_import`]). The
+/// crop is clamped to the screen so a window larger than the Xvfb still yields
+/// a valid frame.
+fn capture_window_via_root_crop(xid: u64) -> Result<Vec<u8>> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    use x11rb::rust_connection::RustConnection;
+
+    let (conn, screen_num) = RustConnection::connect(None)?;
+    let screen = &conn.setup().roots[screen_num];
+    let root = screen.root;
+    let (sw, sh) = (screen.width_in_pixels as i32, screen.height_in_pixels as i32);
+
+    let geom = conn.get_geometry(xid as u32)?.reply()?;
+    let trans = conn.translate_coordinates(xid as u32, root, 0, 0)?.reply()?;
+    let (mut x, mut y) = (trans.dst_x as i32, trans.dst_y as i32);
+    let (mut w, mut h) = (geom.width as i32, geom.height as i32);
+    // Clamp to the screen (PrusaSlicer may restore a window bigger than Xvfb).
+    if x < 0 { w += x; x = 0; }
+    if y < 0 { h += y; y = 0; }
+    w = w.min(sw - x).max(1);
+    h = h.min(sh - y).max(1);
+
+    let crop = format!("{w}x{h}+{x}+{y}");
+    let out = Command::new("import")
+        .args(["-window", "root", "-crop", &crop, "+repage", "-define", "png:color-type=2", "png:-"])
+        .output()?;
+    if !out.status.success() || out.stdout.is_empty() {
+        bail!("headless root-crop capture failed for window {xid} ({crop})");
+    }
+    Ok(out.stdout)
 }
 
 /// Public version of png_dimensions for use in tool code.

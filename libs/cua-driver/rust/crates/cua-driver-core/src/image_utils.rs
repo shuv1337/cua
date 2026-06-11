@@ -81,6 +81,15 @@ pub fn resize_png_if_needed(png_bytes: &[u8], max_dim: u32) -> Result<Vec<u8>> {
         ColorType::Rgb8 => DynamicImage::ImageRgb8(
             ImageBuffer::from_raw(w, h, buf).ok_or_else(|| anyhow!("invalid RGB buffer"))?,
         ),
+        // Grayscale: ImageMagick's `import` writes an optimized L8/La8 PNG
+        // when a window's pixels happen to be (near-)gray, e.g. a dark 3D
+        // viewport. Handle them rather than failing the whole capture.
+        ColorType::L8 => DynamicImage::ImageLuma8(
+            ImageBuffer::from_raw(w, h, buf).ok_or_else(|| anyhow!("invalid L8 buffer"))?,
+        ),
+        ColorType::La8 => DynamicImage::ImageLumaA8(
+            ImageBuffer::from_raw(w, h, buf).ok_or_else(|| anyhow!("invalid La8 buffer"))?,
+        ),
         _ => bail!("unsupported color type for resize: {color:?}"),
     };
 
