@@ -30,7 +30,10 @@ platform: no focus steal, no cursor warp.
   - **Windows**: layered UIA `Invoke` + `PostMessage` fallback, both
     z-order-independent and focus-steal-free.
   - **Linux** (BETA): AT-SPI `accDoDefaultAction` when available;
-    XTest as a focus-stealing last resort.
+    XSendEvent for pixel clicks (best-effort); opt-in headless-X
+    backend (`serve --headless-x`) for stubborn wx/GTK3 apps — a
+    private off-screen Xvfb driven by XTest, where XTest is genuine
+    focused-window input rather than a focus-stealing last resort.
 - Web-app quirks — macOS specifics in `WEB_APPS.md` (Chromium / WebKit
   / Electron / Tauri, minimized-Chrome keyboard-commit caveat,
   `set_value` workaround). Windows web-apps coverage lives in

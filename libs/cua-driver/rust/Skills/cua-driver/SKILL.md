@@ -26,7 +26,7 @@ directory:
   ApplicationFrameHost hosting, layered UIA+PostMessage click chain,
   Session 0 isolation, Windows-specific focus-steal vectors).
 - **Linux** — read `LINUX.md` (X11/Wayland status, AT-SPI,
-  BETA-level support).
+  headless-X backend for stubborn wx/GTK3 apps, BETA-level support).
 
 Cross-cutting topics also have their own files:
 

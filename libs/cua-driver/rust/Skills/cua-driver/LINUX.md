@@ -139,7 +139,7 @@ bus, which correlates strongly with dropping synthetic events.
 
 | Toolkit / surface | Synthetic XSendEvent click |
 |---|---|
-| wxWidgets (e.g. PrusaSlicer 2.9.5) — main frames AND modal dialogs | ❌ silently ignored (confirmed 2026-06-10) — use element_index |
+| wxWidgets (e.g. PrusaSlicer 2.9.5) — main frames AND modal dialogs | ❌ silently ignored (confirmed 2026-06-10) — use element_index, or the headless-X backend (below) |
 | GTK3 main frames | ❌ frequently ignored |
 | xterm & friends with `allowSendEvents: false` (the default) | ❌ ignored by design |
 | Native-Wayland surfaces | ❌ rejected (no X window to address) |
@@ -180,8 +180,8 @@ cancel it — and the tree returns when the modal closes. The
 "relaunch via launch_app" advice now only appears for pids that
 never produced a populated tree (a real launch-env problem).
 
-Every no-foreground input path dead-ends on such a dialog (all
-verified):
+Every no-foreground input path **on the user's shared session**
+dead-ends on such a dialog (all verified):
 
 - XSendEvent mouse + keyboard → silently ignored (wx filters
   `send_event=true`)
@@ -195,14 +195,21 @@ verified):
   from its parent (split across workspaces) reports
   `activewindow: None` and swallows even genuine clicks
 
+The escape hatch is to stop fighting the shared session entirely:
+run the app in a private headless X server where XTest input IS
+genuine focused-window input — see "Headless-X backend" below.
+
 **The escalation ladder** (stop at the first rung that works):
 
 1. `element_index` (AT-SPI `doAction`) — background-safe, the default
 2. Keyboard commit (`press_key` / `set_value`) — background-safe
 3. Pixel `click` via XSendEvent — verify by re-snapshot diff, expect
    failure on wx/GTK3
-4. Real input (uinput-class, visible window, focus-disturbing — a
-   deliberate, labeled escalation; tracked as shuv1337/cua#18)
+4. **Headless-X backend** — restart the daemon with `--headless-x`
+   and drive the app in a private off-screen Xvfb via XTest (real
+   input wx/GTK3 accept, zero focus disturbance to the user — see
+   the section below). Costs a fresh app instance, so prefer it when
+   you can anticipate stubborn modals BEFORE building up in-app state
 5. **The app's own API or config** — often the cleanest exit. The
    dialog above only existed to PUT a file to PrusaLink; the stored
    credentials in `~/.config/PrusaSlicer/physical_printer/*.ini` plus
@@ -210,6 +217,52 @@ verified):
    --data-binary @file http://<host>/api/v1/files/usb/<name>` did the
    whole job. When a dialog's only purpose is a network call, check
    whether you can make that call directly.
+
+## Headless-X backend (`--headless-x`)
+
+`cua-driver serve --headless-x[=WxH]` (default 1920x1080) starts the
+daemon against a **private off-screen Xvfb** instead of the user's
+session. This is the opt-in answer to apps that defeat both AT-SPI
+(wx modals collapse the tree) and XSendEvent (wx/GTK3 drop
+`send_event=true`): inside the private server, input is synthesized
+via **XTest** (`send_event=false` — the exact input wx accepts), and
+the target window IS that server's focused window, so the usual
+focus-steal objection to XTest evaporates. Proven live 2026-06-11:
+PrusaSlicer's wx Configuration Wizard advanced on an XTest click that
+every shared-session path silently dropped.
+
+How it works:
+
+- On startup the daemon spawns `Xvfb` on a free display (`:70..:199`)
+  plus `openbox` (best-effort, for wx modal focus/stacking), repoints
+  its own `$DISPLAY` at it, and clears `HYPRLAND_INSTANCE_SIGNATURE` /
+  `WAYLAND_DISPLAY` — so enumeration, capture, and `launch_app` all
+  transparently target the headless server via the plain X11 paths.
+  Requires `Xvfb` installed (`pacman -S xorg-server-xvfb`); `openbox`
+  recommended.
+- `launch_app` spawns apps off-screen with software GL forced
+  (`LIBGL_ALWAYS_SOFTWARE=1`, llvmpipe) — GL apps (PrusaSlicer) work
+  but render on CPU. `GDK_BACKEND=x11` is forced too.
+- `click` / `type_text` / `press_key` / `drag` route via XTest; tool
+  results say "via XTest (headless-X) — real input delivered" instead
+  of the unverified-XSendEvent caveat. Still verify by re-snapshot.
+- Per-window screenshots are captured by cropping the private root
+  (a direct per-window `XGetImage` is black for llvmpipe GL windows).
+- No agent-cursor overlay in this mode (nobody is watching, and it
+  would black out root captures on the uncomposited Xvfb).
+- Xvfb + openbox are killed with the daemon (`PR_SET_PDEATHSIG`) —
+  no leaked servers even on SIGKILL.
+
+Caveats:
+
+- **Whole-daemon mode**: the daemon is either headless or
+  user-session, not both. Use a separate daemon (distinct `--socket`)
+  if you need to drive the real session at the same time.
+- **Shared app config**: the headless app instance reads/writes the
+  same `~/.config` as the user's real instance — don't run both
+  concurrently for config-heavy apps (per-app `--datadir` isolation
+  is a known follow-up on shuv1337/cua#18).
+- X11-only: the app must be able to run under plain X11.
 
 ## Verify with closed-loop signals, never tool return values
 
@@ -274,6 +327,7 @@ ask the user.
 | Screenshot full-display | ✅ X11 (xshm); ✅ Wayland via grim (no portal) |
 | Screenshot per-window | ✅ X11; ✅ Hyprland via toplevel-export (correct even when occluded); other Wayland TBD |
 | launch_app | ✅ Hyprland: hidden `special:cua` background launch + a11y env injection + placement guard; elsewhere direct exec / xdg-open. Late dialogs may leak to the active workspace (#15) |
+| Headless-X (`--headless-x`) | ✅ private Xvfb + XTest: true off-screen real input for stubborn X11/wx apps; root-crop capture; software GL |
 | Session lifecycle | ✅ idle-TTL 300s, revivable ids (`start_session` same id), TTL discoverable; TTL reclaim kills owned recordings (#19) |
 | Recording | ✅ opt-in (`CUA_RECORDING_ENABLED=1`); wlr-screencopy on Wayland / `x11grab` on X11; ffmpeg required |
 
