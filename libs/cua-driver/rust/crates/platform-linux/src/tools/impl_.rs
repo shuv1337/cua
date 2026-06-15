@@ -888,12 +888,13 @@ fn chromium_switches() -> Vec<&'static str> {
 ///      on the BASENAME of the program token, never a substring of the whole
 ///      line (so `chrome` inside a path/arg of an unrelated app is not a false
 ///      positive).
-///   3. A filesystem-marker probe: resolve the program via `$PATH` + symlink
-///      canonicalisation and look for Electron/Chromium sidecar files
-///      (`chrome-sandbox`, `chrome_crashpad_handler`, `resources/app.asar`,
-///      `icudtl.dat`) next to the real binary. This catches custom Electron
-///      apps without scanning the binary itself. Stat-only, no exec, no ELF
-///      read; any canonicalise/read failure is treated as "not Chromium".
+///   3. On-disk inspection of the resolved binary. For an AppImage, read its
+///      embedded squashfs metadata and look for Electron/Chromium markers
+///      (`app.asar`, `chrome-sandbox`, …) — the toolkit isn't visible on disk
+///      until the AppImage mounts at launch, so this is how `orca-linux.AppImage`
+///      gets classified without an env override. For a normal install, look
+///      for those same sidecar files next to the binary. No exec, no FUSE
+///      mount; any failure is treated as "not Chromium".
 fn is_chromium_app(cmd: &str) -> bool {
     // 1. Explicit override.
     if matches!(std::env::var("CUA_DRIVER_ELECTRON").ok().as_deref(), Some("1")) {
@@ -948,8 +949,17 @@ fn is_chromium_app(cmd: &str) -> bool {
         return true;
     }
 
-    // 3. Filesystem-marker probe of the resolved binary's directory.
-    has_chromium_sidecar_files(&base)
+    // 3. Inspect the resolved binary on disk. An AppImage hides its toolkit in
+    // an appended squashfs (mounted only at launch), so read that directly; a
+    // normally-installed Chromium/Electron ships sidecar files next to the
+    // binary. Resolve once and feed both probes.
+    let Some(prog) = exec_program(cmd) else {
+        return false;
+    };
+    let Some(bin) = resolve_program(&prog) else {
+        return false;
+    };
+    appimage_has_chromium_markers(&bin) || dir_has_chromium_sidecars(&bin)
 }
 
 /// Whether the live process `pid` is a Chromium/Electron binary, decided by
@@ -977,35 +987,127 @@ fn proc_exe_is_chromium(pid: u32) -> bool {
     has_chromium_sidecar_files(&exe.to_string_lossy())
 }
 
-/// Resolve `prog` (a bare basename or path) via `$PATH` + symlink
-/// canonicalisation, then check the real binary's directory for the sidecar
-/// files an Electron/Chromium bundle ships. Returns false on any resolution
-/// failure (treated as non-Chromium). Pure stat — no exec, no binary scan.
-fn has_chromium_sidecar_files(prog: &str) -> bool {
-    // Resolve to an absolute path: honour an explicit path, else walk $PATH.
-    let resolved = if prog.contains('/') {
+/// The first real program token of an `Exec=`-style line — the full path or
+/// bare name, skipping `env` and `K=V` prefixes and stripping surrounding
+/// quotes. `env FOO=1 /usr/bin/code %U` → `/usr/bin/code`. `None` if the line
+/// holds no program token. (Sibling of [`exec_basename`], which keeps only the
+/// basename; here we need the path to locate the binary on disk.)
+fn exec_program(s: &str) -> Option<String> {
+    for tok in s.split_whitespace() {
+        if tok == "env" {
+            continue;
+        }
+        if tok.contains('=') && !tok.starts_with('/') && !tok.starts_with('-') {
+            continue;
+        }
+        return Some(tok.trim_matches(|c| c == '"' || c == '\'').to_owned());
+    }
+    None
+}
+
+/// Resolve a program token (bare name or path) to an absolute, symlink-free
+/// path via `$PATH` + canonicalisation. `None` on any resolution failure.
+fn resolve_program(prog: &str) -> Option<std::path::PathBuf> {
+    if prog.contains('/') {
         std::fs::canonicalize(prog).ok()
     } else {
-        std::env::var_os("PATH")
-            .and_then(|paths| {
-                std::env::split_paths(&paths)
-                    .map(|dir| dir.join(prog))
-                    .find(|cand| cand.is_file())
-            })
-            .and_then(|cand| std::fs::canonicalize(cand).ok())
-    };
-    let Some(bin) = resolved else { return false };
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(prog))
+                .find(|cand| cand.is_file())
+                .and_then(|cand| std::fs::canonicalize(cand).ok())
+        })
+    }
+}
+
+/// Whether the directory containing the resolved binary `bin` holds the sidecar
+/// files an Electron/Chromium *install* ships. Pure stat — no exec, no binary
+/// scan. (Does not see inside an AppImage; that's [`appimage_has_chromium_markers`].)
+fn dir_has_chromium_sidecars(bin: &std::path::Path) -> bool {
     let Some(dir) = bin.parent() else {
         return false;
     };
-
-    // Sidecar files that mark an Electron/Chromium install. `app.asar` lives
-    // under a `resources/` subdir in packaged Electron apps.
+    // `app.asar` lives under a `resources/` subdir in packaged Electron apps.
     const MARKERS: &[&str] = &["chrome-sandbox", "chrome_crashpad_handler", "icudtl.dat"];
     if MARKERS.iter().any(|m| dir.join(m).exists()) {
         return true;
     }
     dir.join("resources").join("app.asar").exists()
+}
+
+/// Resolve `prog` and check its directory for Electron/Chromium sidecar files.
+/// Convenience wrapper over [`resolve_program`] + [`dir_has_chromium_sidecars`]
+/// for callers that hold a program string (e.g. [`proc_exe_is_chromium`]).
+fn has_chromium_sidecar_files(prog: &str) -> bool {
+    resolve_program(prog).is_some_and(|bin| dir_has_chromium_sidecars(&bin))
+}
+
+/// Whether `bin` is an AppImage (type-2: an ELF runtime with an appended
+/// squashfs) whose embedded filesystem ships Electron/Chromium markers. An
+/// AppImage carries its toolkit *inside* the squashfs, which only mounts under
+/// `/tmp/.mount_*` AFTER launch — so [`dir_has_chromium_sidecars`] can't see it
+/// pre-launch. Instead we read the AppImage's own squashfs metadata directly
+/// (no exec, no FUSE mount): verify the type-2 magic (`AI\x02` in the ELF
+/// e_ident padding), compute the squashfs offset from the section-header table
+/// (the same `elf_size` the AppImage runtime uses for `--appimage-offset`),
+/// then enumerate the squashfs directory tree for `chrome-sandbox` /
+/// `chrome_crashpad_handler` / `app.asar` / `icudtl.dat`. Reads only metadata
+/// blocks, not file data. Any failure (not an AppImage, unreadable, unsupported
+/// compressor) is treated as "not Chromium" — so a wx AppImage like
+/// `OrcaSlicer.AppImage` is correctly left unmatched.
+fn appimage_has_chromium_markers(bin: &std::path::Path) -> bool {
+    use std::io::Read;
+
+    // ELF + AppImage type-2 header live in the first 64 bytes.
+    let Ok(mut file) = std::fs::File::open(bin) else {
+        return false;
+    };
+    let mut hdr = [0u8; 64];
+    if file.read_exact(&mut hdr).is_err() {
+        return false;
+    }
+    if &hdr[..4] != b"\x7fELF" {
+        return false;
+    }
+    // AppImage type-2 magic: bytes 8..11 of the ELF e_ident are 'A','I',0x02.
+    if !(hdr[8] == b'A' && hdr[9] == b'I' && hdr[10] == 2) {
+        return false;
+    }
+    // Only 64-bit little-endian ELF — every real x86_64/aarch64 AppImage.
+    if hdr[4] != 2 || hdr[5] != 1 {
+        return false;
+    }
+    // squashfs offset = end of the section-header table = e_shoff +
+    // e_shnum * e_shentsize (matches the AppImage runtime's elf_size()).
+    let e_shoff = u64::from_le_bytes(hdr[40..48].try_into().unwrap());
+    let e_shentsize = u16::from_le_bytes(hdr[58..60].try_into().unwrap()) as u64;
+    let e_shnum = u16::from_le_bytes(hdr[60..62].try_into().unwrap()) as u64;
+    let offset = e_shoff + e_shentsize * e_shnum;
+
+    let Ok(file) = std::fs::File::open(bin) else {
+        return false;
+    };
+    let Ok(fs) = backhand::FilesystemReader::from_reader_with_offset(
+        std::io::BufReader::new(file),
+        offset,
+    ) else {
+        return false;
+    };
+    const MARKERS: &[&str] = &[
+        "chrome-sandbox",
+        "chrome_crashpad_handler",
+        "app.asar",
+        "icudtl.dat",
+    ];
+    // Bind the result so the `files()` iterator temporary is dropped before
+    // `fs` at end of scope (it borrows `fs`).
+    let found = fs.files().any(|node| {
+        node.fullpath
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| MARKERS.contains(&n))
+    });
+    found
 }
 
 /// Build the `env … <cmd> <args>` shell line for a Hyprland background
@@ -3084,15 +3186,58 @@ mod tests {
             "firefox %u",
             "kitty",
             "env FOO=1 /usr/bin/prusa-slicer model.stl",
-            // wx AppImage living next to an Electron one must NOT match —
-            // feeding --force-renderer-accessibility to wx would break it.
+            // Non-existent AppImage paths: the squashfs probe can't open them,
+            // so they resolve to "not Chromium" rather than a false positive.
+            // (A real wx AppImage like OrcaSlicer is rejected by its squashfs
+            // lacking the markers — exercised by the host-gated test below.)
             "/home/u/Applications/OrcaSlicer.AppImage",
-            // Electron AppImage whose name can't be classified: correctly not
-            // matched here (needs CUA_DRIVER_ELECTRON=1).
             "/home/u/Applications/orca-linux.AppImage --no-sandbox",
             "",
         ] {
             assert!(!is_chromium_app(cmd), "did not expect Chromium/Electron: {cmd:?}");
+        }
+    }
+
+    #[test]
+    fn exec_program_keeps_full_path_token() {
+        assert_eq!(exec_program("env FOO=1 /usr/bin/code %U").as_deref(), Some("/usr/bin/code"));
+        assert_eq!(exec_program("firefox %u").as_deref(), Some("firefox"));
+        assert_eq!(
+            exec_program("\"/home/u/Apps/orca-linux.AppImage\" --no-sandbox").as_deref(),
+            Some("/home/u/Apps/orca-linux.AppImage"),
+        );
+        assert_eq!(exec_program(""), None);
+    }
+
+    /// End-to-end squashfs probe against whatever AppImages this host has in
+    /// `~/Applications`. Skips silently when none match so CI stays green; on a
+    /// dev box it proves Electron AppImages classify by content (their squashfs
+    /// ships `app.asar`) while wx AppImages (OrcaSlicer) do not — the whole
+    /// point of reading the embedded squashfs instead of guessing from the
+    /// filename (which carry hashes/versions, e.g. `OrcaSlicer_nightly_*`).
+    #[test]
+    fn appimage_squashfs_probe_classifies_by_content_when_present() {
+        let Ok(home) = std::env::var("HOME") else { return };
+        let Ok(entries) = std::fs::read_dir(format!("{home}/Applications")) else {
+            return;
+        };
+        let override_on = std::env::var("CUA_DRIVER_ELECTRON").as_deref() == Ok("1");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+            if !name.ends_with(".appimage") {
+                continue;
+            }
+            let p = path.to_string_lossy();
+            // Electron apps on this host — squashfs carries app.asar.
+            if name.starts_with("orca-linux") || name.starts_with("cursor") {
+                assert!(is_chromium_app(&p), "Electron AppImage should classify via squashfs: {p}");
+            }
+            // wx app — its squashfs has no Chromium markers, so even though it
+            // sits right next to the Electron ones it must stay unmatched.
+            if name.starts_with("orcaslicer") && !override_on {
+                assert!(!is_chromium_app(&p), "wx AppImage must NOT classify as Chromium: {p}");
+            }
         }
     }
 
