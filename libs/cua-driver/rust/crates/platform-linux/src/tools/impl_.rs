@@ -484,28 +484,33 @@ impl Tool for GetWindowStateTool {
                         structured["atspi_tree_collapsed"] = json!(true);
                         structured["atspi_peak_element_count"] = json!(peak);
                     } else if count <= 1 && peak <= 1 && proc_exe_is_chromium(pid) {
-                        // Frame-only Chromium/Electron: AuraLinux only builds
-                        // the full a11y tree once an AT advertises itself, and
-                        // backgrounds/throttles the renderer when the window is
-                        // hidden — so a hidden Electron window exposes just a
-                        // bare frame node here. The fix is server-side
-                        // (advertise a screen reader on the a11y status bus) +
-                        // the launch switches we inject for driver-launched
-                        // Chromium apps; an app launched outside the driver
-                        // needs a relaunch through launch_app (or --headless-X)
-                        // to pick those up. Only readlink(/proc/PID/exe) — one
-                        // syscall, gated behind the empty-snapshot check.
+                        // Frame-only Chromium/Electron: the Electron UI lives
+                        // in the renderer, and Chromium builds the renderer
+                        // accessibility tree only when launched with
+                        // --force-renderer-accessibility — advertising a
+                        // screen reader on the a11y bus (which the driver does
+                        // on startup) is necessary but NOT sufficient to
+                        // populate it after the fact. Chromium also throttles
+                        // the renderer while the window is hidden/occluded. So
+                        // a hidden Electron window started without the switch
+                        // exposes just a bare frame node here; the reliable fix
+                        // is a relaunch through launch_app (which injects the
+                        // switch) or --headless-X — NOT waiting for the bus
+                        // advertisement to take hold. Only readlink(/proc/PID/
+                        // exe) — one syscall, gated behind the empty-snapshot
+                        // check.
                         content.push(cua_driver_core::protocol::Content::text(
                             "⚠️ This looks like a Chromium/Electron window exposing only a bare \
-                             frame node — Chromium builds its full AT-SPI tree lazily (only when \
-                             a screen reader is advertised) and throttles the renderer while the \
-                             window is hidden/occluded. If this app was NOT launched by the \
-                             driver, relaunch it via launch_app so it inherits \
-                             --force-renderer-accessibility and the no-backgrounding switches \
-                             (or run the driver with --headless-X to drive it off-screen). The \
-                             driver advertises a screen reader on startup, which usually flips \
-                             already-running apps into full-tree mode within a second or two — \
-                             re-snapshot with get_window_state.",
+                             frame node. Electron content lives in the renderer, which builds its \
+                             AT-SPI tree only when the app is launched with \
+                             --force-renderer-accessibility; it also throttles the renderer while \
+                             the window is hidden/occluded. The driver advertises a screen reader \
+                             on the a11y bus, but that alone does NOT reliably populate an \
+                             already-running Electron app's tree. Relaunch it via launch_app so it \
+                             inherits the renderer-accessibility + no-backgrounding switches \
+                             (set CUA_DRIVER_ELECTRON=1 if it's an AppImage the launcher can't \
+                             auto-detect from its name), or run the driver with --headless-X to \
+                             drive it off-screen.",
                         ));
                         structured["atspi_tree_frame_only_chromium"] = json!(true);
                     }
@@ -895,9 +900,21 @@ fn is_chromium_app(cmd: &str) -> bool {
         return true;
     }
 
-    let base = exec_basename(cmd);
+    let mut base = exec_basename(cmd);
     if base.is_empty() {
         return false;
+    }
+    // An AppImage carries its toolkit inside the squashfs, which only mounts
+    // (under /tmp/.mount_*) AFTER launch — so the sidecar probe below can't
+    // see it pre-launch. Strip a trailing `.appimage` so a sanely-named
+    // Electron AppImage (`Code.AppImage`, `Electron.AppImage`) still matches
+    // the allowlist/substring. wx/Qt AppImages keep their own product name
+    // (e.g. `OrcaSlicer.AppImage` → `orcaslicer`, unmatched), so they never
+    // wrongly receive the switches; an Electron AppImage whose name doesn't
+    // classify (`orca-linux.AppImage`) needs the CUA_DRIVER_ELECTRON=1
+    // override — we can't safely guess its toolkit from the filename alone.
+    if let Some(stripped) = base.strip_suffix(".appimage") {
+        base = stripped.to_owned();
     }
 
     // 2. Known Chromium/Electron binary basenames. `electron` and `*electron*`
@@ -3046,6 +3063,10 @@ mod tests {
             "env GDK_BACKEND=x11 electron /opt/app",
             "some-custom-electron-shell",
             "slack -u",
+            // `.appimage` extension is stripped before the allowlist/substring
+            // check, so sanely-named Electron AppImages match.
+            "/home/u/Applications/Code.AppImage --no-sandbox",
+            "/home/u/Apps/Electron.AppImage",
         ] {
             assert!(is_chromium_app(cmd), "expected Chromium/Electron: {cmd:?}");
         }
@@ -3059,7 +3080,18 @@ mod tests {
         if std::env::var("CUA_DRIVER_ELECTRON").as_deref() == Ok("1") {
             return;
         }
-        for cmd in ["firefox %u", "kitty", "env FOO=1 /usr/bin/prusa-slicer model.stl", ""] {
+        for cmd in [
+            "firefox %u",
+            "kitty",
+            "env FOO=1 /usr/bin/prusa-slicer model.stl",
+            // wx AppImage living next to an Electron one must NOT match —
+            // feeding --force-renderer-accessibility to wx would break it.
+            "/home/u/Applications/OrcaSlicer.AppImage",
+            // Electron AppImage whose name can't be classified: correctly not
+            // matched here (needs CUA_DRIVER_ELECTRON=1).
+            "/home/u/Applications/orca-linux.AppImage --no-sandbox",
+            "",
+        ] {
             assert!(!is_chromium_app(cmd), "did not expect Chromium/Electron: {cmd:?}");
         }
     }
