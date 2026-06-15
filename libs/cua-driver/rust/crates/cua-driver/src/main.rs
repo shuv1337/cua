@@ -630,6 +630,23 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            // Advertise a screen reader on the a11y status bus so Chromium/
+            // Electron (and GTK/Qt) build their full AT-SPI accessibility
+            // tree — retroactively, for already-running apps, with no per-app
+            // flag. This is what lets us drive an Electron window that's
+            // backgrounded on a hidden workspace (it otherwise exposes only a
+            // bare frame node). Runs once on the main OS thread BEFORE the
+            // serve worker spawns (below), so the block_on inside is NOT on a
+            // tokio async worker — honouring the native.rs safety contract.
+            // Best-effort: a missing org.a11y.Bus must never block startup.
+            #[cfg(target_os = "linux")]
+            {
+                if let Err(e) = platform_linux::atspi::status::enable_screen_reader() {
+                    eprintln!(
+                        "cua-driver: could not advertise screen reader on a11y status bus: {e:#}"
+                    );
+                }
+            }
             // Serve mode needs the cursor overlay just like MCP mode.
             let cursor_cfg = cursor_overlay::CursorConfig::from_args();
             let reg = Arc::new(build_registry(cursor_cfg));
@@ -763,6 +780,17 @@ async fn async_main() -> anyhow::Result<()> {
     let registry = Arc::new(build_registry(cursor_cfg));
     registry.init_self_weak();
     maybe_init_pip();
+    // Parity with the `serve` arm: advertise a screen reader so Chromium/
+    // Electron build their full AT-SPI tree. async_main runs inside this
+    // process's tokio runtime, and enable_screen_reader() drives its OWN
+    // block_on — calling it inline would be "runtime within a runtime", so
+    // offload it to a detached OS thread. Best-effort; never blocks the server.
+    #[cfg(target_os = "linux")]
+    std::thread::spawn(|| {
+        if let Err(e) = platform_linux::atspi::status::enable_screen_reader() {
+            eprintln!("cua-driver: could not advertise screen reader on a11y status bus: {e:#}");
+        }
+    });
     cua_driver_core::server::run(registry).await?;
     Ok(())
 }

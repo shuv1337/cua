@@ -13,6 +13,7 @@ use anyhow::Result;
 
 pub mod cache;
 pub mod native;
+pub mod status;
 pub use cache::ElementCache;
 
 #[derive(Clone, Debug)]
