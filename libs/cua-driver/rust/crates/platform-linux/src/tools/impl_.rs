@@ -483,6 +483,31 @@ impl Tool for GetWindowStateTool {
                         )));
                         structured["atspi_tree_collapsed"] = json!(true);
                         structured["atspi_peak_element_count"] = json!(peak);
+                    } else if count <= 1 && peak <= 1 && proc_exe_is_chromium(pid) {
+                        // Frame-only Chromium/Electron: AuraLinux only builds
+                        // the full a11y tree once an AT advertises itself, and
+                        // backgrounds/throttles the renderer when the window is
+                        // hidden — so a hidden Electron window exposes just a
+                        // bare frame node here. The fix is server-side
+                        // (advertise a screen reader on the a11y status bus) +
+                        // the launch switches we inject for driver-launched
+                        // Chromium apps; an app launched outside the driver
+                        // needs a relaunch through launch_app (or --headless-X)
+                        // to pick those up. Only readlink(/proc/PID/exe) — one
+                        // syscall, gated behind the empty-snapshot check.
+                        content.push(cua_driver_core::protocol::Content::text(
+                            "⚠️ This looks like a Chromium/Electron window exposing only a bare \
+                             frame node — Chromium builds its full AT-SPI tree lazily (only when \
+                             a screen reader is advertised) and throttles the renderer while the \
+                             window is hidden/occluded. If this app was NOT launched by the \
+                             driver, relaunch it via launch_app so it inherits \
+                             --force-renderer-accessibility and the no-backgrounding switches \
+                             (or run the driver with --headless-X to drive it off-screen). The \
+                             driver advertises a screen reader on startup, which usually flips \
+                             already-running apps into full-tree mode within a second or two — \
+                             re-snapshot with get_window_state.",
+                        ));
+                        structured["atspi_tree_frame_only_chromium"] = json!(true);
                     }
                     structured["element_count"] = json!(count);
                     structured["tree_markdown"] = json!(tr.tree_markdown);
@@ -660,6 +685,13 @@ impl Tool for LaunchAppTool {
                 let rest: Vec<&str> = parts.collect();
                 let mut command = std::process::Command::new(prog);
                 command.args(&rest);
+                // Chromium/Electron-only (covers --headless-X, which forces
+                // this direct-spawn path): force the full renderer a11y tree
+                // and stop background/occlusion throttling. Before extra_args
+                // so the user's explicit args come last.
+                if is_chromium_app(cmd) {
+                    command.args(chromium_switches());
+                }
                 // `args` elements are appended verbatim (no whitespace
                 // splitting), so values with spaces survive intact.
                 command.args(&extra_args);
@@ -819,11 +851,152 @@ fn accessibility_bridge_env_pairs() -> Vec<(&'static str, String)> {
     ]
 }
 
+/// Chromium/Electron command-line switches that make a backgrounded window
+/// driveable. `--force-renderer-accessibility` builds the full renderer a11y
+/// tree without waiting for an AT to attach (the bus advertisement in
+/// `atspi::status` covers already-running apps, but for a freshly-launched
+/// Chromium this switch is the real lever). The three
+/// `--disable-*backgrounding*`/timer switches stop Chromium from throttling
+/// the renderer and pausing timers when the window is occluded/hidden, which
+/// is exactly the state of an Electron app parked on a hidden Hyprland
+/// special workspace. All are `--xxx-yyy` tokens (shell_quote leaves them
+/// bare). Only ever appended when [`is_chromium_app`] detects the target.
+fn chromium_switches() -> Vec<&'static str> {
+    vec![
+        "--force-renderer-accessibility",
+        "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-background-timer-throttling",
+    ]
+}
+
+/// Whether `cmd` (a launch_path / XDG `Exec=`-style line, field codes already
+/// stripped) is a Chromium- or Electron-based app, so [`chromium_switches`]
+/// should be appended. Gating is mandatory: handing these switches to e.g.
+/// Firefox, a terminal, or PrusaSlicer would make them treat the first one as
+/// a positional file arg or error out.
+///
+/// Three signals, cheapest first:
+///   1. `CUA_DRIVER_ELECTRON=1` — explicit operator override for a custom
+///      Electron app the heuristics below can't recognise.
+///   2. A basename allowlist of well-known Chromium/Electron binaries — match
+///      on the BASENAME of the program token, never a substring of the whole
+///      line (so `chrome` inside a path/arg of an unrelated app is not a false
+///      positive).
+///   3. A filesystem-marker probe: resolve the program via `$PATH` + symlink
+///      canonicalisation and look for Electron/Chromium sidecar files
+///      (`chrome-sandbox`, `chrome_crashpad_handler`, `resources/app.asar`,
+///      `icudtl.dat`) next to the real binary. This catches custom Electron
+///      apps without scanning the binary itself. Stat-only, no exec, no ELF
+///      read; any canonicalise/read failure is treated as "not Chromium".
+fn is_chromium_app(cmd: &str) -> bool {
+    // 1. Explicit override.
+    if matches!(std::env::var("CUA_DRIVER_ELECTRON").ok().as_deref(), Some("1")) {
+        return true;
+    }
+
+    let base = exec_basename(cmd);
+    if base.is_empty() {
+        return false;
+    }
+
+    // 2. Known Chromium/Electron binary basenames. `electron` and `*electron*`
+    // catch the generic launcher; the rest are common packaged apps.
+    const CHROMIUM_BINARIES: &[&str] = &[
+        "chrome",
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "google-chrome-stable",
+        "google-chrome-beta",
+        "google-chrome-unstable",
+        "brave",
+        "brave-browser",
+        "msedge",
+        "microsoft-edge",
+        "microsoft-edge-stable",
+        "vivaldi",
+        "vivaldi-stable",
+        "opera",
+        "electron",
+        "code",
+        "code-insiders",
+        "slack",
+        "discord",
+        "signal-desktop",
+        "spotify",
+        "obsidian",
+    ];
+    if CHROMIUM_BINARIES.contains(&base.as_str()) || base.contains("electron") {
+        return true;
+    }
+
+    // 3. Filesystem-marker probe of the resolved binary's directory.
+    has_chromium_sidecar_files(&base)
+}
+
+/// Whether the live process `pid` is a Chromium/Electron binary, decided by
+/// `readlink(/proc/PID/exe)` — a single syscall, cheap enough to run on the
+/// already-rare empty-snapshot path without caching. Used by the frame-only
+/// warning, where we only have a pid (not a launch command). Electron is
+/// multi-process, so `pid` may be a renderer; the exe symlink still resolves
+/// to the bundled Chromium binary, and `has_chromium_sidecar_files` then
+/// recognises the install layout. Any failure is treated as non-Chromium.
+fn proc_exe_is_chromium(pid: u32) -> bool {
+    let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    let base = exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if base.contains("chrom") || base.contains("electron") {
+        return true;
+    }
+    // Packaged Electron apps run under their own product binary name (e.g.
+    // `slack`, `code`), so fall back to the bundle-layout sidecar probe on the
+    // resolved path.
+    has_chromium_sidecar_files(&exe.to_string_lossy())
+}
+
+/// Resolve `prog` (a bare basename or path) via `$PATH` + symlink
+/// canonicalisation, then check the real binary's directory for the sidecar
+/// files an Electron/Chromium bundle ships. Returns false on any resolution
+/// failure (treated as non-Chromium). Pure stat — no exec, no binary scan.
+fn has_chromium_sidecar_files(prog: &str) -> bool {
+    // Resolve to an absolute path: honour an explicit path, else walk $PATH.
+    let resolved = if prog.contains('/') {
+        std::fs::canonicalize(prog).ok()
+    } else {
+        std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|dir| dir.join(prog))
+                    .find(|cand| cand.is_file())
+            })
+            .and_then(|cand| std::fs::canonicalize(cand).ok())
+    };
+    let Some(bin) = resolved else { return false };
+    let Some(dir) = bin.parent() else {
+        return false;
+    };
+
+    // Sidecar files that mark an Electron/Chromium install. `app.asar` lives
+    // under a `resources/` subdir in packaged Electron apps.
+    const MARKERS: &[&str] = &["chrome-sandbox", "chrome_crashpad_handler", "icudtl.dat"];
+    if MARKERS.iter().any(|m| dir.join(m).exists()) {
+        return true;
+    }
+    dir.join("resources").join("app.asar").exists()
+}
+
 /// Build the `env … <cmd> <args>` shell line for a Hyprland background
 /// launch. The launch env (XWayland preference + accessibility bridge) must
 /// be inline because the child is forked by Hyprland's exec, not by this
 /// process. `cmd` is an XDG `Exec=`-style line and passes through verbatim;
-/// `extra_args` are shell-quoted individually.
+/// `extra_args` are shell-quoted individually. Chromium/Electron targets also
+/// get [`chromium_switches`] (before `extra_args`, so the user's args win).
 fn build_background_shell_command(cmd: &str, extra_args: &[String]) -> String {
     let mut env_pairs: Vec<(&'static str, String)> = Vec::new();
     if std::env::var_os("WAYLAND_DISPLAY").is_some() && std::env::var_os("DISPLAY").is_some() {
@@ -841,6 +1014,16 @@ fn build_background_shell_command(cmd: &str, extra_args: &[String]) -> String {
     }
     line.push(' ');
     line.push_str(cmd);
+    // Chromium/Electron-only: keep a hidden-workspace window's renderer awake
+    // and its a11y tree fully built. Before extra_args so the user's args
+    // come last. Switches are `--xxx-yyy` tokens — shell_quote leaves them
+    // bare, so push directly.
+    if is_chromium_app(cmd) {
+        for sw in chromium_switches() {
+            line.push(' ');
+            line.push_str(sw);
+        }
+    }
     for arg in extra_args {
         line.push(' ');
         line.push_str(&shell_quote(arg));
@@ -2843,5 +3026,50 @@ mod tests {
         assert_eq!(reg.ratio(100, 1), Some(2.44));
         reg.clear_ratio(100, 1);
         assert_eq!(reg.ratio(100, 1), None);
+    }
+
+    #[test]
+    fn exec_basename_strips_wrappers_paths_and_field_codes() {
+        assert_eq!(exec_basename("env FOO=1 /usr/bin/code %U"), "code");
+        assert_eq!(exec_basename("firefox %u"), "firefox");
+        assert_eq!(exec_basename("/opt/Some.App/bin/Slack"), "slack");
+        assert_eq!(exec_basename("\"/usr/bin/google-chrome-stable\""), "google-chrome-stable");
+        assert_eq!(exec_basename(""), "");
+    }
+
+    #[test]
+    fn is_chromium_app_matches_known_binaries_by_basename() {
+        // Allowlisted basenames short-circuit before any filesystem probe.
+        for cmd in [
+            "google-chrome-stable %U",
+            "/usr/bin/code --new-window",
+            "env GDK_BACKEND=x11 electron /opt/app",
+            "some-custom-electron-shell",
+            "slack -u",
+        ] {
+            assert!(is_chromium_app(cmd), "expected Chromium/Electron: {cmd:?}");
+        }
+    }
+
+    #[test]
+    fn is_chromium_app_rejects_non_chromium_basenames() {
+        // Names not on the allowlist and (on a normal test host) carrying no
+        // Electron/Chromium sidecar files must not get the switches. Guard
+        // against a CUA_DRIVER_ELECTRON override leaking in from the env.
+        if std::env::var("CUA_DRIVER_ELECTRON").as_deref() == Ok("1") {
+            return;
+        }
+        for cmd in ["firefox %u", "kitty", "env FOO=1 /usr/bin/prusa-slicer model.stl", ""] {
+            assert!(!is_chromium_app(cmd), "did not expect Chromium/Electron: {cmd:?}");
+        }
+    }
+
+    #[test]
+    fn chromium_switches_force_a11y_and_defeat_throttling() {
+        let sw = chromium_switches();
+        assert!(sw.contains(&"--force-renderer-accessibility"));
+        assert!(sw.contains(&"--disable-backgrounding-occluded-windows"));
+        // Every switch is a bare `--flag` token (shell_quote leaves it bare).
+        assert!(sw.iter().all(|s| s.starts_with("--") && !s.contains(' ')));
     }
 }
