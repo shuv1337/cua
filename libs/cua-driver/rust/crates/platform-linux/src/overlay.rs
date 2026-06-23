@@ -141,18 +141,16 @@ pub fn run_on_thread() {
 /// NOT a pause — the `CMD_TX`/`CMD_RX_CELL` channel is process-lifetime
 /// (`OnceLock`), so there is no supported restart after `stop`.
 ///
-/// Sets the STOP flag, nudges the thread out of its quiescent `recv_timeout`
-/// with a benign command so it observes the flag immediately, then joins it —
-/// the thread destroys the override-redirect window on its way out.
+/// Sets the STOP flag then joins the render thread. The loop checks STOP at
+/// the top of every iteration, and the quiescent path already bounds its wait
+/// to `recv_timeout(50ms)` while the animating path polls every ~16ms, so the
+/// flag is observed within that window with no extra wake needed. On its way
+/// out the thread destroys the override-redirect X11 window.
 pub fn stop() {
     if crate::headless_x::is_active() {
         return;
     }
     STOP.store(true, std::sync::atomic::Ordering::Release);
-    if let Some(tx) = CMD_TX.get() {
-        // Benign wake; the thread breaks on the STOP check before applying it.
-        let _ = tx.try_send(OverlayCommand::SetEnabled(false));
-    }
     if let Some(handle) = OVERLAY_THREAD.lock().unwrap().take() {
         let _ = handle.join();
     }
