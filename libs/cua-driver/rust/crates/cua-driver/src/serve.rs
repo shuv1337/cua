@@ -933,6 +933,13 @@ pub async fn run_serve(
     }
 
     // Clean up.
+    // Tear down the Linux agent-cursor overlay thread + its X11 window. The
+    // render thread is long-lived (spawned at daemon start, no per-session
+    // lifecycle) so without this it would otherwise only die on process exit;
+    // stopping it here destroys the override-redirect window cleanly. No-op if
+    // the overlay was disabled or never started.
+    #[cfg(target_os = "linux")]
+    platform_linux::overlay::stop();
     let _ = std::fs::remove_file(socket_path);
     if let Some(pid_path) = pid_file_path {
         let _ = std::fs::remove_file(pid_path);
