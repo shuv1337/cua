@@ -31,6 +31,14 @@ static CMD_RX_CELL: Mutex<Option<std::sync::mpsc::Receiver<OverlayCommand>>> = M
 static RENDER: Mutex<Option<RenderState>> = Mutex::new(None);
 static ARRIVAL_TX: Mutex<Option<tokio::sync::oneshot::Sender<()>>> = Mutex::new(None);
 
+/// Set by [`stop`] to tell the render thread to tear down its X11 window and
+/// exit. The render loop checks it every iteration (and is nudged awake out of
+/// its quiescent wait), so teardown is observed within one poll interval.
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Join handle for the spawned `cua-overlay-x11` thread, so [`stop`] can wait
+/// for the window to actually be destroyed before returning.
+static OVERLAY_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+
 pub fn init(cfg: CursorConfig) {
     // No agent-cursor overlay in headless-X mode: there is no user watching
     // the off-screen Xvfb, and a full-desktop ARGB override window on an
@@ -115,12 +123,60 @@ pub fn run_on_thread() {
         return;
     }
 
-    std::thread::Builder::new()
+    STOP.store(false, std::sync::atomic::Ordering::Release);
+    let handle = std::thread::Builder::new()
         .name("cua-overlay-x11".into())
         .spawn(move || {
             run_overlay_thread(cfg, rx);
         })
         .expect("spawn overlay thread");
+    *OVERLAY_THREAD.lock().unwrap() = Some(handle);
+}
+
+/// Stop the overlay render thread and destroy its X11 window.
+///
+/// Wired into daemon shutdown so the long-lived overlay thread is torn down
+/// deterministically instead of relying on process exit to reap it. Idempotent
+/// and terminal: a no-op if the overlay never started or already stopped, and
+/// NOT a pause — the `CMD_TX`/`CMD_RX_CELL` channel is process-lifetime
+/// (`OnceLock`), so there is no supported restart after `stop`.
+///
+/// Sets the STOP flag then joins the render thread. The loop checks STOP at
+/// the top of every iteration, and the quiescent path already bounds its wait
+/// to `recv_timeout(50ms)` while the animating path polls every ~16ms, so the
+/// flag is observed within that window with no extra wake needed. On its way
+/// out the thread destroys the override-redirect X11 window.
+pub fn stop() {
+    if crate::headless_x::is_active() {
+        return;
+    }
+    STOP.store(true, std::sync::atomic::Ordering::Release);
+    if let Some(handle) = OVERLAY_THREAD.lock().unwrap().take() {
+        let _ = handle.join();
+    }
+}
+
+/// Cheap hash of everything that affects the rendered pixels, used by the
+/// render loop to skip the full-screen `render_frame` + BGRA byte-swap +
+/// `XPutImage` when the visual is unchanged. Floats are quantised so sub-pixel
+/// jitter doesn't force a repaint while genuine motion (≥¼px), heading, fade,
+/// and click-pulse changes still do. Discrete style/shape/palette/motion
+/// changes arrive as commands and force a repaint directly (see the loop), so
+/// they need not all be folded in here.
+#[cfg(target_os = "linux")]
+fn paint_signature(core: &RenderStateCore) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    core.visible.hash(&mut h);
+    ((core.pos.0 * 4.0).round() as i64).hash(&mut h);
+    ((core.pos.1 * 4.0).round() as i64).hash(&mut h);
+    ((core.heading * 256.0).round() as i64).hash(&mut h);
+    ((core.idle_alpha * 255.0).round() as i64).hash(&mut h);
+    core.click_t.map(|t| (t * 255.0).round() as i64).hash(&mut h);
+    core.shape.is_some().hash(&mut h);
+    core.gradient_colors.hash(&mut h);
+    core.bloom_override.hash(&mut h);
+    h.finish()
 }
 
 // ── Animation state ───────────────────────────────────────────────────────
@@ -260,46 +316,121 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayCo
     conn.map_window(win).ok();
     conn.flush().ok();
 
-    // Main render loop at ~60Hz.
+    // Main render loop. Two cost controls keep an idle/hidden agent-cursor at
+    // ~0% CPU instead of re-uploading the WHOLE screen at 60 Hz forever (the
+    // cause of a multi-day single-core pin: a session that placed the cursor
+    // then went idle left this thread allocating a full-screen pixmap, doing a
+    // per-pixel BGRA byte-swap, and `XPutImage`-ing the entire display every
+    // 16 ms with nothing on screen):
+    //
+    //  1. PAINT GATE — a cheap per-frame signature of everything that affects
+    //     the rendered pixels (`paint_signature`). The full-screen render +
+    //     byte-swap + upload only run when that signature changes or a command
+    //     was just applied, so a static or faded-out cursor uploads nothing.
+    //  2. QUIESCENT BACKOFF — while nothing is animating the thread BLOCKS on
+    //     the command channel (bounded wait) rather than spinning at 60 Hz; it
+    //     wakes only for a command, idle-fade bookkeeping, z-order upkeep, or a
+    //     `stop()` request.
     let frame_dur = Duration::from_millis(16);
+    // Bounded so (a) idle-fade onset is detected promptly, (b) z-order
+    // reasserts stay timely, and (c) a STOP request is observed within this
+    // window even when the thread is otherwise idle.
+    let quiescent_wait = Duration::from_millis(50);
     let mut last_tick = Instant::now();
     let mut last_ztick = Instant::now();
+    let mut last_sig: Option<u64> = None;
     let z_enforcer = X11ZOrderEnforcer { conn: &conn, win };
 
     loop {
-        let now = Instant::now();
-        let dt  = now.duration_since(last_tick).as_secs_f64().min(0.05);
-        last_tick = now;
+        if STOP.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
 
-        // Drain commands and tick.
-        let fire_arrival = {
-            let mut guard = RENDER.lock().unwrap();
-            if let Some(rs) = guard.as_mut() {
-                while let Ok(cmd) = rx.try_recv() {
-                    rs.apply_command(cmd);
-                }
-                rs.tick(dt)
-            } else {
-                false
+        // Is the cursor visually evolving — a path/spring/click in flight, or an
+        // idle-fade still in progress? This governs cadence: a tight 60 Hz
+        // frame loop while animating, vs. a blocking wait at rest.
+        let animating = {
+            let guard = RENDER.lock().unwrap();
+            guard.as_ref().is_some_and(|rs| {
+                let c = &rs.core;
+                let moving =
+                    c.path.is_some() || c.spring.is_some() || c.click_t.is_some();
+                // Fade evolves until `idle_hide_ms + 180ms` after last activity.
+                let fade_active = c.visible
+                    && c.motion.idle_hide_ms > 0.0
+                    && c.idle_secs < c.motion.idle_hide_ms / 1000.0 + 0.18;
+                moving || fade_active
+            })
+        };
+
+        // First command for this iteration. While animating, never block — keep
+        // the frame cadence. At rest, BLOCK (bounded) so the thread does not
+        // spin: this is what drops idle CPU to ~0.
+        let first_cmd = if animating {
+            rx.try_recv().ok()
+        } else {
+            match rx.recv_timeout(quiescent_wait) {
+                Ok(cmd) => Some(cmd),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                // The sender is a process-lifetime static, so a disconnect is
+                // unreachable in practice; treat it as a stop just in case.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         };
 
-        // Render and paint.
-        let pixmap = {
+        let now = Instant::now();
+        let dt = now.duration_since(last_tick).as_secs_f64().min(0.05);
+        last_tick = now;
+
+        // Apply the first command (if any), drain the rest, then tick. Track
+        // whether ANY command was applied so discrete style/shape/palette/motion
+        // changes force a repaint even if `paint_signature` doesn't capture them.
+        let (fire_arrival, had_cmd) = {
+            let mut guard = RENDER.lock().unwrap();
+            if let Some(rs) = guard.as_mut() {
+                let mut had_cmd = false;
+                if let Some(cmd) = first_cmd {
+                    rs.apply_command(cmd);
+                    had_cmd = true;
+                }
+                while let Ok(cmd) = rx.try_recv() {
+                    rs.apply_command(cmd);
+                    had_cmd = true;
+                }
+                (rs.tick(dt), had_cmd)
+            } else {
+                (false, false)
+            }
+        };
+
+        // PAINT GATE: render + upload only when the rendered pixels changed (or
+        // a command was just applied). An unchanged frame skips the full-screen
+        // alloc, byte-swap, and `XPutImage` entirely.
+        let (sig, pixmap) = {
             let guard = RENDER.lock().unwrap();
-            guard.as_ref().map(|rs| {
-                cursor_overlay::render_frame(
-                    &rs.core,
-                    rs.scr_w.max(1),
-                    rs.scr_h.max(1),
-                    0.0, 0.0, // Linux uses screen-local coords (no origin offset)
-                    None,     // focus-rect is macOS-only
-                )
-            })
+            match guard.as_ref() {
+                Some(rs) => {
+                    let sig = paint_signature(&rs.core);
+                    let pm = if had_cmd || last_sig != Some(sig) {
+                        Some(cursor_overlay::render_frame(
+                            &rs.core,
+                            rs.scr_w.max(1),
+                            rs.scr_h.max(1),
+                            0.0, 0.0, // Linux uses screen-local coords (no origin offset)
+                            None,     // focus-rect is macOS-only
+                        ))
+                    } else {
+                        None
+                    };
+                    (Some(sig), pm)
+                }
+                None => (None, None),
+            }
         };
 
         if let Some(pm) = pixmap {
             paint_x11(&conn, win, scr_w, scr_h, depth, visual_id, &pm);
+            last_sig = sig;
         }
 
         if fire_arrival {
@@ -323,11 +454,21 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayCo
         // Drain any X events (needed to avoid blocking).
         while let Ok(Some(_)) = conn.poll_for_event() {}
 
-        let elapsed = Instant::now().duration_since(last_tick);
-        if let Some(remaining) = frame_dur.checked_sub(elapsed) {
-            std::thread::sleep(remaining);
+        // Frame pacing only matters while animating; the quiescent path already
+        // slept inside `recv_timeout` above.
+        if animating {
+            let elapsed = Instant::now().duration_since(last_tick);
+            if let Some(remaining) = frame_dur.checked_sub(elapsed) {
+                std::thread::sleep(remaining);
+            }
         }
     }
+
+    // Teardown (reached via `stop()`): drop the override-redirect overlay
+    // window so a stopped overlay leaves nothing behind on the X server.
+    // Qualified to disambiguate the xproto vs. shape `ConnectionExt` globs.
+    let _ = x11rb::protocol::xproto::ConnectionExt::destroy_window(&conn, win);
+    let _ = conn.flush();
 }
 
 // ── Z-order enforcer (Linux impl of cursor_overlay::ZOrderEnforcer) ──────
@@ -451,3 +592,72 @@ fn paint_x11(
 
 #[cfg(not(target_os = "linux"))]
 fn run_overlay_thread(_cfg: CursorConfig, _rx: std::sync::mpsc::Receiver<OverlayCommand>) {}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::paint_signature;
+    use cursor_overlay::{CursorConfig, RenderStateCore};
+
+    fn core() -> RenderStateCore {
+        RenderStateCore::new(CursorConfig::default())
+    }
+
+    // The paint gate's whole point: an UNCHANGED frame must hash identically,
+    // so the render loop can skip the full-screen alloc + BGRA byte-swap +
+    // XPutImage. This is what keeps an idle/static cursor at ~0% CPU instead
+    // of re-uploading the whole screen at 60 Hz forever (the multi-day
+    // single-core pin this fixes).
+    #[test]
+    fn signature_is_stable_when_nothing_changes() {
+        let c = core();
+        assert_eq!(paint_signature(&c), paint_signature(&c));
+    }
+
+    // A genuine cursor move (≥¼px after quantisation) must change the signature
+    // so the frame is actually repainted.
+    #[test]
+    fn signature_changes_on_visible_motion() {
+        let mut c = core();
+        let before = paint_signature(&c);
+        c.pos = (c.pos.0 + 10.0, c.pos.1 + 10.0);
+        assert_ne!(before, paint_signature(&c));
+    }
+
+    // Sub-quarter-pixel jitter must NOT force a repaint — the quantisation in
+    // `paint_signature` is what prevents float noise from defeating the gate.
+    #[test]
+    fn signature_ignores_subpixel_jitter() {
+        let mut c = core();
+        let before = paint_signature(&c);
+        c.pos = (c.pos.0 + 0.05, c.pos.1 + 0.05);
+        assert_eq!(before, paint_signature(&c));
+    }
+
+    // The idle-fade path animates `idle_alpha` toward 0; each fade step must
+    // change the signature so the fade actually renders, then stay put once
+    // fully hidden (alpha pinned at 0) so a hidden cursor uploads nothing.
+    #[test]
+    fn signature_tracks_idle_fade_then_settles() {
+        let mut c = core();
+        let visible = paint_signature(&c);
+        c.idle_alpha = 0.5;
+        let mid = paint_signature(&c);
+        assert_ne!(visible, mid);
+        c.idle_alpha = 0.0;
+        let hidden = paint_signature(&c);
+        assert_ne!(mid, hidden);
+        // Fully hidden is a fixed point: re-hashing the same hidden state is
+        // identical, so the loop stops repainting.
+        assert_eq!(hidden, paint_signature(&c));
+    }
+
+    // Toggling visibility (SetEnabled) must change the signature so show/hide
+    // is honoured by the gate.
+    #[test]
+    fn signature_changes_on_visibility_toggle() {
+        let mut c = core();
+        let shown = paint_signature(&c);
+        c.visible = false;
+        assert_ne!(shown, paint_signature(&c));
+    }
+}
