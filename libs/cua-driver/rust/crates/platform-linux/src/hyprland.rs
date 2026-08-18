@@ -5,12 +5,13 @@
 //! enough read-only metadata for list_windows, and per-window screenshots
 //! go through the hyprland-toplevel-export-v1 protocol
 //! (`crate::wayland_capture`) — which copies the toplevel's own buffer, so
-//! occluded/background windows capture their real content. grim region
-//! cropping remains only as a fallback when the protocol path fails.
+//! occluded/background windows capture their real content without relying on
+//! screen-region crops.
 
 use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::x11::WindowInfo;
@@ -60,16 +61,6 @@ pub fn list_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     list_windows_inner(filter_pid).unwrap_or_default()
 }
 
-/// How a per-window capture was obtained. `RegionCrop` pixels come from the
-/// live composited screen at the window's geometry — unlike a true
-/// `ToplevelExport` surface copy they can show overlapping windows, so
-/// callers surfacing the image to a user/LLM should attach a warning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CaptureMethod {
-    ToplevelExport,
-    RegionCrop,
-}
-
 /// True while a previous toplevel-export scratch thread has not finished.
 /// The capture is fully deadline-bounded now, so this should never stay set;
 /// it caps the damage at one outstanding thread+connection if something
@@ -77,45 +68,42 @@ pub enum CaptureMethod {
 static TOPLEVEL_CAPTURE_IN_FLIGHT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Per-window screenshot. Tries hyprland-toplevel-export first (true
-/// surface capture: correct content for occluded/background windows and
-/// windows on other workspaces), falling back to a grim screen-region crop
-/// of the client geometry when the protocol path is unavailable.
-pub fn screenshot_window_bytes(window_id: u64) -> Result<Vec<u8>> {
-    screenshot_window_bytes_with_provenance(window_id).map(|(png, _)| png)
+struct ToplevelCaptureGate;
+
+impl Drop for ToplevelCaptureGate {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        TOPLEVEL_CAPTURE_IN_FLIGHT.store(false, Ordering::Release);
+    }
 }
 
-/// Like [`screenshot_window_bytes`] but reports which capture method
-/// produced the pixels, so tool surfaces can warn about region crops.
-///
-/// The protocol capture runs on a bounded scratch thread: both the
-/// connect/registry handshake and the frame dispatch loops are
-/// deadline-bounded in `wayland_capture`, and this function is called
-/// synchronously from the recording write path — a wedged compositor must
-/// cost at most the timeout, not a hang or a leaked thread.
-pub fn screenshot_window_bytes_with_provenance(
-    window_id: u64,
-) -> Result<(Vec<u8>, CaptureMethod)> {
+/// Per-window screenshot through the identified toplevel-export protocol.
+/// There is deliberately no geometry crop fallback: a crop cannot prove that
+/// the pixels belong to this client.
+pub fn screenshot_window_bytes(window_id: u64) -> Result<Vec<u8>> {
+    if !clients()?
+        .iter()
+        .any(|client| parse_address(&client.address) == Some(window_id))
+    {
+        bail!("Hyprland client 0x{window_id:x} is not present in the current client list");
+    }
     use std::sync::atomic::Ordering;
 
     if TOPLEVEL_CAPTURE_IN_FLIGHT
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        tracing::debug!(
-            "previous toplevel-export capture still in flight; \
-             using grim region crop for 0x{window_id:x}"
-        );
-        return screenshot_window_bytes_grim(window_id)
-            .map(|png| (png, CaptureMethod::RegionCrop));
+        bail!("another Hyprland toplevel capture is already in flight");
     }
 
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let spawn = std::thread::Builder::new().name("wl-shot".into()).spawn(move || {
-        let result = crate::wayland_capture::capture_toplevel_png(window_id);
-        TOPLEVEL_CAPTURE_IN_FLIGHT.store(false, Ordering::Release);
-        let _ = tx.send(result);
-    });
+    let spawn = std::thread::Builder::new()
+        .name("wl-shot".into())
+        .spawn(move || {
+            let _gate = ToplevelCaptureGate;
+            let result = crate::wayland_capture::capture_toplevel_png(window_id);
+            let _ = tx.send(result);
+        });
     let result = match spawn {
         Ok(_) => rx
             .recv_timeout(Duration::from_secs(6))
@@ -126,68 +114,19 @@ pub fn screenshot_window_bytes_with_provenance(
         }
     };
     match result {
-        Ok(Ok(png)) => return Ok((png, CaptureMethod::ToplevelExport)),
-        Ok(Err(e)) => {
-            tracing::debug!(
-                "toplevel-export capture failed for 0x{window_id:x} ({e:#}); \
-                 falling back to grim region crop"
-            );
-        }
-        Err(e) => {
-            tracing::debug!(
-                "toplevel-export capture for 0x{window_id:x} did not complete ({e:#}); \
-                 falling back to grim region crop"
-            );
-        }
+        Ok(Ok(png)) => return Ok(png),
+        Ok(Err(e)) => return Err(e),
+        Err(e) => return Err(e),
     }
-    screenshot_window_bytes_grim(window_id).map(|png| (png, CaptureMethod::RegionCrop))
 }
 
-fn screenshot_window_bytes_grim(window_id: u64) -> Result<Vec<u8>> {
-    let client = clients()?
-        .into_iter()
-        .find(|c| parse_address(&c.address) == Some(window_id))
-        .ok_or_else(|| anyhow::anyhow!("Hyprland client 0x{window_id:x} not found"))?;
-    if client.size[0] <= 1 || client.size[1] <= 1 {
-        bail!("Hyprland client 0x{window_id:x} has invalid geometry");
-    }
-    // grim has no window concept: -g crops the live composited output at
-    // these screen coordinates. If the client's workspace is not the active
-    // one on its monitor, the crop would return unrelated screen content
-    // that looks like a faithful capture — refuse instead, so callers
-    // degrade to "no frame" rather than storing a wrong one. (A window on
-    // the active workspace but occluded can still be cropped to the
-    // covering window's pixels; that residual is why callers get
-    // CaptureMethod::RegionCrop provenance.)
-    if let (Some(workspace), Some(monitor_id)) = (&client.workspace, client.monitor) {
-        let active = monitors().ok().and_then(|ms| {
-            ms.into_iter()
-                .find(|m| m.id == monitor_id)
-                .and_then(|m| m.active_workspace)
-        });
-        if let Some(active) = active {
-            if active.id != workspace.id {
-                bail!(
-                    "Hyprland client 0x{window_id:x} is on workspace {} but its monitor \
-                     shows workspace {}; a grim region crop would capture unrelated content",
-                    workspace.id,
-                    active.id
-                );
-            }
-        }
-    }
-
-    let geometry = format!(
-        "{},{} {}x{}",
-        client.at[0], client.at[1], client.size[0], client.size[1]
-    );
-    let out = Command::new("grim")
-        .args(["-g", &geometry, "-t", "png", "-"])
-        .output()?;
-    if !out.status.success() || out.stdout.is_empty() {
-        bail!("grim failed for Hyprland geometry {geometry}");
-    }
-    Ok(out.stdout)
+fn daemon_owner_token() -> &'static str {
+    static TOKEN: OnceLock<String> = OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).expect("OS randomness unavailable");
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    })
 }
 
 /// Full-desktop screenshot via grim (all outputs composited). Used by the
@@ -233,12 +172,34 @@ pub fn monitor_scale_for_window(window_id: u64) -> Option<f64> {
         .map(|m| if m.scale > 0.0 { m.scale } else { 1.0 })
 }
 
+/// Logical screen origin of one exact Hyprland client, addressed by window id.
+///
+/// `hyprctl clients -j` reports `at` in logical compositor coordinates — the
+/// same space AT-SPI `CoordType::Window` extents and the input layer use — so
+/// this is the window-scoped offset an element-bounds rebase needs. Unlike the
+/// pid-scoped origin sources it never collapses a multi-toplevel process onto
+/// its first window. Returns `None` outside a Hyprland session or when the
+/// address is not a live client.
+pub fn window_origin(window_id: u64) -> Option<(i32, i32)> {
+    if !is_hyprland_session() {
+        return None;
+    }
+    clients()
+        .ok()?
+        .into_iter()
+        .find(|client| parse_address(&client.address) == Some(window_id))
+        .map(|client| (client.at[0], client.at[1]))
+}
+
 /// Address of the currently active (focused) Hyprland window, if any.
 pub fn active_window_address() -> Option<u64> {
     if !is_hyprland_session() {
         return None;
     }
-    let out = Command::new("hyprctl").args(["activewindow", "-j"]).output().ok()?;
+    let out = Command::new("hyprctl")
+        .args(["activewindow", "-j"])
+        .output()
+        .ok()?;
     if !out.status.success() || out.stdout.is_empty() {
         return None;
     }
@@ -265,7 +226,9 @@ pub fn focus_window(address: u64) {
 /// no special workspace shown). A window whose workspace is in this set is
 /// what a user would call "on screen".
 pub fn visible_workspace_ids() -> Vec<i64> {
-    let Ok(ms) = monitors() else { return Vec::new() };
+    let Ok(ms) = monitors() else {
+        return Vec::new();
+    };
     let mut ids = Vec::new();
     for m in ms {
         if let Some(w) = m.active_workspace {
@@ -283,38 +246,48 @@ pub fn visible_workspace_ids() -> Vec<i64> {
 /// Name of the hidden special workspace background launches land on.
 pub const BACKGROUND_WORKSPACE: &str = "special:cua";
 
-/// Launch `shell_cmd` onto the hidden [`BACKGROUND_WORKSPACE`] via
+/// Launch argv onto the hidden [`BACKGROUND_WORKSPACE`] via
 /// `hyprctl dispatch exec` with a `[workspace special:cua silent]` rule
 /// prefix — the window maps there without a workspace switch or focus
 /// change, so the user's session is untouched (the driver's no-foreground
 /// contract). Hyprland forks the child itself, so the pid is discovered by
-/// diffing the client list: returns the first new window (preferring one
-/// that actually landed on a special workspace, in case the user opened
-/// something mid-poll). `Ok(None)` means the dispatch was accepted but no
+/// correlating the token-bearing process to exactly one new client. `Ok(None)`
+/// means the dispatch was accepted but no
 /// new window mapped within the deadline — a slow cold start, or a
 /// single-instance app that routed to an existing process.
-pub fn launch_on_special_workspace(shell_cmd: &str) -> Result<Option<WindowInfo>> {
-    let before: std::collections::HashSet<u64> =
-        list_windows(None).iter().map(|w| w.xid).collect();
+pub fn launch_on_special_workspace(
+    argv: &[String],
+    env: &[(String, String)],
+) -> Result<Option<WindowInfo>> {
+    let token = env
+        .iter()
+        .find(|(key, _)| key == "CUA_LAUNCH_TOKEN")
+        .map(|(_, value)| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("launch correlation token is missing"))?;
+    let before: std::collections::HashSet<u64> = list_windows(None).iter().map(|w| w.xid).collect();
     dispatch_exec_with_rules(
         &format!("workspace {BACKGROUND_WORKSPACE} silent"),
-        shell_cmd,
+        argv,
+        env,
     )?;
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(250));
+        let pids = crate::proc_fs::processes_with_env("CUA_LAUNCH_TOKEN", token);
+        if pids.len() > 1 {
+            bail!("launch correlation token matched multiple processes");
+        }
         let fresh: Vec<WindowInfo> = list_windows(None)
             .into_iter()
-            .filter(|w| !before.contains(&w.xid))
+            .filter(|w| !before.contains(&w.xid) && w.pid.is_some_and(|pid| pids.contains(&pid)))
             .collect();
         if fresh.is_empty() {
             continue;
         }
-        let found = fresh
-            .iter()
-            .find(|w| w.workspace_id.is_some_and(|id| id < 0))
-            .cloned()
-            .unwrap_or_else(|| fresh[0].clone());
+        if fresh.len() != 1 {
+            bail!("launch correlation token matched ambiguous Hyprland clients");
+        }
+        let found = fresh[0].clone();
         // The exec rule only covers the FIRST window the spawned pid maps.
         // Apps with a splash screen burn the rule on the splash and map
         // their real main frame onto the user's active workspace seconds
@@ -375,7 +348,7 @@ fn guard_background_placement_for_pid_lifetime(pid: u32) {
     }
 }
 
-/// Add `pid` to the compositor-side guard registry (`_G.cua_bg.pids`),
+/// Add `pid` to this daemon's compositor-side guard registry,
 /// installing the shared `window.open` subscription on first use. The
 /// callback runs inside the compositor at map time and reuses the atomic
 /// move + re-hide pattern from [`move_window_to_background_workspace`].
@@ -387,18 +360,43 @@ fn guard_background_placement_for_pid_lifetime(pid: u32) {
 /// (`:set_enabled(false)` is the whole runtime API, verified live on
 /// 0.55.3) — and a per-launch rule that can't be removed is a leak that
 /// pid recycling would eventually turn into misplaced windows.
+///
+/// ## Known limitation: the compositor callback matches on pid alone
+///
+/// The registry entry carries the launched process's `/proc` starttime, and
+/// [`unregister_background_pid_hook`] refuses to clear an entry whose
+/// starttime does not match — so a *stale* daemon can never unregister a
+/// newer instance's guard. The `window.open` callback itself, however, can
+/// only compare `w.pid`: the Hyprland event payload exposes the client's
+/// pid and address and nothing that identifies the process instance, and
+/// the compositor's Lua environment has no filesystem access with which to
+/// read `/proc/<pid>/stat` itself (no `io`/`os` in the sandboxed `hl`
+/// runtime — verified on 0.55.3). There is no current Hyprland API that
+/// exposes a process instance token to the callback.
+///
+/// The residual exposure is therefore: guarded pid exits → the kernel
+/// recycles that exact pid for an unrelated process → that process maps a
+/// window *before* the driver unregisters the entry → its window is swept
+/// onto the hidden workspace. [`spawn_background_pid_reaper`] shrinks that
+/// window to the kernel's own exit notification latency by blocking on a
+/// `pidfd` instead of a 1 s poll, so in practice unregistration happens
+/// before the pid can be reused at all. It is not architecturally closed,
+/// and cannot be until Hyprland exposes process identity to `window.open`.
 fn register_background_pid_hook(pid: u32) -> bool {
-    reset_background_pid_registry_once();
+    let Some(start) = crate::proc_fs::process_instance_id(pid) else {
+        return false;
+    };
+    let state = daemon_owner_token();
     let workspace = BACKGROUND_WORKSPACE;
     let name = workspace.trim_start_matches("special:");
     let lua = format!(
-        "(function() \
-         if _G.cua_bg == nil then _G.cua_bg = {{ pids = {{}} }} end \
-         _G.cua_bg.pids[{pid}] = true \
-         if _G.cua_bg.sub == nil then \
-         _G.cua_bg.sub = hl.on('window.open', function(w) \
-         local t = _G.cua_bg \
-         if t == nil or w == nil or not t.pids[w.pid] then return end \
+         "(function() \
+          local t = _G['{state}'] \
+          if t == nil then t = {{ owner = '{state}', pids = {{}} }} _G['{state}'] = t end \
+          t.pids[{pid}] = {{ start = {start} }} \
+          if t.sub == nil then \
+          t.sub = hl.on('window.open', function(w) \
+          if w == nil or t.pids[w.pid] == nil then return end \
          if w.workspace == nil or w.workspace.id >= 0 then \
          hl.dispatch(hl.dsp.window.move({{ workspace = '{workspace}', window = 'address:'..tostring(w.address) }})) \
          local sp = hl.get_active_special_workspace() \
@@ -412,31 +410,19 @@ fn register_background_pid_hook(pid: u32) -> bool {
     hyprctl_dispatch(&lua)
 }
 
-/// One-time (per daemon process) cleanup of compositor-side guard state a
-/// previous daemon instance may have left behind: a stale `window.open`
-/// subscription whose reaper died with the old daemon would keep sweeping
-/// its registered pids — and pids recycle.
-fn reset_background_pid_registry_once() {
-    static RESET: std::sync::Once = std::sync::Once::new();
-    RESET.call_once(|| {
-        let _ = hyprctl_dispatch(
-            "(function() \
-             local t = _G.cua_bg \
-             if t ~= nil and t.sub ~= nil then t.sub:remove() end \
-             _G.cua_bg = { pids = {} } \
-             return hl.dsp.no_op() end)()",
-        );
-    });
-}
-
 /// Drop `pid` from the compositor-side guard registry, removing the shared
 /// `window.open` subscription once no guarded pids remain.
-fn unregister_background_pid_hook(pid: u32) {
+///
+/// Conditional on BOTH the daemon owner token and the registered `/proc`
+/// starttime, so neither a foreign daemon's registry nor a newer instance's
+/// entry for a recycled pid can be cleared by this call.
+fn unregister_background_pid_hook(pid: u32, start: u64) {
+    let state = daemon_owner_token();
     let lua = format!(
-        "(function() \
-         local t = _G.cua_bg \
-         if t ~= nil then \
-         t.pids[{pid}] = nil \
+         "(function() \
+          local t = _G['{state}'] \
+          if t ~= nil and t.owner == '{state}' and t.pids[{pid}] ~= nil and t.pids[{pid}].start == {start} then \
+          t.pids[{pid}] = nil \
          if t.sub ~= nil and next(t.pids) == nil then t.sub:remove() t.sub = nil end \
          end \
          return hl.dsp.no_op() end)()"
@@ -447,17 +433,20 @@ fn unregister_background_pid_hook(pid: u32) {
 /// Watch for `pid`'s exit, then unregister its compositor-side guard
 /// entry. Process identity is `(pid, /proc starttime)` so a recycled pid
 /// can't keep an unrelated process's windows getting swept off-screen.
+///
+/// The wait blocks on a `pidfd` bound to that exact process instance, so
+/// unregistration runs as soon as the kernel reports the exit rather than
+/// up to one poll interval later. That latency is what bounds the
+/// pid-recycling exposure documented on [`register_background_pid_hook`],
+/// whose compositor-side callback can only match on the numeric pid.
 fn spawn_background_pid_reaper(pid: u32) {
     std::thread::spawn(move || {
-        let Some(start) = proc_start_time(pid) else {
+        let Some(start) = crate::proc_fs::process_instance_id(pid) else {
             // Gone before the reaper started; nothing left to guard.
-            unregister_background_pid_hook(pid);
             return;
         };
-        while proc_start_time(pid) == Some(start) {
-            std::thread::sleep(Duration::from_secs(1));
-        }
-        unregister_background_pid_hook(pid);
+        crate::proc_fs::wait_for_process_exit(pid, start, Duration::from_secs(1));
+        unregister_background_pid_hook(pid, start);
     });
 }
 
@@ -470,9 +459,11 @@ fn spawn_background_pid_reaper(pid: u32) {
 /// same spirit as [`spawn_focus_restore_guard`].
 fn spawn_background_placement_guard(pid: u32) {
     std::thread::spawn(move || {
-        let Some(start) = proc_start_time(pid) else { return };
+        let Some(start) = crate::proc_fs::process_instance_id(pid) else {
+            return;
+        };
         let begun = Instant::now();
-        while proc_start_time(pid) == Some(start) {
+        while crate::proc_fs::process_instance_id(pid) == Some(start) {
             std::thread::sleep(if begun.elapsed() < Duration::from_secs(30) {
                 Duration::from_millis(300)
             } else {
@@ -481,16 +472,6 @@ fn spawn_background_placement_guard(pid: u32) {
             enforce_background_placement(pid);
         }
     });
-}
-
-/// Kernel start time of `pid` (`/proc/<pid>/stat` field 22, clock ticks
-/// since boot) — the stable half of a `(pid, starttime)` process identity.
-/// `None` once the process is gone. The comm field may itself contain
-/// spaces and parens, so fields are taken from after the LAST `)`.
-fn proc_start_time(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let (_, rest) = stat.rsplit_once(')')?;
-    rest.split_ascii_whitespace().nth(19)?.parse().ok()
 }
 
 /// Move a window (by Hyprland client address) onto [`BACKGROUND_WORKSPACE`]
@@ -519,7 +500,9 @@ pub fn move_window_to_background_workspace(address: u64) -> bool {
     if hyprctl_dispatch(&modern) {
         return true;
     }
-    hyprctl_dispatch(&format!("movetoworkspacesilent {workspace},address:0x{address:x}"))
+    hyprctl_dispatch(&format!(
+        "movetoworkspacesilent {workspace},address:0x{address:x}"
+    ))
 }
 
 /// `hyprctl dispatch exec` with a window-rule prefix, speaking both
@@ -528,8 +511,14 @@ pub fn move_window_to_background_workspace(address: u64) -> bool {
 /// form is `hl.dsp.exec_cmd('[rules] cmd')` (verified on 0.55: the rule
 /// prefix rides inside the exec payload in both grammars). Try modern
 /// first, legacy second, mirroring `focus_window` above.
-fn dispatch_exec_with_rules(rules: &str, shell_cmd: &str) -> Result<()> {
-    let payload = format!("[{rules}] {shell_cmd}");
+fn dispatch_exec_with_rules(rules: &str, argv: &[String], env: &[(String, String)]) -> Result<()> {
+    let command = env
+        .iter()
+        .map(|(key, value)| format!("{}={}", shell_quote(key), shell_quote(value)))
+        .chain(argv.iter().map(|arg| shell_quote(arg)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let payload = format!("[{rules}] env {command}");
     let lua = format!(
         "hl.dsp.exec_cmd('{}')",
         payload.replace('\\', r"\\").replace('\'', r"\'")
@@ -543,6 +532,10 @@ fn dispatch_exec_with_rules(rules: &str, shell_cmd: &str) -> Result<()> {
     bail!("hyprctl dispatch exec was rejected in both the modern (Lua) and legacy grammar");
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// Run `hyprctl dispatch <arg>`; true only when the compositor answered
 /// "ok" (hyprctl can exit 0 while printing an error).
 fn hyprctl_dispatch(arg: &str) -> bool {
@@ -551,7 +544,9 @@ fn hyprctl_dispatch(arg: &str) -> bool {
         .output()
         .map(|o| {
             o.status.success()
-                && String::from_utf8_lossy(&o.stdout).trim_start().starts_with("ok")
+                && String::from_utf8_lossy(&o.stdout)
+                    .trim_start()
+                    .starts_with("ok")
         })
         .unwrap_or(false)
 }
@@ -609,6 +604,7 @@ pub fn spawn_focus_restore_guard() {
 
 fn list_windows_inner(filter_pid: Option<u32>) -> Result<Vec<WindowInfo>> {
     let mut out = Vec::new();
+    let visible_workspaces = visible_workspace_ids();
     for client in clients()? {
         if !client.mapped || client.hidden || client.size[0] <= 1 || client.size[1] <= 1 {
             continue;
@@ -623,7 +619,7 @@ fn list_windows_inner(filter_pid: Option<u32>) -> Result<Vec<WindowInfo>> {
             continue;
         };
         let title = if client.title.trim().is_empty() {
-            client.class
+            client.class.clone()
         } else {
             client.title
         };
@@ -633,12 +629,18 @@ fn list_windows_inner(filter_pid: Option<u32>) -> Result<Vec<WindowInfo>> {
         out.push(WindowInfo {
             xid: window_id,
             pid,
+            app_name: client.class.clone(),
             title,
+            is_on_screen: client
+                .workspace
+                .as_ref()
+                .map(|workspace| visible_workspaces.contains(&workspace.id))
+                .unwrap_or(true),
+            z_index: None,
             x: client.at[0],
             y: client.at[1],
             width: client.size[0] as u32,
             height: client.size[1] as u32,
-            workspace_id: client.workspace.as_ref().map(|w| w.id),
         });
     }
     Ok(out)
@@ -675,20 +677,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proc_start_time_reads_a_live_process() {
-        assert!(proc_start_time(std::process::id()).is_some());
+    fn process_instance_id_reads_a_live_process() {
+        assert!(crate::proc_fs::process_instance_id(std::process::id()).is_some());
     }
 
     #[test]
-    fn proc_start_time_is_stable_for_a_live_process() {
+    fn process_instance_id_is_stable_for_a_live_process() {
         let pid = std::process::id();
-        assert_eq!(proc_start_time(pid), proc_start_time(pid));
+        assert_eq!(
+            crate::proc_fs::process_instance_id(pid),
+            crate::proc_fs::process_instance_id(pid)
+        );
     }
 
     #[test]
-    fn proc_start_time_none_once_gone() {
+    fn process_instance_id_none_once_gone() {
         // pid 0 (the idle task) never has a /proc/<pid>/stat entry.
-        assert_eq!(proc_start_time(0), None);
+        assert_eq!(crate::proc_fs::process_instance_id(0), None);
+    }
+
+    #[test]
+    fn compositor_shell_quote_cannot_split_arguments() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(
+            shell_quote("a b;$(touch /tmp/pwned)"),
+            "'a b;$(touch /tmp/pwned)'"
+        );
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 
     /// Kills the probe process even when an assertion panics mid-test.
@@ -719,19 +734,32 @@ mod tests {
     fn live_window_open_hook_sweeps_late_windows() {
         const CLASS: &str = "cua-live-issue15";
         if !is_hyprland_session()
-            || !Command::new("kitty").arg("--version").output().is_ok_and(|o| o.status.success())
+            || !Command::new("kitty")
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
         {
             eprintln!("skipping: needs a live Hyprland session and kitty");
             return;
         }
-        assert!(probe_windows(CLASS).is_empty(), "stale {CLASS} probe window present");
+        assert!(
+            probe_windows(CLASS).is_empty(),
+            "stale {CLASS} probe window present"
+        );
 
         dispatch_exec_with_rules(
             &format!("workspace {BACKGROUND_WORKSPACE} silent"),
-            &format!(
-                "kitty --class {CLASS} -o allow_remote_control=yes \
-                 -o confirm_os_window_close=0 --listen-on=unix:@{CLASS}"
-            ),
+            &[
+                "kitty".into(),
+                "--class".into(),
+                CLASS.into(),
+                "-o".into(),
+                "allow_remote_control=yes".into(),
+                "-o".into(),
+                "confirm_os_window_close=0".into(),
+                "--listen-on=unix:@".to_owned() + CLASS,
+            ],
+            &[("CUA_LAUNCH_TOKEN".into(), "test".into())],
         )
         .expect("dispatch exec");
 
@@ -746,12 +774,21 @@ mod tests {
         let pid = first.pid as u32;
         let _guard = KillOnDrop(pid);
 
-        assert!(register_background_pid_hook(pid), "hook registration rejected");
+        assert!(
+            register_background_pid_hook(pid),
+            "hook registration rejected"
+        );
 
         // Same pid maps a second OS window — Hyprland's default placement
         // for it would be the user's active workspace.
         let out = Command::new("kitten")
-            .args(["@", "--to", &format!("unix:@{CLASS}"), "launch", "--type=os-window"])
+            .args([
+                "@",
+                "--to",
+                &format!("unix:@{CLASS}"),
+                "launch",
+                "--type=os-window",
+            ])
             .output()
             .expect("kitten launch");
         assert!(out.status.success(), "kitten remote launch failed");
@@ -760,14 +797,18 @@ mod tests {
         loop {
             let wins = probe_windows(CLASS);
             if wins.len() >= 2
-                && wins.iter().all(|w| w.workspace.as_ref().is_some_and(|ws| ws.id < 0))
+                && wins
+                    .iter()
+                    .all(|w| w.workspace.as_ref().is_some_and(|ws| ws.id < 0))
             {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
                 "late window never reached {BACKGROUND_WORKSPACE}: {:?}",
-                wins.iter().map(|w| w.workspace.as_ref().map(|ws| ws.id)).collect::<Vec<_>>()
+                wins.iter()
+                    .map(|w| w.workspace.as_ref().map(|ws| ws.id))
+                    .collect::<Vec<_>>()
             );
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -781,6 +822,8 @@ mod tests {
             );
         }
 
-        unregister_background_pid_hook(pid);
+        if let Some(start) = crate::proc_fs::process_instance_id(pid) {
+            unregister_background_pid_hook(pid, start);
+        }
     }
 }

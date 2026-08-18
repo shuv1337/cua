@@ -1,14 +1,9 @@
 # Recording & replaying trajectories
 
 > **Cross-platform.** Recording is available on macOS (native
-> ScreenCaptureKit), Windows (ffmpeg + `gdigrab`), and Linux (Wayland
-> wlr-screencopy piped to ffmpeg; `x11grab` on pure-X11 sessions). Replay
-> is cross-platform as long as the recorded artifacts are present.
->
-> **Opt-in required (daemon).** Recording is disabled by default: start
-> the daemon with `--allow-recording` or `CUA_RECORDING_ENABLED=1`. On
-> Linux the AT-SPI `app_state.json` capture is separately gated behind
-> `CUA_RECORDING_CAPTURE_AX=1` (default off).
+> ScreenCaptureKit), Windows (ffmpeg + `gdigrab`), and Linux (ffmpeg +
+> `x11grab`). Replay is cross-platform as long as the recorded artifacts
+> are present.
 
 Session-scoped capture of action sequences + pre/post state, suitable
 for demos, regression diffs, and training data. Invoked only when the
@@ -22,14 +17,14 @@ turn folder under a caller-chosen output directory. Read-only tools
 permission probes, agent-cursor getters / setters, and the recording
 controls themselves) are not recorded.
 
-**Video off by default.** Pass `record_video: true` so `start_recording` also captures the main
-display to `<output_dir>/recording.mp4` (H.264 / 30 fps) for the
-lifetime of the session. The mp4 is finalized on `stop_recording`.
-(Default flipped from on to off in #1776 — older docs disagree.)
+**Video is opt-in.** `start_recording` records per-turn screenshots and
+JSON only. Pass `record_video: true` to *also* capture the main display
+to `<output_dir>/recording.mp4` (H.264 / 30 fps) for the lifetime of the
+session; the mp4 is finalized on `stop_recording`.
 
-**macOS — native ScreenCaptureKit, zero-config.** On macOS the
-recorder uses an in-process `SCStream` + `SCRecordingOutput`, so it
-inherits cua-driver's own Screen Recording grant — no separate
+**macOS — native ScreenCaptureKit, zero-config.** On macOS the daemon's
+recorder uses `SCStream` + `SCRecordingOutput`, so it inherits the daemon's
+Screen Recording grant — no separate
 subprocess prompt, no fast-fail, no second TCC dance. Requires macOS
 15.0+ (SCRecordingOutput introduced in macOS 15). No ffmpeg needed.
 
@@ -47,11 +42,22 @@ tools, or the friendlier `cua-driver recording` subcommand group
 (wraps both with human-readable output).
 
 ```
-cua-driver recording start ~/cua-trajectories/run-1 --video
-# … run the workflow … (omit --video for screenshots+JSON only)
+cua-driver recording start ~/cua-trajectories/run-1           # per-turn capture only
+cua-driver recording start ~/cua-trajectories/run-1 --video   # …plus display capture
+# … run the workflow …
 cua-driver recording status    # -> enabled / disabled, next_turn, output_dir
 cua-driver recording stop      # -> "Recording stopped. (video → recording.mp4)"
 ```
+
+Video is opt-in (`--video`, matching `start_recording`'s
+`record_video` default of `false`). The flag may appear on either side
+of the directory, and a global `--socket <path>` may appear before or
+after the `recording` verb without being mistaken for either.
+
+A session that owns a live recording is exempt from the idle-TTL
+sweep, so a long think between turns cannot silently split a
+trajectory. Explicit `end_session`, client disconnect, operator
+revocation, and daemon shutdown all still stop it.
 
 Raw-tool equivalent:
 
@@ -72,26 +78,47 @@ daemon restart resets to disabled.
 
 Each action writes to `turn-NNNNN/` (five-digit zero-padded counter):
 
-- `app_state.json` — post-action AX/UIA snapshot for the target
-  `(pid, window_id)` carrying the same `tree_markdown` +
-  `element_count` shape `get_window_state` returns (minus the
-  screenshot fields — those live in `screenshot.png`). On macOS the
-  recorder resolves a frontmost window internally when the action's
-  args don't carry one; on Windows it uses the first window of the
-  target pid. **Omitted on Linux** — ATSPI doesn't expose a cheap
-  whole-tree snapshot, and the file is left out rather than faked.
-- `screenshot.png` — post-action capture of the target window.
-  Omitted when the pid has no visible window.
+- `before_state.json` and `after_state.json` — application accessibility
+  state immediately before and after the action. They carry the same
+  `tree_markdown` and `element_count` shape as `get_window_state`.
+- `before.png` and `after.png` — target-window images immediately before
+  and after the action. Window capture remains scoped to the target when
+  another window covers it.
+- `evidence.json` — capture status for each phase. Missing expected capture
+  has an explicit classification instead of disappearing from the turn.
+- `app_state.json` and `screenshot.png` — compatibility aliases for
+  `after_state.json` and `after.png`.
 - `action.json` — the tool name, full input arguments, result
-  summary, pid, click point (when applicable), ISO-8601 timestamp.
+  summary, result-error flag, pid, click point (when applicable), ISO-8601
+  timestamp.
 - `click.png` — for click-family actions (`click`, `double_click`,
-  `right_click`): a copy of `screenshot.png` with a red dot drawn at
+  `right_click`): a copy of `before.png` with a red marker drawn at
   the click point. **Both addressing modes are covered:** explicit
   `x, y` clicks use the supplied coordinates directly, and
   `element_index`-addressed clicks resolve to the element's center
   via the live AX/UIA cache, then convert to window-local screenshot
-  pixels. Absent for non-click tools and for clicks whose resolved
-  point falls outside the captured window.
+  pixels. Absent for non-click tools. It is also absent, and explicitly
+  classified as not applicable, when the driver refuses a click before target
+  resolution; no input was aimed in that case. A dispatched click whose marker
+  cannot be resolved or rendered remains an evidence failure.
+
+## What the session manifest records
+
+`session.json` sits beside the turn folders and is rewritten when the
+recording is finalized:
+
+- `video` — presence, path, and finalized metadata, or the error that
+  prevented capture.
+- `cursor` — `sample_count` (positions written to `cursor.jsonl`) plus
+  `outside_capture_surface_count` and `unavailable_count`, which
+  separate "the pointer was off the recorded surface" from "this
+  session type has no cursor poll at all". A sub-30 Hz average sample
+  rate is then self-explaining.
+- `end_reason` — why the recording was finalized: `manual`,
+  `idle_backstop`, or the owning session's end (`session_explicit`,
+  `session_idle_timeout`, `session_process_exit`, `session_unknown`).
+  **Absent means never finalized:** the recording is still live, or the
+  process died with it running.
 
 ## When to use it
 
@@ -107,8 +134,8 @@ Each action writes to `turn-NNNNN/` (five-digit zero-padded counter):
 This skill does **not** auto-enable recording. The client invokes
 `start_recording` explicitly when the user asks to capture a session.
 If the user says "record this session" or similar, call
-`start_recording({output_dir:…})` before the first action (video on
-by default; pass `record_video: false` to opt out), and
+`start_recording({output_dir:…})` before the first action (video is
+off unless you pass `record_video: true`), and
 `stop_recording({})` when done.
 
 ## Replaying a recorded trajectory

@@ -115,8 +115,11 @@ pub fn write_crosshair_png(png_bytes: &[u8], cx: f64, cy: f64, path: &str) -> Re
     let path = if let Some(rest) = path.strip_prefix('~') {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
-            .map_err(|_| anyhow::anyhow!(
-                "Cannot expand `~` in path {path:?}: neither HOME nor USERPROFILE is set"))?;
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Cannot expand `~` in path {path:?}: neither HOME nor USERPROFILE is set"
+                )
+            })?;
         if home.is_empty() {
             anyhow::bail!("Cannot expand `~` in path {path:?}: HOME/USERPROFILE is empty");
         }
@@ -255,11 +258,11 @@ pub fn encode_rgba_to_png(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
             rgba.len()
         );
     }
-    let buf: ImageBuffer<image::Rgba<u8>, Vec<u8>> =
-        ImageBuffer::from_raw(w, h, rgba.to_vec())
-            .ok_or_else(|| anyhow!("invalid RGBA buffer for w={w} h={h}"))?;
+    let buf: ImageBuffer<image::Rgba<u8>, Vec<u8>> = ImageBuffer::from_raw(w, h, rgba.to_vec())
+        .ok_or_else(|| anyhow!("invalid RGBA buffer for w={w} h={h}"))?;
     let mut out = Vec::new();
-    DynamicImage::ImageRgba8(buf).write_to(&mut std::io::Cursor::new(&mut out), ImageFormat::Png)?;
+    DynamicImage::ImageRgba8(buf)
+        .write_to(&mut std::io::Cursor::new(&mut out), ImageFormat::Png)?;
     Ok(out)
 }
 
@@ -323,6 +326,30 @@ mod tests {
         let (w, h) = png_dimensions(&resized).unwrap();
         assert_eq!(w, 50);
         assert_eq!(h, 25);
+    }
+
+    fn encode_png(pixels: &[u8], width: u32, height: u32, color: ColorType) -> Vec<u8> {
+        use image::ImageEncoder;
+
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(pixels, width, height, color.into())
+            .unwrap();
+        png
+    }
+
+    #[test]
+    fn resize_supports_l8_png() {
+        let png = encode_png(&vec![128; 20 * 10], 20, 10, ColorType::L8);
+        let resized = resize_png_if_needed(&png, 5).unwrap();
+        assert_eq!(png_dimensions(&resized).unwrap(), (5, 3));
+    }
+
+    #[test]
+    fn resize_supports_la8_png() {
+        let png = encode_png(&vec![128; 20 * 10 * 2], 20, 10, ColorType::La8);
+        let resized = resize_png_if_needed(&png, 5).unwrap();
+        assert_eq!(png_dimensions(&resized).unwrap(), (5, 3));
     }
 
     #[test]

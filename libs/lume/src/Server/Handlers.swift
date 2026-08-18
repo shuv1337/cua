@@ -77,6 +77,7 @@ extension Server {
 
         let vmName = request.name ?? imageName
         await PullProgressTracker.shared.setProgress(0.0, for: vmName)
+        let pullStartedAt = Date()
 
         Task.detached { @MainActor @Sendable in
             do {
@@ -93,9 +94,23 @@ extension Server {
                 )
                 await PullProgressTracker.shared.complete(for: vmName)
                 Logger.info("Async pull completed", metadata: ["name": vmName])
+                TelemetryClient.shared.recordOperationCompleted(
+                    operation: "pull_start",
+                    transport: .http,
+                    success: true,
+                    errorClass: .none,
+                    elapsed: Date().timeIntervalSince(pullStartedAt)
+                )
             } catch {
                 await PullProgressTracker.shared.setError(error.localizedDescription, for: vmName)
                 Logger.error("Async pull failed", metadata: ["name": vmName, "error": error.localizedDescription])
+                TelemetryClient.shared.recordOperationCompleted(
+                    operation: "pull_start",
+                    transport: .http,
+                    success: false,
+                    errorClass: .operationError,
+                    elapsed: Date().timeIntervalSince(pullStartedAt)
+                )
             }
         }
 
@@ -256,7 +271,10 @@ extension Server {
                 memory: sizes.memory,
                 diskSize: sizes.diskSize,
                 display: sizes.display?.string,
-                storage: request.storage
+                storage: request.storage,
+                noBackup: request.noBackup ?? false,
+                keepBackup: request.keepBackup ?? false,
+                dryRun: request.dryRun ?? false
             )
 
             return HTTPResponse(
@@ -410,11 +428,18 @@ extension Server {
 
         do {
             Logger.info("Creating VM controller and parsing request", metadata: ["name": name])
-            let request =
-                body.flatMap { try? JSONDecoder().decode(RunVMRequest.self, from: $0) }
-                ?? RunVMRequest(
+            let request: RunVMRequest
+            if let body {
+                do {
+                    request = try JSONDecoder().decode(RunVMRequest.self, from: body)
+                } catch {
+                    throw ValidationError("Invalid run request body")
+                }
+            } else {
+                request = RunVMRequest(
                     noDisplay: nil, sharedDirectories: nil, recoveryMode: nil, storage: nil,
-                    diskPath: nil, nvramPath: nil, network: nil, clipboard: nil)
+                    diskPath: nil, nvramPath: nil, network: nil, clipboard: nil, vnc: nil)
+            }
 
             // Record telemetry
             TelemetryClient.shared.record(event: TelemetryEvent.apiVMRun, properties: [
@@ -437,19 +462,22 @@ extension Server {
                 metadata: ["name": name, "count": "\(dirs.count)"])
 
             let networkMode = try request.parseNetworkMode()
+            let vncPolicy = try request.validatedVNCPolicy(noDisplayDefault: false)
+            let noDisplay = request.noDisplay ?? false
 
             // Start VM in background
             Logger.info("Starting VM in background", metadata: ["name": name])
             startVM(
                 name: name,
-                noDisplay: request.noDisplay ?? false,
+                noDisplay: noDisplay,
                 sharedDirectories: dirs,
                 recoveryMode: request.recoveryMode ?? false,
                 storage: request.storage,
                 diskPath: request.diskPath.map { Path($0) },
                 nvramPath: request.nvramPath.map { Path($0) },
                 networkMode: networkMode,
-                clipboard: request.clipboard ?? false
+                clipboard: request.clipboard ?? false,
+                vncPolicy: vncPolicy
             )
             Logger.info("VM start initiated in background", metadata: ["name": name])
 
@@ -582,6 +610,7 @@ extension Server {
 
         // Record telemetry
         TelemetryClient.shared.record(event: TelemetryEvent.apiPush)
+        let pushStartedAt = Date()
 
         // Trigger push asynchronously, return Accepted immediately
         Task.detached { @MainActor @Sendable in
@@ -603,9 +632,23 @@ extension Server {
                 print(
                     "Background push completed successfully for image: \(request.imageName):\(request.tags.joined(separator: ","))"
                 )
+                TelemetryClient.shared.recordOperationCompleted(
+                    operation: "push",
+                    transport: .http,
+                    success: true,
+                    errorClass: .none,
+                    elapsed: Date().timeIntervalSince(pushStartedAt)
+                )
             } catch {
                 print(
                     "Background push failed for image: \(request.imageName):\(request.tags.joined(separator: ",")) - Error: \(error.localizedDescription)"
+                )
+                TelemetryClient.shared.recordOperationCompleted(
+                    operation: "push",
+                    transport: .http,
+                    success: false,
+                    errorClass: .operationError,
+                    elapsed: Date().timeIntervalSince(pushStartedAt)
                 )
             }
         }
@@ -914,7 +957,8 @@ extension Server {
         diskPath: Path? = nil,
         nvramPath: Path? = nil,
         networkMode: NetworkMode? = nil,
-        clipboard: Bool = false
+        clipboard: Bool = false,
+        vncPolicy: VNCPolicy = .enabled
     ) {
         Logger.info(
             "Starting VM in detached task",
@@ -924,6 +968,7 @@ extension Server {
                 "recoveryMode": "\(recoveryMode)",
                 "storage": String(describing: storage),
                 "networkMode": networkMode?.description ?? "vm-config",
+                "vncPolicy": vncPolicy.rawValue,
             ])
 
         Task.detached { @MainActor @Sendable in
@@ -947,7 +992,9 @@ extension Server {
                     diskPath: diskPath,
                     nvramPath: nvramPath,
                     networkMode: networkMode,
-                    clipboard: clipboard
+                    clipboard: clipboard,
+                    vncPolicy: vncPolicy,
+                    telemetryTransport: .http
                 )
                 Logger.info("VM started successfully in background task", metadata: ["name": name])
             } catch {

@@ -1,187 +1,152 @@
-//! Recording callbacks for Linux, mirroring
-//! `platform_macos::recording_hooks`.
-//!
-//! - `app_state_json_for` → per-turn `app_state.json`: the AT-SPI tree in
-//!   the same `{pid, window_id, element_count, tree_markdown}` shape
-//!   `get_window_state` returns (minus screenshot fields).
-//! - `element_window_local_xy` → element center in window-local screenshot
-//!   pixels, so `click.png` markers and `action.json.click_point` work for
-//!   element_index-addressed clicks, not just pixel ones.
-//!
-//! Coordinate spaces: AT-SPI extents and hyprctl geometry are logical
-//! compositor coordinates, but toplevel-export screenshots of native
-//! Wayland windows are physical pixels at the window's monitor render
-//! scale (1.5x fractional scaling is common). X11/XWayland `import`
-//! captures are 1:1 with X11 logical coordinates, so they need no scale.
-//!
-//! Known limitation: element bounds come from a post-action AT-SPI
-//! re-walk, so if the action changed the tree the index can drift and the
-//! marker lands on the wrong element. macOS avoids this with a process-
-//! global element cache; porting that to Linux is the proper fix.
+//! Application-state snapshots used by trajectory recording on Linux.
 
-use std::sync::mpsc::SyncSender;
-use std::sync::OnceLock;
-use std::time::Duration;
-
-/// Jobs for the single long-lived hook worker, boxed so one thread serves
-/// both hook shapes.
-type HookJob = Box<dyn FnOnce() + Send + 'static>;
-
-/// `Some(sender)` once the "rec-hook" worker is up; `None` when the spawn
-/// failed (hooks then permanently skip, matching the old per-call `.ok()?`).
-static HOOK_TX: OnceLock<Option<SyncSender<HookJob>>> = OnceLock::new();
-
-/// Run a hook body on the long-lived "rec-hook" worker with a bounded wait.
-///
-/// Recording hooks are invoked synchronously from `write_turn` on a tokio
-/// async worker thread (tool impls escape via `spawn_blocking`, the
-/// recording path does not). The AT-SPI layer drives its own runtime via
-/// `block_on`, which panics when called from inside an async context — so
-/// hop to a plain thread first. A single persistent worker (rather than a
-/// spawn per call) caps in-flight AT-SPI work at one: agent-driven turn
-/// rates against a slow tree would otherwise accumulate leaked scratch
-/// threads all contending on the shared single-worker AT-SPI runtime.
-///
-/// The join is deadline-bounded so a wedged D-Bus walk cannot stall the
-/// tool-response path. The job queue holds at most one pending job; while
-/// the worker is busy and the slot is taken, further turns skip (`None`,
-/// callers omit the artifact for that turn). A timed-out job's late result
-/// lands in its own dropped channel and is discarded, leaving the worker
-/// free for the next turn.
-fn on_scratch_thread<T, F>(timeout: Duration, f: F) -> Option<T>
-where
-    F: FnOnce() -> Option<T> + Send + 'static,
-    T: Send + 'static,
-{
-    let tx = HOOK_TX
-        .get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<HookJob>(1);
-            std::thread::Builder::new()
-                .name("rec-hook".into())
-                .spawn(move || {
-                    while let Ok(job) = rx.recv() {
-                        job();
-                    }
-                })
-                .ok()
-                .map(|_| tx)
-        })
-        .as_ref()?;
-
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
-    let job: HookJob = Box::new(move || {
-        // Capacity-1 + a fresh channel per job: the send never blocks, and
-        // a result arriving after the recv_timeout below is simply dropped
-        // with the channel.
-        let _ = result_tx.try_send(f());
-    });
-    if tx.try_send(job).is_err() {
-        // Queue full: a previous turn's walk is still running AND one job is
-        // already waiting behind it — skip this turn rather than backlog.
-        return None;
-    }
-    result_rx.recv_timeout(timeout).ok().flatten()
-}
-
+#[cfg(target_os = "linux")]
 pub fn app_state_json_for(window_id: Option<u64>, pid: Option<i64>) -> Option<Vec<u8>> {
-    // pid is required, matching the macOS hook: AT-SPI lookup is by pid.
-    let pid = pid?;
-    let pid_u32 = u32::try_from(pid).ok()?;
-    // Bail fast when the action closed the app's last window (OK-button
-    // clicks, dialog dismissals): an AT-SPI walk against a dying process
-    // burns multi-second D-Bus timeouts and stalls the tool response.
-    let windows = crate::x11::list_windows(Some(pid_u32));
-    if windows.is_empty() {
-        return None;
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return std::thread::spawn(move || app_state_json_for_blocking(window_id, pid))
+            .join()
+            .ok()
+            .flatten();
     }
-    // Match macOS/Windows: always emit a numeric window id when one can be
-    // resolved (first window of the pid when the recorded args had none).
-    let window_id = window_id.or_else(|| windows.first().map(|w| w.xid));
-    on_scratch_thread(Duration::from_secs(12), move || {
-        // Native AT-SPI only — without the X11-properties fallback the
-        // shared walk_tree wrapper uses for get_window_state. That
-        // fallback fabricates a one-node title tree (and truncates
-        // Hyprland addresses to u32), which is worse than omitting
-        // app_state.json for the turn.
-        let (tree_markdown, nodes) = crate::atspi::native::walk_tree(pid_u32).ok().flatten()?;
-        if tree_markdown.is_empty() {
-            return None;
-        }
-        let payload = serde_json::json!({
-            "pid": pid,
-            "window_id": window_id,
-            "element_count": nodes.len(),
-            "tree_markdown": tree_markdown,
-        });
-        serde_json::to_vec_pretty(&payload).ok()
-    })
+    app_state_json_for_blocking(window_id, pid)
 }
 
-pub fn element_window_local_xy(
+#[cfg(target_os = "linux")]
+fn app_state_json_for_blocking(window_id: Option<u64>, pid: Option<i64>) -> Option<Vec<u8>> {
+    let pid = u32::try_from(pid?).ok()?;
+    let window_id = if crate::wayland::is_inject_mode() {
+        // Most injected actions already carry the protocol-verified window id.
+        // Process-scoped setup calls such as browser_prepare do not, so resolve
+        // their single target here instead of classifying required AX evidence
+        // as a capture failure.
+        match window_id {
+            Some(window_id) => window_id,
+            None => resolve_window_for_recording(pid, None)?.xid,
+        }
+    } else {
+        resolve_window_for_recording(pid, window_id)?.xid
+    };
+    let result = if crate::wayland::is_inject_mode() {
+        // Evidence capture runs inside the daemon call. Keep it below the
+        // transport deadline so an unresponsive renderer cannot block input.
+        crate::atspi::walk_tree_for_recording(pid, window_id, std::time::Duration::from_secs(2))
+    } else {
+        crate::atspi::walk_tree(pid, window_id, None)
+    };
+    if result.nodes.is_empty() || result.tree_markdown.trim().is_empty() {
+        return None;
+    }
+    let element_count = result
+        .nodes
+        .iter()
+        .filter(|node| node.element_index.is_some())
+        .count();
+    let payload = serde_json::json!({
+        "pid": pid,
+        "window_id": window_id,
+        "element_count": element_count,
+        "tree_markdown": result.tree_markdown,
+    });
+    serde_json::to_vec_pretty(&payload).ok()
+}
+
+#[cfg(target_os = "linux")]
+pub fn screenshot_for_recording(window_id: Option<u64>, pid: Option<i64>) -> Option<Vec<u8>> {
+    if crate::wayland::is_inject_mode() {
+        // A full-output frame is the strongest evidence for the nested
+        // compositor's background/focus guarantees and needs no slow AT-SPI
+        // geometry re-resolution. Per-window screenshots elsewhere retain the
+        // normal crop behavior.
+        return crate::wayland::screenshot_display_dispatch().ok();
+    }
+    if let Some(window_id) = window_id {
+        crate::wayland::screenshot_dispatch(window_id).ok()
+    } else if crate::hyprland::is_hyprland_session() {
+        // A recording event without its exact Hyprland address is not safe to
+        // correlate by PID: one process may own several toplevels.
+        None
+    } else if let Some(pid) = pid.and_then(|pid| u32::try_from(pid).ok()) {
+        let windows = crate::wayland::list_windows_dispatch(Some(pid));
+        (windows.len() == 1)
+            .then(|| windows[0].xid)
+            .and_then(|xid| crate::wayland::screenshot_dispatch(xid).ok())
+    } else {
+        crate::capture::screenshot_display_bytes().ok()
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn element_window_local_xy(window_id: u64, pid: i64, element_index: u32) -> Option<(f64, f64)> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return std::thread::spawn(move || {
+            element_window_local_xy_blocking(window_id, pid, element_index)
+        })
+        .join()
+        .ok()
+        .flatten();
+    }
+    element_window_local_xy_blocking(window_id, pid, element_index)
+}
+
+#[cfg(target_os = "linux")]
+fn element_window_local_xy_blocking(
     window_id: u64,
     pid: i64,
     element_index: u32,
 ) -> Option<(f64, f64)> {
-    let pid_u32 = u32::try_from(pid).ok()?;
-    on_scratch_thread(Duration::from_secs(8), move || {
-        element_window_local_xy_blocking(window_id, pid_u32, element_index)
-    })
+    let pid = u32::try_from(pid).ok()?;
+    // Scope the bounds to the exact window this recording turn targets: one
+    // pid can own several toplevels (routine on Hyprland), and an unscoped
+    // lookup rebases through whichever window happens to be listed first.
+    let (screen_x, screen_y, width, height) =
+        crate::atspi::get_element_bounds_in_window(pid, element_index as usize, Some(window_id))
+            .ok()?;
+    let window = resolve_window_for_recording(pid, Some(window_id))?;
+    Some((
+        f64::from(screen_x - window.x) + f64::from(width) / 2.0,
+        f64::from(screen_y - window.y) + f64::from(height) / 2.0,
+    ))
 }
 
-fn element_window_local_xy_blocking(
-    window_id: u64,
-    pid_u32: u32,
-    element_index: u32,
+#[cfg(target_os = "linux")]
+fn resolve_window_for_recording(
+    pid: u32,
+    window_id: Option<u64>,
+) -> Option<crate::x11::WindowInfo> {
+    let windows = crate::wayland::list_windows_dispatch(Some(pid));
+    if crate::hyprland::is_hyprland_session() {
+        window_id.and_then(|id| windows.into_iter().find(|window| window.xid == id))
+    } else if crate::wayland::is_wayland() {
+        // Foreign-toplevel protocol object ids are scoped to one Wayland
+        // connection. Recording hooks open a fresh connection, so re-resolve
+        // the target by pid instead of comparing an id from the action call.
+        if windows.len() == 1 {
+            windows.into_iter().next()
+        } else {
+            None
+        }
+    } else if let Some(window_id) = window_id {
+        windows.into_iter().find(|window| window.xid == window_id)
+    } else {
+        windows.into_iter().next()
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn app_state_json_for(_window_id: Option<u64>, _pid: Option<i64>) -> Option<Vec<u8>> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn screenshot_for_recording(_window_id: Option<u64>, _pid: Option<i64>) -> Option<Vec<u8>> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn element_window_local_xy(
+    _window_id: u64,
+    _pid: i64,
+    _element_index: u32,
 ) -> Option<(f64, f64)> {
-    // Window lookup first: it's cheap, and when the click closed the
-    // window there's no point burning AT-SPI timeouts on a dead app.
-    let win = crate::x11::list_windows(Some(pid_u32))
-        .into_iter()
-        .find(|w| w.xid == window_id)?;
-
-    // Budget strictly under the 8s scratch-thread join above: unbounded,
-    // this call parks the shared hook worker on a wedged AT-SPI peer long
-    // after the join gave up (see `get_element_bounds_bounded`).
-    let (x, y, w, h) = crate::atspi::native::get_element_bounds_bounded(
-        pid_u32,
-        element_index as usize,
-        Duration::from_secs(7),
-    )
-    .ok()?;
-    let cx = x as f64 + w as f64 / 2.0;
-    let cy = y as f64 + h as f64 / 2.0;
-
-    let native_wayland = window_id > u32::MAX as u64;
-
-    // AT-SPI extents are screen coordinates for X11/XWayland apps, but
-    // toolkits on native Wayland cannot know their global position and
-    // report window-local coordinates (no Wayland protocol exposes the
-    // window's place in the layout). Both interpretations are tested for
-    // in-window containment; when both fit (window near the layout
-    // origin), native Wayland prefers the window-local reading because
-    // that is what GTK4/Qt actually emit — the screen-coordinate reading
-    // only arises from the rare all-zero-extents fallback in
-    // `component_extents_for_pid`, and mis-picking there costs at most
-    // the (small) window-origin offset.
-    let in_window = |lx: f64, ly: f64| {
-        lx >= 0.0 && ly >= 0.0 && lx <= win.width as f64 && ly <= win.height as f64
-    };
-    let screen_rel = (cx - win.x as f64, cy - win.y as f64);
-    let (lx, ly) = if native_wayland && in_window(cx, cy) {
-        (cx, cy)
-    } else if in_window(screen_rel.0, screen_rel.1) {
-        screen_rel
-    } else {
-        return None;
-    };
-
-    // Native Wayland windows (Hyprland addresses) are captured at physical
-    // pixel scale; X11/XWayland captures match logical coordinates.
-    let scale = if native_wayland {
-        crate::hyprland::monitor_scale_for_window(window_id).unwrap_or(1.0)
-    } else {
-        1.0
-    };
-
-    Some((lx * scale, ly * scale))
+    None
 }

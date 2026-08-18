@@ -30,16 +30,17 @@
 //! "permission denied" frame — there is no failed event to detect.
 
 use std::fs::File;
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::fs::FileExt;
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use wayland_client::globals::Global;
 use wayland_client::protocol::{
     wl_buffer::WlBuffer,
-    wl_callback,
-    wl_registry,
+    wl_callback, wl_registry,
     wl_shm::{self, WlShm},
     wl_shm_pool::WlShmPool,
 };
@@ -124,8 +125,17 @@ impl Dispatch<wl_registry::WlRegistry, ()> for CaptureState {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
-            state.globals.push(Global { name, interface, version });
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
+            state.globals.push(Global {
+                name,
+                interface,
+                version,
+            });
         }
     }
 }
@@ -157,13 +167,19 @@ impl Dispatch<HyprlandToplevelExportFrameV1, ()> for CaptureState {
     ) {
         use hyprland_toplevel_export_frame_v1::Event;
         match event {
-            Event::Buffer { format: WEnum::Value(format), width, height, stride } => {
+            Event::Buffer {
+                format: WEnum::Value(format),
+                width,
+                height,
+                stride,
+            } => {
                 state.shm_params = Some((format, width, height, stride));
             }
             Event::BufferDone => state.buffer_done = true,
-            Event::Flags { flags: WEnum::Value(flags) } => {
-                state.y_invert =
-                    flags.contains(hyprland_toplevel_export_frame_v1::Flags::YInvert);
+            Event::Flags {
+                flags: WEnum::Value(flags),
+            } => {
+                state.y_invert = flags.contains(hyprland_toplevel_export_frame_v1::Flags::YInvert);
             }
             Event::Ready { .. } => state.ready = true,
             Event::Failed => state.failed = true,
@@ -194,7 +210,9 @@ fn dispatch_until(
     done: impl Fn(&CaptureState) -> bool,
 ) -> Result<()> {
     loop {
-        queue.dispatch_pending(state).context("wayland dispatch failed")?;
+        queue
+            .dispatch_pending(state)
+            .context("wayland dispatch failed")?;
         if done(state) {
             return Ok(());
         }
@@ -207,7 +225,11 @@ fn dispatch_until(
             continue; // events already queued — dispatch them
         };
         let fd = guard.connection_fd().as_raw_fd();
-        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
         let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
         if n < 0 {
@@ -254,13 +276,50 @@ fn roundtrip_bounded(
 /// bounded here.
 fn connect_bounded(
     deadline: Instant,
-) -> Result<(Connection, EventQueue<CaptureState>, CaptureState, wl_registry::WlRegistry)> {
-    let conn = Connection::connect_to_env().context("WAYLAND_DISPLAY connect failed")?;
+) -> Result<(
+    Connection,
+    EventQueue<CaptureState>,
+    CaptureState,
+    wl_registry::WlRegistry,
+)> {
+    let conn = if let Ok(fd) = std::env::var("WAYLAND_SOCKET") {
+        // An inherited compositor fd has no connect phase to bound.
+        let _ = fd;
+        Connection::connect_to_env()
+    } else {
+        let socket_name = std::env::var_os("WAYLAND_DISPLAY")
+            .ok_or_else(|| anyhow::anyhow!("WAYLAND_DISPLAY is unset"))?;
+        let socket_name = PathBuf::from(socket_name);
+        let path = if socket_name.is_absolute() {
+            socket_name
+        } else {
+            let mut path = PathBuf::from(
+                std::env::var_os("XDG_RUNTIME_DIR")
+                    .ok_or_else(|| anyhow::anyhow!("XDG_RUNTIME_DIR is unset"))?,
+            );
+            path.push(socket_name);
+            path
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+        socket
+            .connect_timeout(&socket2::SockAddr::unix(&path)?, remaining)
+            .context("bounded WAYLAND_DISPLAY connect failed")?;
+        let stream = unsafe { UnixStream::from_raw_fd(socket.into_raw_fd()) };
+        Connection::from_socket(stream)
+    }
+    .context("WAYLAND_DISPLAY connect failed")?;
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
     let registry = conn.display().get_registry(&qh, ());
     let mut state = CaptureState::default();
-    roundtrip_bounded(&conn, &mut queue, &mut state, deadline, "wl_registry global enumeration")?;
+    roundtrip_bounded(
+        &conn,
+        &mut queue,
+        &mut state,
+        deadline,
+        "wl_registry global enumeration",
+    )?;
     Ok((conn, queue, state, registry))
 }
 
@@ -320,7 +379,9 @@ fn validate_shm_params(params: (wl_shm::Format, u32, u32, u32)) -> Result<()> {
         bail!("compositor advertised degenerate shm params {width}x{height} stride {stride}");
     }
     if width > i32::MAX as u32 || height > i32::MAX as u32 || stride > i32::MAX as u32 {
-        bail!("compositor advertised shm params out of i32 range: {width}x{height} stride {stride}");
+        bail!(
+            "compositor advertised shm params out of i32 range: {width}x{height} stride {stride}"
+        );
     }
     // All supported wl_shm formats here are 32-bit (4 bytes per pixel).
     let min_stride = width as u64 * 4;
@@ -350,8 +411,15 @@ impl ShmBuffer {
         let len = stride as u64 * height as u64;
         let file = create_shm_file(len)?;
         let pool = shm.create_pool(file.as_fd(), len as i32, qh, ());
-        let buffer =
-            pool.create_buffer(0, width as i32, height as i32, stride as i32, format, qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            width as i32,
+            height as i32,
+            stride as i32,
+            format,
+            qh,
+            (),
+        );
         Ok(ShmBuffer { file, pool, buffer })
     }
 
@@ -371,15 +439,13 @@ fn pack_rows(raw: &[u8], width: u32, height: u32, stride: u32, y_invert: bool) -
     for y in 0..height as usize {
         let src_y = if y_invert { height as usize - 1 - y } else { y };
         let start = src_y * stride as usize;
-        let row = raw
-            .get(start..start + row_bytes)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "shm buffer ({} bytes) too small for advertised geometry \
+        let row = raw.get(start..start + row_bytes).ok_or_else(|| {
+            anyhow::anyhow!(
+                "shm buffer ({} bytes) too small for advertised geometry \
                      {width}x{height} stride {stride}",
-                    raw.len()
-                )
-            })?;
+                raw.len()
+            )
+        })?;
         out.extend_from_slice(row);
     }
     Ok(out)
@@ -446,9 +512,13 @@ pub fn capture_toplevel_frame(address: u64, overlay_cursor: bool) -> Result<RawF
     let frame = manager.capture_toplevel(overlay_cursor as i32, handle, &qh, ());
 
     // Phase 1: buffer params (buffer → buffer_done).
-    dispatch_until(&mut queue, &mut state, deadline, "toplevel buffer params", |s| {
-        s.buffer_done || s.failed
-    })?;
+    dispatch_until(
+        &mut queue,
+        &mut state,
+        deadline,
+        "toplevel buffer params",
+        |s| s.buffer_done || s.failed,
+    )?;
     if state.failed {
         frame.destroy();
         bail!("toplevel export failed for window 0x{address:x} (handle 0x{handle:08x})");
@@ -472,10 +542,13 @@ pub fn capture_toplevel_frame(address: u64, overlay_cursor: bool) -> Result<RawF
         }
     };
     frame.copy(&shm_buf.buffer, 1);
-    let copy_result =
-        dispatch_until(&mut queue, &mut state, deadline, "toplevel frame copy", |s| {
-            s.ready || s.failed
-        });
+    let copy_result = dispatch_until(
+        &mut queue,
+        &mut state,
+        deadline,
+        "toplevel frame copy",
+        |s| s.ready || s.failed,
+    );
 
     frame.destroy();
     let (format, width, height, stride) = params;
@@ -507,7 +580,6 @@ pub fn capture_toplevel_png(address: u64) -> Result<Vec<u8>> {
     let rgba = frame_to_rgba8(&frame)?;
     cua_driver_core::image_utils::encode_rgba_to_png(&rgba, frame.width, frame.height)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -573,7 +645,10 @@ mod tests {
             format: wl_shm::Format::Xrgb8888,
             data: vec![0x10, 0x20, 0x30, 0x00], // B,G,R,X
         };
-        assert_eq!(frame_to_rgba8(&frame).unwrap(), vec![0x30, 0x20, 0x10, 0xFF]);
+        assert_eq!(
+            frame_to_rgba8(&frame).unwrap(),
+            vec![0x30, 0x20, 0x10, 0xFF]
+        );
 
         let frame = RawFrame {
             width: 1,
@@ -581,6 +656,9 @@ mod tests {
             format: wl_shm::Format::Abgr8888,
             data: vec![0x10, 0x20, 0x30, 0x77], // already R,G,B,A
         };
-        assert_eq!(frame_to_rgba8(&frame).unwrap(), vec![0x10, 0x20, 0x30, 0x77]);
+        assert_eq!(
+            frame_to_rgba8(&frame).unwrap(),
+            vec![0x10, 0x20, 0x30, 0x77]
+        );
     }
 }

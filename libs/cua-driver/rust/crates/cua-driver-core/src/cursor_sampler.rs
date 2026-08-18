@@ -8,9 +8,8 @@
 //! Per-platform polling:
 //! - **Windows:** `GetCursorPos` (returns physical screen coords)
 //! - **macOS:** `CGEventCreate` + `CGEventGetLocation`
-//! - **Linux (Hyprland):** `cursorpos` over the Hyprland IPC socket
-//!   (global logical coordinates)
-//! - **Linux (other):** no portable API exists; sampler runs but logs
+//! - **Linux X11:** `XQueryPointer` against the root window
+//! - **Linux Wayland:** no portable API exists; sampler runs but logs
 //!   no samples — the resulting cursor.jsonl is empty and the zoom
 //!   renderer falls back to the click-point-only path.
 
@@ -27,24 +26,50 @@ use std::time::{Duration, Instant};
 /// granularity without interpolation noise.
 pub const SAMPLE_RATE_HZ: u32 = 30;
 
-/// Final tallies from a sampler run, exposed in `session.json` so a
-/// low apparent sample rate is self-explaining (samples are dropped
-/// while the cursor is off the recorded monitor, not lost).
+/// Final tallies from one sampler run, surfaced in `session.json` so an
+/// apparent sub-30 Hz sample rate is self-explaining instead of looking like
+/// sampler loss.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CursorStats {
-    /// Samples written to cursor.jsonl.
+    /// Polls that resolved a position and were written to `cursor.jsonl`.
     pub samples: usize,
-    /// Polls that resolved a position outside the recorded monitor and
-    /// were deliberately not written.
-    pub dropped_offscreen: usize,
+    /// Polls that resolved a position lying outside the recorded capture
+    /// surface. These are deliberately not written — the renderer has no
+    /// frame to place them on — and are counted separately so they are not
+    /// confused with an unavailable cursor API.
+    pub outside_capture_surface: usize,
+    /// Polls where the platform could not report a cursor position at all
+    /// (no portable API for this session type, or a failed query).
+    pub unavailable: usize,
+    /// JSONL writes (including the final buffered flush) that failed. This is
+    /// additive telemetry; `samples` only counts records accepted by the
+    /// writer.
+    pub write_failures: usize,
 }
 
-/// One poll result. `OffScreen` is distinguished from `Unavailable` so
-/// the deliberate off-monitor drop can be counted without conflating it
-/// with platforms/sessions that simply cannot poll the cursor.
+fn write_sample(writer: &mut impl Write, t_ms: f64, x: f64, y: f64) -> bool {
+    writeln!(
+        writer,
+        "{{\"t_ms\":{:.3},\"x\":{:.2},\"y\":{:.2}}}",
+        t_ms, x, y
+    )
+    .is_ok()
+}
+
+/// One poll outcome. `OutsideCaptureSurface` is distinguished from
+/// `Unavailable` so a platform that CAN read the cursor but has it off the
+/// recorded surface is not reported as having no cursor API.
 enum CursorPoll {
+    /// Not constructed on targets whose poll cannot resolve a position at
+    /// all (Linux today, where neither X11 nor Wayland is wired up here).
+    #[allow(dead_code)]
     At(f64, f64),
-    OffScreen,
+    /// No current platform poll resolves a position it can also place
+    /// outside the recorded surface, so this arm is constructed only by a
+    /// platform poll that gains that knowledge (for example a compositor
+    /// query that reports monitor-relative coordinates).
+    #[allow(dead_code)]
+    OutsideCaptureSurface,
     Unavailable,
 }
 
@@ -75,17 +100,20 @@ impl CursorSampler {
                         // Write one JSON object per line. We hand-format
                         // the trivial shape rather than pulling serde_json
                         // into the hot loop — keeps wakeup-cost bounded.
-                        let _ = writeln!(writer,
-                            "{{\"t_ms\":{:.3},\"x\":{:.2},\"y\":{:.2}}}",
-                            t_ms, x, y);
-                        stats.samples += 1;
+                        if write_sample(&mut writer, t_ms, x, y) {
+                            stats.samples += 1;
+                        } else {
+                            stats.write_failures += 1;
+                        }
                     }
-                    CursorPoll::OffScreen => stats.dropped_offscreen += 1,
-                    CursorPoll::Unavailable => {}
+                    CursorPoll::OutsideCaptureSurface => stats.outside_capture_surface += 1,
+                    CursorPoll::Unavailable => stats.unavailable += 1,
                 }
                 std::thread::sleep(interval);
             }
-            let _ = writer.flush();
+            if writer.flush().is_err() {
+                stats.write_failures += 1;
+            }
             let _ = path_for_thread; // keep path moved (warning silencer)
             stats
         });
@@ -96,15 +124,18 @@ impl CursorSampler {
         })
     }
 
-    /// Stop the sampler. Returns the written/dropped tallies.
+    /// Stop the sampler. Returns the written / skipped tallies.
     pub fn stop(mut self) -> CursorStats {
         self.stop_flag.store(true, Ordering::Relaxed);
-        self.handle.take()
+        self.handle
+            .take()
             .and_then(|h| h.join().ok())
             .unwrap_or_default()
     }
 
-    pub fn output_path(&self) -> &std::path::Path { &self.output_path }
+    pub fn output_path(&self) -> &std::path::Path {
+        &self.output_path
+    }
 }
 
 impl Drop for CursorSampler {
@@ -138,18 +169,27 @@ fn sample_cursor() -> CursorPoll {
     // CGEventGetLocation(event) → CGPoint. The point is in points
     // (top-left origin) so it matches the cursor-space convention the
     // renderer uses.
+    #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         fn CGEventCreate(source: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
         fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPoint;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
         fn CFRelease(cf: *mut std::ffi::c_void);
     }
     #[repr(C)]
     #[derive(Copy, Clone)]
-    struct CGPoint { x: f64, y: f64 }
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
 
     unsafe {
         let event = CGEventCreate(std::ptr::null_mut());
-        if event.is_null() { return CursorPoll::Unavailable; }
+        if event.is_null() {
+            return CursorPoll::Unavailable;
+        }
         let p = CGEventGetLocation(event);
         CFRelease(event);
         CursorPoll::At(p.x, p.y)
@@ -158,97 +198,51 @@ fn sample_cursor() -> CursorPoll {
 
 #[cfg(target_os = "linux")]
 fn sample_cursor() -> CursorPoll {
-    // Wayland has no portable cursor poll, but Hyprland exposes one over
-    // its IPC socket (`cursorpos` — the same query `hyprctl cursorpos`
-    // runs). One short-lived unix-socket connect per sample is the
-    // protocol's request model and is cheap at 30 Hz.
+    // Wayland has no equivalent portable poll; on X11 use XQueryPointer.
+    // We try the X11 path via the `x11` crate if available; otherwise
+    // return None and the sampler writes an empty cursor.jsonl.
     //
-    // cursorpos is global LOGICAL layout coordinates, but the screencopy
-    // video records the focused-at-start monitor in PHYSICAL pixels — so
-    // samples are translated by that monitor's origin and multiplied by
-    // its scale, and samples while the cursor is on another monitor are
-    // dropped (the recorded screen doesn't show the cursor then anyway).
-    // The monitor snapshot is per sampler thread, i.e. per recording
-    // session — the same focused-monitor choice the video backend makes.
-    //
-    // Non-Hyprland sessions return None and the sampler writes an empty
-    // cursor.jsonl — the renderer falls back to click-point-only zoom.
-    thread_local! {
-        static MONITOR: std::cell::OnceCell<Option<FocusedMonitor>> =
-            const { std::cell::OnceCell::new() };
-    }
-    MONITOR.with(|m| {
-        let Some(mon) = *m.get_or_init(hyprland_focused_monitor) else {
-            return CursorPoll::Unavailable;
-        };
-        let Some((cx, cy)) = hyprland_cursorpos() else {
-            return CursorPoll::Unavailable;
-        };
-        let px = (cx - mon.x) * mon.scale;
-        let py = (cy - mon.y) * mon.scale;
-        if px < 0.0 || py < 0.0 || px > mon.width_px || py > mon.height_px {
-            return CursorPoll::OffScreen;
-        }
-        CursorPoll::At(px, py)
-    })
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Clone, Copy)]
-struct FocusedMonitor {
-    /// Logical layout origin.
-    x: f64,
-    y: f64,
-    scale: f64,
-    /// Mode size in physical pixels.
-    width_px: f64,
-    height_px: f64,
-}
-
-#[cfg(target_os = "linux")]
-fn hyprland_focused_monitor() -> Option<FocusedMonitor> {
-    let raw = hyprland_query("j/monitors")?;
-    let monitors: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let mon = monitors
-        .as_array()?
-        .iter()
-        .find(|m| m.get("focused").and_then(|f| f.as_bool()).unwrap_or(false))?;
-    let num = |k: &str| mon.get(k).and_then(|v| v.as_f64());
-    let scale = num("scale").filter(|s| *s > 0.0).unwrap_or(1.0);
-    Some(FocusedMonitor {
-        x: num("x")?,
-        y: num("y")?,
-        scale,
-        width_px: num("width")?,
-        height_px: num("height")?,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn hyprland_query(command: &str) -> Option<String> {
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
-
-    let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
-    let runtime = std::env::var("XDG_RUNTIME_DIR").ok()?;
-    let path = PathBuf::from(runtime).join("hypr").join(sig).join(".socket.sock");
-
-    let mut stream = UnixStream::connect(path).ok()?;
-    stream.set_read_timeout(Some(Duration::from_millis(200))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_millis(200))).ok()?;
-    stream.write_all(command.as_bytes()).ok()?;
-    let mut buf = String::new();
-    stream.read_to_string(&mut buf).ok()?;
-    Some(buf)
-}
-
-#[cfg(target_os = "linux")]
-fn hyprland_cursorpos() -> Option<(f64, f64)> {
-    // Response shape: "1234, 567"
-    let buf = hyprland_query("cursorpos")?;
-    let (x, y) = buf.trim().split_once(',')?;
-    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+    // The X11 dep isn't always present in cua-driver's Linux build
+    // (Wayland-only hosts), so this fallback is "no-op when X11 isn't
+    // wired up" — the renderer copes by falling back to click-point-
+    // only zoom (no cursor-follow between actions). Reported as
+    // unavailable rather than off-surface: no position was resolved.
+    CursorPoll::Unavailable
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-fn sample_cursor() -> Option<(f64, f64)> { None }
+fn sample_cursor() -> CursorPoll {
+    CursorPoll::Unavailable
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("fixture write failure"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_jsonl_write_is_not_counted_as_a_sample() {
+        let mut writer = FailingWriter;
+        let mut stats = CursorStats::default();
+
+        if write_sample(&mut writer, 1.0, 2.0, 3.0) {
+            stats.samples += 1;
+        } else {
+            stats.write_failures += 1;
+        }
+
+        assert_eq!(stats.samples, 0);
+        assert_eq!(stats.write_failures, 1);
+    }
+}

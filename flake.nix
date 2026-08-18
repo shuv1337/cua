@@ -2,7 +2,7 @@
   description = "CUA - Computer Use Agent";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -24,116 +24,133 @@
           pkgs = import nixpkgs { inherit system; };
 
           rustSrc = ./libs/cua-driver/rust;
+          rustTestSrc = pkgs.lib.fileset.toSource {
+            root = ./libs/cua-driver;
+            fileset = pkgs.lib.fileset.unions [
+              ./libs/cua-driver/rust
+              ./libs/cua-driver/wayland-helper
+              ./libs/cua-driver/compat-fixtures
+              ./libs/cua-driver/tests/fixtures/shared/web/index.html
+            ];
+          };
 
           cuaDriverPackage = import ./nix/cua-driver/package.nix {
             inherit pkgs;
             src = rustSrc;
           };
+
+          cuaCompositorPackage = pkgs.callPackage ./nix/cua-driver/compositor { };
+
+          # nixpkgs builds the AT-SPI launcher for NixOS's system profile.
+          # The E2E shell also runs on non-NixOS hosts such as GitHub's Ubuntu
+          # image, so point its private accessibility bus at store binaries.
+          hostAtSpi = pkgs.at-spi2-core.overrideAttrs (old: {
+            mesonFlags = map (
+              flag:
+              if pkgs.lib.hasPrefix "-Ddbus_daemon=" flag then
+                "-Ddbus_daemon=${pkgs.dbus}/bin/dbus-daemon"
+              else if pkgs.lib.hasPrefix "-Ddbus_broker=" flag then
+                "-Ddbus_broker=${pkgs.dbus-broker}/bin/dbus-broker-launch"
+              else
+                flag
+            ) old.mesonFlags;
+          });
+
+          waylandE2eLibraries = with pkgs; [
+            alsa-lib
+            cairo
+            cups
+            dbus
+            expat
+            glib
+            gtk3
+            libayatana-appindicator
+            libdrm
+            libei
+            libgbm
+            librsvg
+            libsoup_3
+            libx11
+            libxcb
+            libxcomposite
+            libxdamage
+            libxext
+            libxfixes
+            libxi
+            libxkbcommon
+            libxrandr
+            libxtst
+            mesa
+            nspr
+            nss
+            openssl
+            pango
+            pipewire
+            webkitgtk_4_1
+          ];
+
+          waylandE2eShell = extraPackages: pkgs.mkShell {
+            # hostAtSpi is referenced by absolute launcher path below, but is
+            # deliberately not a shell package: adding its rebuilt library and
+            # typelib hooks alongside GTK's stock AT-SPI closure loads two ATK
+            # copies and crashes PyGObject during Gtk import.
+            packages = (with pkgs; [
+              cargo
+              clang
+              chromium
+              dbus
+              ffmpeg
+              gobject-introspection
+              grim
+              jq
+              nodejs
+              pkg-config
+              procps
+              rustc
+              rustfmt
+              sway
+              unzip
+              wf-recorder
+              wtype
+              # Keep the GTK3 fixture on the mature Python/PyGObject combination.
+              (python312.withPackages (pythonPackages: [ pythonPackages.pygobject3 ]))
+            ]) ++ extraPackages;
+            buildInputs = waylandE2eLibraries;
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath waylandE2eLibraries;
+            shellHook = ''
+              export NO_AT_BRIDGE=0
+              export CUA_AT_SPI_BUS_LAUNCHER="${hostAtSpi}/libexec/at-spi-bus-launcher"
+              export XDG_DATA_DIRS="${hostAtSpi}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+            '';
+          };
         in
         {
           packages = {
+            cua-compositor = cuaCompositorPackage;
             cua-driver = cuaDriverPackage;
             default = cuaDriverPackage;
           };
 
-          checks =
-            {
-              cua-driver-build = cuaDriverPackage;
-            }
-            // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
-              # NixOS VM integration test (x86_64-linux only)
-              cua-driver-integration = import ./nix/cua-driver/tests/integration.nix {
-                inherit pkgs;
-                inherit (pkgs) lib;
-                cuaDriverModule = {
-                  imports = [ ./nix/cua-driver/module.nix ];
-                  services.cua-driver.package = cuaDriverPackage;
-                };
-              };
+          checks = {
+            cua-compositor-build = cuaCompositorPackage;
+            cua-driver-build = cuaDriverPackage;
+            cua-driver-linux-rust-unit = import ./nix/cua-driver/tests/rust-unit.nix {
+              inherit pkgs;
+              src = rustTestSrc;
+              sourceSubdir = "rust";
+            };
+            cua-driver-policy-yaml = import ./nix/cua-driver/tests/policy-yaml.nix {
+              inherit pkgs;
+              cuaDriver = cuaDriverPackage;
+            };
+            cua-driver-policy-rego = import ./nix/cua-driver/tests/policy-rego.nix {
+              inherit pkgs;
+              cuaDriver = cuaDriverPackage;
+            };
+          };
 
-              # Screenshot test — uses cua-driver's own get_window_state tool
-              # to capture a screenshot via MCP, proving the driver can see the display
-              cua-driver-screenshot = import ./nix/cua-driver/tests/screenshot.nix {
-                inherit pkgs;
-                inherit (pkgs) lib;
-                cuaDriverModule = {
-                  imports = [ ./nix/cua-driver/module.nix ];
-                  services.cua-driver.package = cuaDriverPackage;
-                };
-              };
-
-              cua-driver-linux-cursor-click-gif = import ./nix/cua-driver/tests/linux-cursor-click-gif.nix {
-                inherit pkgs;
-                inherit (pkgs) lib;
-                cuaDriverModule = {
-                  imports = [ ./nix/cua-driver/module.nix ];
-                  services.cua-driver.package = cuaDriverPackage;
-                };
-              };
-
-              cua-driver-linux-background-terminal-gif = import ./nix/cua-driver/tests/linux-background-terminal-gif.nix {
-                inherit pkgs;
-                inherit (pkgs) lib;
-                cuaDriverModule = {
-                  imports = [ ./nix/cua-driver/module.nix ];
-                  services.cua-driver.package = cuaDriverPackage;
-                };
-              };
-            }
-            // pkgs.lib.optionalAttrs (system == "x86_64-linux") (
-              # Background GUI input coverage — one independent matrix job per
-              # app, proving focus-free typing into real toolkit/browser windows.
-              pkgs.lib.listToAttrs (
-                map (
-                  app:
-                  pkgs.lib.nameValuePair "cua-driver-linux-background-gui-${app}" (
-                    import ./nix/cua-driver/tests/linux-background-gui.nix {
-                      inherit pkgs app;
-                      inherit (pkgs) lib;
-                      cuaDriverModule = {
-                        imports = [ ./nix/cua-driver/module.nix ];
-                        services.cua-driver.package = cuaDriverPackage;
-                      };
-                    }
-                  )
-                  # Real-app matrix: 5 apps per toolkit category run as a LENIENT,
-                  # READ-ONLY skeleton (find window + driver page/get_text + GIF;
-                  # focus-free WRITE / typed-text assertions are added later via
-                  # trajectories). chromium keeps the full CDP focus-free-write
-                  # override; tk is the negative-control full entry (Tk `send`).
-                  # "firefox" remains disabled: under the emulated CI VM (no KVM)
-                  # it does not surface its window within the launch timeout.
-                ) [
-                  "chromium"
-                  "tk"
-                  # GTK3
-                  "gtk3-gedit"
-                  "gtk3-mousepad"
-                  # gtk3-geany / gtk3-abiword temporarily disabled: their huge
-                  # AT-SPI trees make the bounds walk + recorder grind in the
-                  # emulated CI VM and the jobs time out. Re-enable once the
-                  # walk is fast enough for 700+-node trees.
-                  # "gtk3-geany"
-                  "gtk3-scite"
-                  # "gtk3-abiword"
-                  # GTK4
-                  "gtk4-characters"
-                  # Qt5
-                  "qt5-manuskript"
-                  "qt5-klog"
-                  "qt5-openambit"
-                  # Qt6
-                  "qt6-kate"
-                  "qt6-kcalc"
-                  "qt6-okular"
-                  "qt6-qownnotes"
-                  # Electron
-                  "electron-zettlr"
-                  "electron-joplin"
-                  "electron-logseq"
-                ]
-              )
-            );
+          devShells.cua-driver-wayland-e2e = waylandE2eShell [ ];
+          devShells.cua-driver-inject-e2e = waylandE2eShell [ cuaCompositorPackage ];
         }
       )
     // {

@@ -20,80 +20,6 @@ use std::time::{Duration, Instant};
 
 use crate::video::{VideoBackend, VideoBackendFactory, VideoMetadata};
 
-/// Bytes of ffmpeg stderr kept for diagnostics (the failure detail is
-/// always at the end of the stream).
-const STDERR_TAIL_BYTES: usize = 4096;
-
-/// Drain ffmpeg's stderr on a thread so the pipe can't fill up and block
-/// the encoder, keeping a rolling tail of the last `STDERR_TAIL_BYTES`.
-/// Chunked reads cap memory at O(tail) for the whole session — a
-/// `read_to_end` would buffer everything ffmpeg prints until EOF.
-/// Public so platform ffmpeg pipelines (e.g. the Linux Wayland
-/// screencopy backend) reuse the same drain.
-pub fn spawn_stderr_drain(
-    mut stderr: std::process::ChildStderr,
-) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || -> Vec<u8> {
-        use std::io::Read;
-        let mut buf = Vec::with_capacity(STDERR_TAIL_BYTES);
-        let mut chunk = [0u8; 4096];
-        loop {
-            match stderr.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    buf.extend_from_slice(&chunk[..n]);
-                    // Trim with slack so we don't memmove on every read.
-                    if buf.len() > STDERR_TAIL_BYTES * 2 {
-                        let excess = buf.len() - STDERR_TAIL_BYTES;
-                        buf.drain(..excess);
-                    }
-                }
-            }
-        }
-        if buf.len() > STDERR_TAIL_BYTES {
-            let excess = buf.len() - STDERR_TAIL_BYTES;
-            buf.drain(..excess);
-        }
-        buf
-    })
-}
-
-/// Fast-fail startup probe — surface stderr immediately when ffmpeg dies
-/// right after spawn (bad input device, missing codec, unwritable
-/// output). Without it the recording session would report a live video
-/// backend and record a useless empty mp4. Consumes `stderr_thread` on
-/// the death path (the tail goes into the error). Public so platform
-/// ffmpeg pipelines share the probe.
-pub fn probe_ffmpeg_startup(
-    child: &mut Child,
-    stderr_thread: &mut Option<std::thread::JoinHandle<Vec<u8>>>,
-) -> anyhow::Result<()> {
-    let probe_deadline = Instant::now() + Duration::from_millis(1500);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let tail = stderr_thread
-                    .take()
-                    .map(|h| h.join().unwrap_or_default())
-                    .unwrap_or_default();
-                let tail_str = String::from_utf8_lossy(&tail);
-                let _ = child.kill();
-                let _ = child.wait();
-                anyhow::bail!(
-                    "ffmpeg exited immediately ({status}). stderr tail:\n{tail_str}"
-                );
-            }
-            Ok(None) => {
-                if Instant::now() >= probe_deadline {
-                    return Ok(());
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => anyhow::bail!("ffmpeg try_wait failed: {e}"),
-        }
-    }
-}
-
 pub struct FfmpegVideoBackendFactory;
 
 impl VideoBackendFactory for FfmpegVideoBackendFactory {
@@ -135,8 +61,7 @@ impl FfmpegVideoBackend {
         }
 
         let mut cmd = Command::new(&ffmpeg);
-        cmd.arg("-y")
-            .arg("-loglevel").arg("error");
+        cmd.arg("-y").arg("-loglevel").arg("error");
 
         platform_input_args(&mut cmd);
 
@@ -144,24 +69,62 @@ impl FfmpegVideoBackend {
         // display stays in frame on odd resolutions (e.g. 1512×949 Win11).
         cmd.arg("-vf").arg("pad=ceil(iw/2)*2:ceil(ih/2)*2");
 
-        cmd.arg("-c:v").arg("libx264")
-            .arg("-preset").arg("ultrafast")
-            .arg("-pix_fmt").arg("yuv420p")
-            .arg("-movflags").arg("+faststart")
-            .arg("-g").arg("30")
+        cmd.arg("-c:v")
+            .arg("libx264")
+            .arg("-preset")
+            .arg("ultrafast")
+            .arg("-pix_fmt")
+            .arg("yuv420p")
+            .arg("-movflags")
+            .arg("+faststart")
+            .arg("-g")
+            .arg("30")
             .arg(&output_path);
 
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
-        let mut child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!("Failed to spawn ffmpeg ({}): {e}", ffmpeg.display())
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to spawn ffmpeg ({}): {e}", ffmpeg.display()))?;
 
-        let mut stderr_thread = child.stderr.take().map(spawn_stderr_drain);
+        let stderr_thread = child.stderr.take().map(|mut stderr| {
+            std::thread::spawn(move || -> Vec<u8> {
+                use std::io::Read;
+                let mut buf = Vec::with_capacity(4096);
+                let _ = stderr.read_to_end(&mut buf);
+                let len = buf.len();
+                if len > 4096 {
+                    buf.drain(..len - 4096);
+                }
+                buf
+            })
+        });
 
-        probe_ffmpeg_startup(&mut child, &mut stderr_thread)?;
+        // Fast-fail probe — surface stderr immediately when ffmpeg dies
+        // on startup (bad input device, missing codec). Without this the
+        // recording session would record a useless empty mp4.
+        let probe_deadline = Instant::now() + Duration::from_millis(1500);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let tail = stderr_thread
+                        .map(|h| h.join().unwrap_or_default())
+                        .unwrap_or_default();
+                    let tail_str = String::from_utf8_lossy(&tail);
+                    let _ = child.kill();
+                    anyhow::bail!("ffmpeg exited immediately ({status}). stderr tail:\n{tail_str}");
+                }
+                Ok(None) => {
+                    if Instant::now() >= probe_deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => anyhow::bail!("ffmpeg try_wait failed: {e}"),
+            }
+        }
 
         Ok(FfmpegVideoBackend {
             child,
@@ -204,19 +167,14 @@ impl VideoBackend for FfmpegVideoBackend {
             }
         }
 
-        let mut error: Option<String> = None;
         if !finalized {
-            let mut detail = String::new();
             if let Some(handle) = self.stderr_thread.take() {
                 if let Ok(buf) = handle.join() {
-                    if !buf.is_empty() {
-                        detail = format!(". Last stderr tail:\n{}", String::from_utf8_lossy(&buf));
-                    }
+                    let tail = String::from_utf8_lossy(&buf);
+                    tracing::warn!(target: "recording",
+                        "ffmpeg did not finalize cleanly. Last stderr tail:\n{tail}");
                 }
             }
-            let msg = format!("ffmpeg did not finalize cleanly{detail}");
-            tracing::warn!(target: "recording", "{msg}");
-            error = Some(msg);
         } else if let Some(handle) = self.stderr_thread.take() {
             let _ = handle.join();
         }
@@ -225,7 +183,6 @@ impl VideoBackend for FfmpegVideoBackend {
             path: self.output_path,
             duration_ms: elapsed.as_millis() as u64,
             finalized,
-            error,
         })
     }
 }
@@ -235,21 +192,34 @@ impl VideoBackend for FfmpegVideoBackend {
 /// distro I've seen.
 pub fn find_ffprobe() -> Option<PathBuf> {
     let ffmpeg = find_ffmpeg()?;
-    if ffmpeg.parent().map(|p| p.as_os_str().is_empty()).unwrap_or(true) {
+    if ffmpeg
+        .parent()
+        .map(|p| p.as_os_str().is_empty())
+        .unwrap_or(true)
+    {
         return Some(PathBuf::from("ffprobe"));
     }
     let mut p = ffmpeg.clone();
-    p.set_file_name(if cfg!(target_os = "windows") { "ffprobe.exe" } else { "ffprobe" });
-    if p.exists() { Some(p) } else { None }
+    p.set_file_name(if cfg!(target_os = "windows") {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    });
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
 }
 
-/// Locate the ffmpeg binary (PATH first, then well-known install dirs).
-/// Public so platform video backends (e.g. the Linux Wayland screencopy
-/// pipeline) can reuse the same resolution logic.
-pub fn find_ffmpeg() -> Option<PathBuf> {
-    if Command::new("ffmpeg").arg("-version")
-        .stdout(Stdio::null()).stderr(Stdio::null())
-        .status().map(|s| s.success()).unwrap_or(false)
+pub(crate) fn find_ffmpeg() -> Option<PathBuf> {
+    if Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
     {
         return Some(PathBuf::from("ffmpeg"));
     }
@@ -257,8 +227,7 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
-            let pkg_root = PathBuf::from(local_appdata)
-                .join("Microsoft/WinGet/Packages");
+            let pkg_root = PathBuf::from(local_appdata).join("Microsoft/WinGet/Packages");
             if let Ok(entries) = std::fs::read_dir(&pkg_root) {
                 for e in entries.flatten() {
                     let name = e.file_name();
@@ -280,7 +249,9 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
             "C:/tools/ffmpeg/bin/ffmpeg.exe",
         ] {
             let pb = PathBuf::from(p);
-            if pb.exists() { return Some(pb); }
+            if pb.exists() {
+                return Some(pb);
+            }
         }
     }
 
@@ -292,7 +263,9 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
             "/snap/bin/ffmpeg",
         ] {
             let pb = PathBuf::from(p);
-            if pb.exists() { return Some(pb); }
+            if pb.exists() {
+                return Some(pb);
+            }
         }
     }
 
@@ -307,7 +280,9 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
             "/usr/bin/ffmpeg",
         ] {
             let pb = PathBuf::from(p);
-            if pb.exists() { return Some(pb); }
+            if pb.exists() {
+                return Some(pb);
+            }
         }
     }
 
@@ -319,18 +294,35 @@ fn platform_input_args(cmd: &mut Command) {
 
     #[cfg(target_os = "windows")]
     {
-        cmd.arg("-f").arg("gdigrab")
-            .arg("-framerate").arg(framerate)
-            .arg("-draw_mouse").arg("1")
-            .arg("-i").arg("desktop");
+        cmd.arg("-f")
+            .arg("gdigrab")
+            .arg("-framerate")
+            .arg(framerate)
+            .arg("-draw_mouse")
+            .arg("1")
+            .arg("-i")
+            .arg("desktop");
     }
 
     #[cfg(target_os = "linux")]
     {
         let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0.0".into());
-        cmd.arg("-f").arg("x11grab")
-            .arg("-framerate").arg(framerate)
-            .arg("-i").arg(display);
+        // x11grab draws the real X pointer by default. When the synthetic agent
+        // cursor is the actor (the usual case for a recorded run), the real
+        // pointer is just noise — set CUA_DRIVER_RS_DRAW_SYSTEM_CURSOR=0 to
+        // suppress it so only the agent cursor appears.
+        let draw_mouse = match std::env::var("CUA_DRIVER_RS_DRAW_SYSTEM_CURSOR").as_deref() {
+            Ok("0") => "0",
+            _ => "1",
+        };
+        cmd.arg("-f")
+            .arg("x11grab")
+            .arg("-framerate")
+            .arg(framerate)
+            .arg("-draw_mouse")
+            .arg(draw_mouse)
+            .arg("-i")
+            .arg(display);
     }
 
     // macOS not wired here — the macOS factory is `SckitVideoBackendFactory`

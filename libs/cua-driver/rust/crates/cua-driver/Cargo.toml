@@ -17,11 +17,13 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 cua-driver-core = { path = "../cua-driver-core" }
+cua-driver-sdk = { path = "../cua-driver-sdk" }
 cursor-overlay = { path = "../cursor-overlay" }
 pip-preview = { path = "../pip-preview" }
 async-trait = "0.1"
 base64 = { workspace = true }
 uuid = { workspace = true }
+zeroize = { workspace = true }
 # Telemetry HTTP client. `ureq` over `reqwest` for the small dep footprint:
 # PostHog ingest is a single fire-and-forget POST with a 3s timeout. Uses
 # rustls (default) so Linux/Windows builds don't require system OpenSSL.
@@ -30,10 +32,7 @@ ureq = { version = "3", features = ["json"] }
 # pre-release tags (`-dev`, `-rc.1`) sort below their corresponding release
 # and we never recommend a pre-release as an "update".
 semver = "1"
-# Bounded `Child::wait_timeout` for the Linux AT-SPI / gdbus probe in
-# `doctor`. We can't rely on `gdbus introspect` returning quickly when the
-# session D-Bus is hung — without a timeout, `doctor` would block forever
-# on a broken accessibility stack. Tiny dep, exactly this use case.
+# Bounds subprocess probes in `doctor` when the desktop session bus is hung.
 wait-timeout = "0.2"
 # Tarball extraction for `cua-driver skills install`. The verb fetches a
 # versioned `cua-driver-rs-v<v>-skills.tar.gz` release asset from GitHub
@@ -55,11 +54,23 @@ platform-macos = { path = "../platform-macos" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 platform-windows = { path = "../platform-windows" }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 platform-linux = { path = "../platform-linux" }
 
-[build-dependencies]
+[features]
+default = []
+# GNOME/KDE portal input ships in ordinary Linux releases; PipeWire capture
+# remains a separate modern-desktop feature. The combined name stays as a
+# compatibility alias for Nix and downstream builds.
+portal-input = ["platform-linux/portal-input"]
+portal-capture = ["platform-linux/portal-capture"]
+portal-libei = ["platform-linux/portal-libei"]
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 # Embed the Windows manifest for DPI awareness (fixes coordinate mismatches
@@ -67,12 +78,18 @@ platform-linux = { path = "../platform-linux" }
 embed-resource = "2"
 
 [dev-dependencies]
+# Shared integration-test harness (MCP/CLI transports, child reaping, paths,
+# response accessors). Dev-only — never linked into the shipped driver.
+cua-driver-testkit = { path = "../cua-driver-testkit" }
+cua-driver-contract = { path = "../cua-driver-contract" }
 tokio = { workspace = true, features = ["full"] }
 image = { workspace = true }
 base64 = { workspace = true }
 # Isolated HOME / cache directories for `version_check` unit tests so they
-# never touch the developer's real `~/.cua-driver-rs/version_check.json`.
+# never touch the developer's real `~/.cua-driver/version_check.json`.
 tempfile = "3"
+futures-util = "0.3"
+tokio-tungstenite = "0.24"
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
 platform-windows = { path = "../platform-windows" }
@@ -88,3 +105,6 @@ windows = { version = "0.61", features = [
     "Win32_Security",
     "Win32_System_Threading",
 ] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+core-foundation = "0.10"

@@ -1,13 +1,13 @@
 //! Trajectory recording session.
 //!
 //! When enabled, every non-read-only, non-recording tool call writes a
-//! `turn-NNNNN/action.json` file to the configured output directory.
-//! When a screenshot callback is registered via `set_screenshot_fn`, it also
-//! writes `screenshot.png` (extracted from `pid`/`window_id` in the args).
+//! `turn-NNNNN/action.json` file to the configured output directory. Targeted
+//! turns also persist explicit before/after state and image evidence. The
+//! legacy `app_state.json` and `screenshot.png` names remain post-action aliases.
 //!
 //! Schema mirrors the Swift/Windows reference `action.json`:
-//!   { tool, arguments, result_summary, timestamp, t_ms_from_session_start,
-//!     t_start_ms_from_session_start }
+//!   { tool, arguments, result_summary, result_error, timestamp,
+//!     t_ms_from_session_start, t_start_ms_from_session_start }
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -26,12 +26,47 @@ use crate::video::{self, VideoBackend, VideoMetadata};
 // and returns raw PNG bytes, or None if capture fails. The callback is called
 // synchronously from write_turn (a blocking context).
 
-type ScreenshotFnBox = Box<dyn Fn(Option<u64>, Option<i64>) -> Option<Vec<u8>> + Send + Sync>;
+pub struct ScreenshotCapture {
+    pub png: Option<Vec<u8>>,
+    pub classification: Option<&'static str>,
+}
+
+impl ScreenshotCapture {
+    pub fn captured(png: Vec<u8>) -> Self {
+        Self {
+            png: Some(png),
+            classification: None,
+        }
+    }
+
+    pub fn unavailable(classification: &'static str) -> Self {
+        Self {
+            png: None,
+            classification: Some(classification),
+        }
+    }
+}
+
+type ScreenshotFnBox = Box<dyn Fn(Option<u64>, Option<i64>) -> ScreenshotCapture + Send + Sync>;
 static SCREENSHOT_FN: OnceLock<ScreenshotFnBox> = OnceLock::new();
 
 /// Register the platform-specific screenshot callback. Call once at startup
 /// before any tool invocations. Subsequent calls are silently ignored.
-pub fn set_screenshot_fn(f: impl Fn(Option<u64>, Option<i64>) -> Option<Vec<u8>> + Send + Sync + 'static) {
+pub fn set_screenshot_fn(
+    f: impl Fn(Option<u64>, Option<i64>) -> Option<Vec<u8>> + Send + Sync + 'static,
+) {
+    set_classified_screenshot_fn(move |window_id, pid| {
+        f(window_id, pid)
+            .map(ScreenshotCapture::captured)
+            .unwrap_or_else(|| ScreenshotCapture::unavailable("capture_failed"))
+    });
+}
+
+/// Register a screenshot callback that preserves a stable unavailable-capture
+/// classification for the turn evidence manifest.
+pub fn set_classified_screenshot_fn(
+    f: impl Fn(Option<u64>, Option<i64>) -> ScreenshotCapture + Send + Sync + 'static,
+) {
     let _ = SCREENSHOT_FN.set(Box::new(f));
 }
 
@@ -40,14 +75,16 @@ pub fn set_screenshot_fn(f: impl Fn(Option<u64>, Option<i64>) -> Option<Vec<u8>>
 /// by the PiP push hook (and by anything else that wants to share the
 /// per-turn screenshot pipeline without duplicating the platform glue).
 pub fn screenshot_for(window_id: Option<u64>, pid: Option<i64>) -> Option<Vec<u8>> {
-    SCREENSHOT_FN.get().and_then(|f| f(window_id, pid))
+    SCREENSHOT_FN
+        .get()
+        .and_then(|capture| capture(window_id, pid).png)
 }
 
 // ── Platform click-marker callback ───────────────────────────────────────────
 //
 // Takes (png_bytes, cx, cy) and returns modified PNG bytes with a red crosshair
 // at (cx, cy), or None if drawing fails. Used to produce click.png alongside
-// screenshot.png when a click-family tool is recorded.
+// before.png when a click-family tool is recorded, producing click.png.
 
 type ClickMarkerFnBox = Box<dyn Fn(&[u8], f64, f64) -> Option<Vec<u8>> + Send + Sync>;
 static CLICK_MARKER_FN: OnceLock<ClickMarkerFnBox> = OnceLock::new();
@@ -59,15 +96,16 @@ pub fn set_click_marker_fn(f: impl Fn(&[u8], f64, f64) -> Option<Vec<u8>> + Send
 
 // ── Platform AX-snapshot callback ────────────────────────────────────────────
 //
-// Takes (window_id, pid) and returns JSON bytes for `app_state.json` (the
-// post-action AX/UIA snapshot), or None if no snapshot is available on this
-// platform.
+// Takes (window_id, pid) and returns JSON bytes for the phase's application
+// state. The post-action bytes are also kept as legacy `app_state.json`.
 
 type AxSnapshotFnBox = Box<dyn Fn(Option<u64>, Option<i64>) -> Option<Vec<u8>> + Send + Sync>;
 static AX_SNAPSHOT_FN: OnceLock<AxSnapshotFnBox> = OnceLock::new();
 
 /// Register the platform-specific AX/UIA snapshot callback. Call once at startup.
-pub fn set_ax_snapshot_fn(f: impl Fn(Option<u64>, Option<i64>) -> Option<Vec<u8>> + Send + Sync + 'static) {
+pub fn set_ax_snapshot_fn(
+    f: impl Fn(Option<u64>, Option<i64>) -> Option<Vec<u8>> + Send + Sync + 'static,
+) {
     let _ = AX_SNAPSHOT_FN.set(Box::new(f));
 }
 
@@ -82,8 +120,34 @@ type ElementBoundsFnBox = Box<dyn Fn(u64, i64, u32) -> Option<(f64, f64)> + Send
 static ELEMENT_BOUNDS_FN: OnceLock<ElementBoundsFnBox> = OnceLock::new();
 
 /// Register the platform-specific element-bounds resolver. Args: (window_id, pid, element_index).
-pub fn set_element_bounds_fn(f: impl Fn(u64, i64, u32) -> Option<(f64, f64)> + Send + Sync + 'static) {
+pub fn set_element_bounds_fn(
+    f: impl Fn(u64, i64, u32) -> Option<(f64, f64)> + Send + Sync + 'static,
+) {
     let _ = ELEMENT_BOUNDS_FN.set(Box::new(f));
+}
+
+#[derive(Default)]
+struct TurnCapture {
+    state: Option<Vec<u8>>,
+    screenshot: Option<Vec<u8>>,
+    screenshot_classification: Option<&'static str>,
+}
+
+/// A reserved recording turn captured immediately before tool dispatch.
+/// `ToolRegistry` passes this token back after dispatch so both phases share
+/// one stable `turn-NNNNN` directory even when calls complete out of order.
+pub struct PendingTurn {
+    generation: u64,
+    turn_dir: PathBuf,
+    tool_name: String,
+    args: Value,
+    start_ms: u64,
+    session_start_ms: u64,
+    window_id: Option<u64>,
+    pid: Option<i64>,
+    click_point: Option<(f64, f64)>,
+    capture_visual_state: bool,
+    before: TurnCapture,
 }
 
 /// Persistent recording session state (singleton per process).
@@ -93,6 +157,7 @@ pub struct RecordingSession {
 
 struct RecordingInner {
     enabled: bool,
+    generation: u64,
     /// Session that owns the live recording, stamped on every successful
     /// `start()` from the daemon-injected `_session_id`. The daemon-global
     /// recorder is a singleton, so when session A starts a recording and
@@ -108,6 +173,7 @@ struct RecordingInner {
     output_dir: Option<PathBuf>,
     next_turn: u32,
     session_start_ms: u64,
+    started_at_monotonic_ms: u64,
     /// Monotonic clock anchor for the cursor sampler so its `t_ms`
     /// matches the action-timeline anchor in `action.json`.
     session_monotonic_start: Option<Instant>,
@@ -125,44 +191,56 @@ struct RecordingInner {
     /// behavior. Stopped on `stop()` along with video.
     cursor: Option<CursorSampler>,
     /// Tallies from the last finalized cursor sampler; exposed in
-    /// `session.json` after stop so the renderer can confirm the
-    /// sampler ran (and so off-monitor drops are self-explaining).
+    /// `session.json` after stop so the renderer can confirm the sampler
+    /// ran and so skipped polls are self-explaining.
     last_cursor_stats: crate::cursor_sampler::CursorStats,
-    /// Bumped by every `start()` at entry (phase 1) and by every effective
-    /// unconditional (`requester == None`) stop. `start()` re-checks it at
-    /// commit (phase 3): a stale value means a newer start or a manual stop
-    /// won the race while this start's backends were spinning up with the
-    /// lock released, so the loser tears down its own backends instead of
-    /// displacing the winner. Requester-scoped stops don't bump — a dying
-    /// session's reaper must not abort a newer session's in-flight start
-    /// (its own resurrection is already blocked by the dead-session
-    /// re-check at commit).
-    start_epoch: u64,
 }
 
-/// Why a recording ended — folded into the finalized `session.json` as
-/// `end_reason` so a split or truncated trajectory is self-explaining (#19).
-/// A `session.json` with NO `end_reason` was never finalized: the daemon
-/// died (shutdown/crash) with the recording live.
+/// Why a recording was finalized, persisted into the finalized `session.json`
+/// as an additive `end_reason` field so a split or truncated trajectory is
+/// self-explaining. A `session.json` with NO `end_reason` was never finalized:
+/// either the recording is still live, or the process died with it running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordingEndReason {
-    /// Explicit `stop_recording` (tool, CLI, or legacy `configure(false)`).
+    /// Unconditional stop: the `stop_recording` tool, the CLI verb, the
+    /// legacy `configure(false)` shim, or runtime shutdown.
     Manual,
-    /// The owning session ended (explicit `end_session` or client
-    /// disconnect) and the session-end hook tore the recording down.
-    SessionEnd,
-    /// An idle reaper stopped it: the recording idle backstop (ownerless
-    /// recordings only), or — defensively, should owner-pinning ever
-    /// regress — the session idle-TTL sweep.
-    IdleTtl,
+    /// The runtime's recording idle backstop reclaimed it after global
+    /// inactivity.
+    IdleBackstop,
+    /// The owning session ended explicitly (`end_session` / CLI verb).
+    SessionExplicit,
+    /// The owning session was reclaimed by the session idle-TTL sweep.
+    SessionIdleTimeout,
+    /// The owning session ended because its client process exited.
+    SessionProcessExit,
+    /// The owning session ended through a path that carries no reason (a
+    /// transport close, or a reason the lifecycle marks as unknown).
+    SessionUnknown,
 }
 
 impl RecordingEndReason {
     pub fn as_str(self) -> &'static str {
         match self {
             RecordingEndReason::Manual => "manual",
-            RecordingEndReason::SessionEnd => "session_end",
-            RecordingEndReason::IdleTtl => "idle_ttl",
+            RecordingEndReason::IdleBackstop => "idle_backstop",
+            RecordingEndReason::SessionExplicit => "session_explicit",
+            RecordingEndReason::SessionIdleTimeout => "session_idle_timeout",
+            RecordingEndReason::SessionProcessExit => "session_process_exit",
+            RecordingEndReason::SessionUnknown => "session_unknown",
+        }
+    }
+
+    /// Map the lifecycle's reason for one ended session episode. `None` is the
+    /// reason-less end path and stays `session_unknown` rather than being
+    /// guessed as an explicit end.
+    pub fn for_session_end(reason: Option<crate::session::SessionEndReason>) -> Self {
+        use crate::session::SessionEndReason;
+        match reason {
+            Some(SessionEndReason::Explicit) => RecordingEndReason::SessionExplicit,
+            Some(SessionEndReason::IdleTimeout) => RecordingEndReason::SessionIdleTimeout,
+            Some(SessionEndReason::ProcessExit) => RecordingEndReason::SessionProcessExit,
+            Some(SessionEndReason::Unknown) | None => RecordingEndReason::SessionUnknown,
         }
     }
 }
@@ -193,17 +271,18 @@ impl RecordingSession {
         Self {
             inner: Mutex::new(RecordingInner {
                 enabled: false,
+                generation: 0,
                 owner: None,
                 output_dir: None,
                 next_turn: 1,
                 session_start_ms: 0,
+                started_at_monotonic_ms: 0,
                 session_monotonic_start: None,
                 last_error: None,
                 video: None,
                 last_video: None,
                 cursor: None,
-                last_cursor_stats: Default::default(),
-                start_epoch: 0,
+                last_cursor_stats: crate::cursor_sampler::CursorStats::default(),
             }),
         }
     }
@@ -215,9 +294,9 @@ impl RecordingSession {
     /// for the lifetime of the session. NOTE: the MCP `start_recording` tool
     /// now defaults `record_video` to *false* (opt-in) — see
     /// `recording_tools.rs` — so video only records when explicitly requested.
-    /// The legacy CLI `recording start` path via `configure()` still forces
-    /// video on. If ffmpeg isn't on PATH the start still succeeds —
-    /// the per-turn capture (action.json + screenshot.png) is independent
+    /// The legacy `configure()` compatibility shim still forces video on. If
+    /// ffmpeg isn't on PATH the start still succeeds —
+    /// the per-turn capture (action.json + pre/post evidence) is independent
     /// of video — but the structured state carries the ffmpeg error so
     /// the caller can surface it.
     ///
@@ -225,65 +304,55 @@ impl RecordingSession {
     /// `_session_id`). `None` marks an anonymous start (CLI one-shot / legacy
     /// `configure()` shim) owned by nobody. See `stop_owner()` for how this
     /// gates teardown.
-    /// Structured as lock → prepare-unlocked → lock-commit: backend startup
-    /// (video::start_video on Wayland blocks on the compositor handshake,
-    /// CursorSampler::start, filesystem writes) must not run under the
-    /// daemon-global recording mutex — `record()` takes it synchronously on
-    /// every recorded tool call, and `stop_owner()`/`current_state()` would
-    /// stall behind a slow or wedged backend start.
-    pub fn start(&self, output_dir: &str, record_video: bool, owner: Option<&str>) -> anyhow::Result<()> {
-        // Phase 1 (locked): resurrection guard + displace any live backends.
-        //
+    pub fn start(
+        &self,
+        output_dir: &str,
+        record_video: bool,
+        owner: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
         // Write-boundary resurrection guard — checked INSIDE the lock so the
-        // is_session_ended test is atomic with the recorder state. An in-flight
-        // start_recording that lands after its owning session ended (passed the
-        // dispatch gate, then the proxy died) must not create a recording owned
-        // by a dead session — a leaked ffmpeg/SCStream. The teardown sites call
-        // `fire_session_end` (which marks ENDED_SESSIONS) BEFORE `stop_owner`,
-        // so either the mark is already set and we bail here, or we win the
-        // lock first and the reaper's later stop_owner(owner) reaps what we
-        // started. The guard is re-checked at commit (phase 3) since the
-        // session can end while backends start. Anonymous starts (owner =
-        // None: CLI one-shot / legacy shim) are never gated.
-        let (old_video, old_cursor, my_epoch) = {
-            let mut inner = self.inner.lock().unwrap();
-            if let Some(o) = owner {
-                if crate::session::is_session_ended(o) {
-                    anyhow::bail!(
-                        "session {o} has ended; refusing to start a recording owned by a dead session"
-                    );
-                }
+        // is_session_ended test is atomic with the enabled/owner write below.
+        // An in-flight start_recording that lands after its owning session ended
+        // (passed the dispatch gate, then the proxy died) must not create a
+        // recording owned by a dead session — a leaked ffmpeg/SCStream. The
+        // teardown sites call `fire_session_end` (which marks ENDED_SESSIONS)
+        // BEFORE `stop_owner`, so either the mark is already set and we bail
+        // here, or we win the lock first and the reaper's later stop_owner(owner)
+        // reaps what we started. Anonymous starts (owner = None: CLI one-shot /
+        // legacy shim) are never gated.
+        if let Some(o) = owner {
+            if crate::session::is_session_ended(o) {
+                anyhow::bail!(
+                    "session {o} has ended; refusing to start a recording owned by a dead session"
+                );
             }
-            inner.start_epoch += 1;
-            (inner.video.take(), inner.cursor.take(), inner.start_epoch)
-        };
-        // Phase 2 (unlocked): tear down the displaced session's backends so
-        // the caller doesn't leak an ffmpeg process, then start the new ones.
-        if let Some(rec) = old_video {
+        }
+        // If a previous session is still open, gracefully tear it down
+        // first so the caller doesn't accidentally leak an ffmpeg process.
+        if let Some(rec) = inner.video.take() {
             let _ = rec.stop();
         }
-        if let Some(cur) = old_cursor {
+        if let Some(cur) = inner.cursor.take() {
             let _ = cur.stop();
         }
 
         let dir = expand_tilde(output_dir);
         std::fs::create_dir_all(&dir)?;
-        // Kept for the cross-process state hint written at commit — `dir`
-        // itself moves into the locked state.
-        let dir_for_hint = dir.clone();
 
         // Single monotonic anchor shared by video, cursor sampler, and
         // per-turn `t_ms_from_session_start` math in `record()` — so all
         // three timelines line up at the millisecond.
         let monotonic_start = Instant::now();
 
-        let mut video: Option<Box<dyn VideoBackend>> = None;
+        let mut video_present = false;
         let mut video_error: Option<String> = None;
         if record_video {
             let path = dir.join("recording.mp4");
             match video::start_video(&path) {
                 Ok(rec) => {
-                    video = Some(rec);
+                    inner.video = Some(rec);
+                    video_present = true;
                 }
                 Err(e) => {
                     video_error = Some(e.to_string());
@@ -301,91 +370,50 @@ impl RecordingSession {
         // post-hoc analysis, so we run it anyway — the cost is one
         // background thread + a small jsonl file.
         let cursor_path = dir.join("cursor.jsonl");
-        let cursor = match CursorSampler::start(cursor_path, monotonic_start) {
-            Ok(s) => Some(s),
+        match CursorSampler::start(cursor_path, monotonic_start) {
+            Ok(s) => {
+                inner.cursor = Some(s);
+            }
             Err(e) => {
                 tracing::warn!(target: "recording",
                     "Cursor sampler failed to start: {e}");
-                None
             }
-        };
+        }
 
         // Write initial session.json — final video metadata is rewritten on
         // stop. We mark `present` based on whether ffmpeg actually started,
         // not just whether the caller asked for video.
+        let started_at_monotonic_ms = now_ms();
         let session_payload = serde_json::json!({
             "schema_version": 1,
-            "started_at_monotonic_ms": now_ms(),
-            "video": video_session_payload(video.is_some(), video_error.as_deref(), None),
-            "cursor": { "present": cursor.is_some(), "sample_count": 0 }
-        });
-        let _ = write_json_atomic(
-            &dir.join("session.json"),
-            &session_payload,
-        );
-
-        // Phase 3 (locked): commit. Two re-checks, both racing the unlocked
-        // backend startup above:
-        //   - resurrection guard: the owning session may have ended; the
-        //     reaper's stop_owner ran against the pre-start state and would
-        //     never see what we just started, so we tear it down ourselves.
-        //   - epoch guard: a newer start() (it entered phase 1 last, it must
-        //     win) or a manual stop_recording (it must not be silently
-        //     overridden) may have superseded this start.
-        // Either way the loser stops its own backends after dropping the
-        // lock and finalizes its orphaned session.json so the output dir
-        // doesn't claim an in-flight recording forever.
-        let displaced = {
-            let mut inner = self.inner.lock().unwrap();
-            let dead = owner.is_some_and(crate::session::is_session_ended);
-            if dead || inner.start_epoch != my_epoch {
-                // When the winning start already committed the SAME output
-                // dir, its in-flight session.json must survive — finalizing
-                // it here would mark the live recording absent until stop.
-                let dir_owned_by_winner =
-                    inner.enabled && inner.output_dir.as_deref() == Some(dir.as_path());
-                drop(inner);
-                abort_uncommitted_start(&dir, video, cursor, !dir_owned_by_winner);
-                if dead {
-                    let o = owner.unwrap_or_default();
-                    anyhow::bail!(
-                        "session {o} has ended; refusing to start a recording owned by a dead session"
-                    );
-                }
-                anyhow::bail!(
-                    "a concurrent start_recording or stop_recording superseded this start"
-                );
+            "started_at_monotonic_ms": started_at_monotonic_ms,
+            "video": video_session_payload(video_present, video_error.as_deref(), None),
+            "cursor": {
+                "present": inner.cursor.is_some(),
+                "sample_count": 0,
+                "outside_capture_surface_count": 0,
+                "unavailable_count": 0,
+                "write_failure_count": 0
             }
-            // Belt-and-suspenders: the epoch guard means no concurrent
-            // start() can have committed into our window (it would have seen
-            // a stale epoch and aborted), but displace-and-stop anything
-            // here anyway — after releasing the lock, since stop can block
-            // for seconds (same reason phase 2 is unlocked).
-            let displaced = (inner.video.take(), inner.cursor.take());
-            inner.video = video;
-            inner.cursor = cursor;
-            // Stamp the owning session on every successful start. `owner`
-            // clobbers any previous owner, which is correct: the daemon-global
-            // recorder is a singleton, so the latest start() owns it. The
-            // previous owner's disconnect then no-ops in stop_owner().
-            inner.owner = owner.map(str::to_owned);
-            inner.enabled = true;
-            inner.output_dir = Some(dir);
-            inner.next_turn = 1;
-            inner.session_start_ms = now_ms();
-            inner.session_monotonic_start = Some(monotonic_start);
-            inner.last_error = video_error;
-            inner.last_video = None;
-            inner.last_cursor_stats = Default::default();
-            displaced
-        };
-        if let Some(rec) = displaced.0 {
-            let _ = rec.stop();
-        }
-        if let Some(cur) = displaced.1 {
-            let _ = cur.stop();
-        }
-        write_state_hint(&dir_for_hint);
+        });
+        let _ = write_json_atomic(&dir.join("session.json"), &session_payload);
+
+        // Stamp the owning session on every successful start (reached only on
+        // the success path — start() returns early via `?` on `create_dir_all`
+        // failure above). `owner` clobbers any previous owner, which is correct:
+        // the daemon-global recorder is a singleton, so the latest start() owns
+        // it. The previous owner's disconnect then no-ops in stop_owner().
+        inner.owner = owner.map(str::to_owned);
+        inner.generation = inner.generation.wrapping_add(1);
+        inner.enabled = true;
+        inner.output_dir = Some(dir);
+        inner.next_turn = 1;
+        inner.session_start_ms = now_ms();
+        inner.started_at_monotonic_ms = started_at_monotonic_ms;
+        inner.session_monotonic_start = Some(monotonic_start);
+        inner.last_error = video_error;
+        inner.last_video = None;
+        inner.last_cursor_stats = crate::cursor_sampler::CursorStats::default();
         Ok(())
     }
 
@@ -404,23 +432,29 @@ impl RecordingSession {
     ///     whose recording was already clobbered by a newer `start()`, or which
     ///     never started a recording) — silent no-op, leaving the current
     ///     owner's recording running.
+    ///
     /// The guard lives inside the lock so it is race-free against a concurrent
     /// `start()`. Supersedes the #1775 generation-token `stop()`.
     ///
-    /// The end reason defaults by requester — `None` is the manual-stop
-    /// family, `Some(sid)` is session-driven teardown. Callers whose stop is
-    /// an idle reclaim (the recording idle backstop, the session TTL sweep's
-    /// hook) pass the reason explicitly via [`Self::stop_owner_with_reason`].
+    /// The finalized `session.json` records WHY the recording ended. An
+    /// unconditional stop is the manual family; a session-scoped stop reads
+    /// back that session episode's lifecycle end reason (the cleanup-hook
+    /// signature carries no reason, and the lifecycle publishes it before
+    /// hooks run). A caller whose stop is neither — the runtime's recording
+    /// idle backstop — names its own reason with
+    /// [`Self::stop_owner_with_reason`].
     pub fn stop_owner(&self, requester: Option<&str>) -> anyhow::Result<()> {
         let reason = match requester {
             None => RecordingEndReason::Manual,
-            Some(_) => RecordingEndReason::SessionEnd,
+            Some(session) => {
+                RecordingEndReason::for_session_end(crate::session::session_end_reason(session))
+            }
         };
         self.stop_owner_with_reason(requester, reason)
     }
 
-    /// [`Self::stop_owner`] with an explicit end reason for the finalized
-    /// `session.json` (#19): `manual | session_end | idle_ttl`.
+    /// [`Self::stop_owner`] with an explicitly named end reason for the
+    /// finalized `session.json`.
     pub fn stop_owner_with_reason(
         &self,
         requester: Option<&str>,
@@ -438,33 +472,34 @@ impl RecordingSession {
             if inner.owner.as_deref() != Some(req) {
                 return Ok(());
             }
-        } else {
-            // Unconditional stop: bump the epoch so an in-flight start()
-            // (backends starting with the lock released) observes the stop
-            // at commit and aborts instead of silently overriding it.
-            inner.start_epoch += 1;
         }
         inner.owner = None;
         let dir = inner.output_dir.clone();
-        let video_meta = inner.video.take().and_then(|rec| rec.stop().ok());
+        let (video_meta, stop_error) = match inner.video.take().map(|rec| rec.stop()) {
+            Some(Ok(meta)) => match validate_video_metadata(meta) {
+                Ok(meta) => (Some(meta), None),
+                Err(error) => (None, Some(error.to_string())),
+            },
+            Some(Err(error)) => (None, Some(error.to_string())),
+            None => (None, None),
+        };
         let cursor_stats = inner.cursor.take().map(|c| c.stop()).unwrap_or_default();
+        let started_at_monotonic_ms = inner.started_at_monotonic_ms;
 
         inner.enabled = false;
         inner.output_dir = None;
         inner.next_turn = 1;
         inner.session_start_ms = 0;
+        inner.started_at_monotonic_ms = 0;
         inner.session_monotonic_start = None;
-        // The backend's stop() is the authority on capture health: clear any
-        // stale start-time error on a healthy stop, but carry a capture-side
-        // failure (persistent screencopy errors, frozen frames, unclean
-        // encoder exit) into last_error so a broken recording never reports
-        // a clean structured state. When no video ran, keep whatever error
-        // start() recorded.
-        if let Some(meta) = &video_meta {
-            inner.last_error = meta.error.clone();
+        if let Some(error) = &stop_error {
+            inner.last_error = Some(error.clone());
+        } else if video_meta.is_some() {
+            inner.last_error = None;
         }
         inner.last_video = video_meta.clone();
         inner.last_cursor_stats = cursor_stats;
+        let final_video_error = inner.last_error.clone();
 
         // Rewrite session.json with final video metadata + cursor count
         // so the renderer (and any external analysis) sees what actually
@@ -473,30 +508,29 @@ impl RecordingSession {
             let video_block = if let Some(ref m) = video_meta {
                 video_session_payload(true, None, Some(m))
             } else {
-                video_session_payload(false, None, None)
+                video_session_payload(false, final_video_error.as_deref(), None)
             };
             let session_payload = serde_json::json!({
                 "schema_version": 1,
-                "started_at_monotonic_ms": now_ms(),
+                "started_at_monotonic_ms": started_at_monotonic_ms,
+                // Additive: absent while the recording is live (and if the
+                // process dies with it running), present once finalized.
                 "end_reason": reason.as_str(),
                 "video": video_block,
                 "cursor": cursor_session_payload(cursor_stats)
             });
-            let _ = write_json_atomic(
-                &dir.join("session.json"),
-                &session_payload,
-            );
+            let _ = write_json_atomic(&dir.join("session.json"), &session_payload);
         }
-        clear_state_hint();
+        if let Some(error) = stop_error {
+            anyhow::bail!("video finalization failed: {error}");
+        }
         Ok(())
     }
 
     /// Legacy toggle API kept as a thin shim over `start()`/`stop()` so
-    /// existing callers (tests) keep compiling during the rename window.
-    /// Forces `record_video` on for this legacy path. NOTE: the CLI
-    /// `recording start` subcommand does NOT go through here — it wraps the
-    /// `start_recording` tool (cli.rs::run_recording_cmd), where video
-    /// defaults OFF and is enabled with the `--video` flag.
+    /// existing callers and tests keep compiling during the rename window.
+    /// This shim preserves its historical `record_video=true` behavior. The
+    /// CLI subcommand does not use it; CLI and MCP video capture are opt-in.
     pub fn configure(&self, enabled: bool, output_dir: Option<&str>) -> anyhow::Result<()> {
         if !enabled {
             return self.stop_owner(None);
@@ -512,37 +546,60 @@ impl RecordingSession {
         let inner = self.inner.lock().unwrap();
         RecordingState {
             enabled: inner.enabled,
-            output_dir: inner.output_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            output_dir: inner
+                .output_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
             next_turn: inner.next_turn,
             last_error: inner.last_error.clone(),
             video_active: inner.video.is_some(),
-            last_video_path: inner.last_video.as_ref()
+            last_video_path: inner
+                .last_video
+                .as_ref()
                 .map(|m| m.path.to_string_lossy().into_owned()),
             owner: inner.owner.clone(),
         }
     }
 
-    /// Record a completed tool call. No-op when recording is disabled.
-    /// `start_ms` — wall-clock ms at invocation start (use `now_ms()` before calling the tool).
-    pub fn record(
+    /// Reserve a turn and capture its target immediately before tool dispatch.
+    /// No-op when recording is disabled.
+    pub fn begin_turn(&self, tool_name: &str, args: &Value, start_ms: u64) -> Option<PendingTurn> {
+        self.begin_turn_with_capture(tool_name, args, start_ms, true)
+    }
+
+    /// Reserve a turn while deliberately suppressing visual and accessibility
+    /// capture. Used for consent-bearing operations where the target may be an
+    /// authenticated browser profile: action metadata and the structured result
+    /// remain auditable without persisting page or dialog contents.
+    pub fn begin_private_turn(
         &self,
         tool_name: &str,
         args: &Value,
-        result_text: &str,
         start_ms: u64,
-    ) {
-        let (turn_dir, session_start_ms) = {
+    ) -> Option<PendingTurn> {
+        self.begin_turn_with_capture(tool_name, args, start_ms, false)
+    }
+
+    fn begin_turn_with_capture(
+        &self,
+        tool_name: &str,
+        args: &Value,
+        start_ms: u64,
+        capture_visual_state: bool,
+    ) -> Option<PendingTurn> {
+        let (turn_dir, session_start_ms, generation) = {
             let mut inner = self.inner.lock().unwrap();
             if !inner.enabled {
-                return;
+                return None;
             }
-            let out = match inner.output_dir.clone() {
-                Some(o) => o,
-                None => return,
-            };
+            let out = inner.output_dir.clone()?;
             let idx = inner.next_turn;
             inner.next_turn += 1;
-            (out.join(format!("turn-{idx:05}")), inner.session_start_ms)
+            (
+                out.join(format!("turn-{idx:05}")),
+                inner.session_start_ms,
+                inner.generation,
+            )
         };
 
         // Strip the daemon-injected `_session_id` (and any other reserved
@@ -550,27 +607,223 @@ impl RecordingSession {
         // in action.json's `arguments`. The injection point is the daemon
         // `call` branch (serve.rs); recording is the single chokepoint where
         // those internal keys must not leak into the persisted trajectory.
-        let args = strip_internal_keys(args);
+        let args = strip_internal_keys(args).into_owned();
+        use crate::tool_args::ArgsExt;
+        let mut window_id = args.opt_u64("window_id");
+        let pid = args.opt_i64("pid");
+        let mut element_index = args.opt_u64("element_index");
+        if let (Some(pid), Some(token)) = (
+            pid.and_then(|pid| i32::try_from(pid).ok()),
+            args.get("element_token").and_then(Value::as_str),
+        ) {
+            if let Ok((resolved_window, resolved_index)) =
+                crate::element_token::global().resolve(pid, token)
+            {
+                window_id = Some(u64::from(resolved_window));
+                element_index = u64::try_from(resolved_index).ok();
+            }
+        }
+        let click_point = resolve_click_point(tool_name, &args, window_id, pid, element_index);
+        let before = if capture_visual_state {
+            capture_turn(window_id, pid)
+        } else {
+            TurnCapture {
+                state: None,
+                screenshot: None,
+                screenshot_classification: Some("privacy_suppressed"),
+            }
+        };
 
-        if let Err(e) = write_turn(
-            &turn_dir,
-            tool_name,
-            args.as_ref(),
-            result_text,
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.enabled || inner.generation != generation {
+            return None;
+        }
+        if let Err(error) = write_phase_artifacts(&turn_dir, "before", &before) {
+            inner.last_error = Some(error.to_string());
+        }
+        drop(inner);
+
+        Some(PendingTurn {
+            generation,
+            turn_dir,
+            tool_name: tool_name.to_owned(),
+            args,
             start_ms,
             session_start_ms,
-        ) {
-            let mut inner = self.inner.lock().unwrap();
-            inner.last_error = Some(e.to_string());
+            window_id,
+            pid,
+            click_point,
+            capture_visual_state,
+            before,
+        })
+    }
+
+    /// Finalize a previously reserved turn after tool dispatch.
+    pub fn finish_turn(&self, pending: PendingTurn, result_text: &str) {
+        self.finish_turn_with_action(pending, result_text, None);
+    }
+
+    /// Finalize a turn while retaining the daemon's rich, non-wire action
+    /// truth in the recording artifact. Existing trajectory readers can ignore
+    /// the additive `action_truth` key.
+    pub fn finish_turn_with_action(
+        &self,
+        pending: PendingTurn,
+        result_text: &str,
+        action_record: Option<&crate::action_record::ActionExecutionRecord>,
+    ) {
+        self.finish_turn_with_outcome(pending, result_text, action_record, false);
+    }
+
+    /// Finalize a turn while also recording whether dispatch returned an
+    /// error. A click-family call rejected before its target can be resolved
+    /// has no click point to annotate; retaining this bit lets the evidence
+    /// manifest distinguish that honest non-action from a missing marker on a
+    /// dispatched click.
+    pub fn finish_turn_with_outcome(
+        &self,
+        pending: PendingTurn,
+        result_text: &str,
+        action_record: Option<&crate::action_record::ActionExecutionRecord>,
+        result_is_error: bool,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.enabled || inner.generation != pending.generation {
+            tracing::warn!(
+                target: "recording",
+                "discarding a turn from an inactive recording generation"
+            );
+            return;
         }
+        if let Err(error) = write_turn(pending, result_text, action_record, result_is_error) {
+            inner.last_error = Some(error.to_string());
+        }
+    }
+
+    /// Compatibility helper for callers that only report completed calls.
+    /// New dispatch paths should use `begin_turn` and `finish_turn` so the
+    /// before phase is captured before the action changes application state.
+    pub fn record(&self, tool_name: &str, args: &Value, result_text: &str, start_ms: u64) {
+        let Some(pending) = self.begin_turn(tool_name, args, start_ms) else {
+            return;
+        };
+        self.finish_turn(pending, result_text);
     }
 }
 
 impl Default for RecordingSession {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+fn capture_turn(window_id: Option<u64>, pid: Option<i64>) -> TurnCapture {
+    let screenshot = SCREENSHOT_FN
+        .get()
+        .map(|capture| capture(window_id, pid))
+        .unwrap_or_else(|| ScreenshotCapture::unavailable("capture_hook_unavailable"));
+    TurnCapture {
+        state: AX_SNAPSHOT_FN
+            .get()
+            .and_then(|capture| capture(window_id, pid)),
+        screenshot: screenshot.png,
+        screenshot_classification: screenshot.classification,
+    }
+}
+
+fn resolve_click_point(
+    tool_name: &str,
+    args: &Value,
+    window_id: Option<u64>,
+    pid: Option<i64>,
+    element_index: Option<u64>,
+) -> Option<(f64, f64)> {
+    use crate::tool_args::ArgsExt;
+    if !matches!(tool_name, "click" | "double_click" | "right_click") {
+        return None;
+    }
+    match (args.opt_f64("x"), args.opt_f64("y")) {
+        (Some(x), Some(y)) => Some((x, y)),
+        _ => match (window_id, pid, element_index, ELEMENT_BOUNDS_FN.get()) {
+            (Some(wid), Some(pid), Some(index), Some(resolve)) => u32::try_from(index)
+                .ok()
+                .and_then(|index| resolve(wid, pid, index)),
+            _ => None,
+        },
+    }
+}
+
+fn write_phase_artifacts(
+    turn_dir: &Path,
+    phase: &str,
+    capture: &TurnCapture,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(turn_dir)?;
+    if let Some(state) = &capture.state {
+        std::fs::write(turn_dir.join(format!("{phase}_state.json")), state)?;
+    }
+    if let Some(screenshot) = &capture.screenshot {
+        std::fs::write(turn_dir.join(format!("{phase}.png")), screenshot)?;
+    }
+    Ok(())
+}
+
+fn capture_status(captured: bool, expected: bool, classification: Option<&'static str>) -> Value {
+    if captured {
+        serde_json::json!({ "status": "captured" })
+    } else if expected {
+        serde_json::json!({
+            "status": "unavailable",
+            "classification": classification.unwrap_or("capture_failed")
+        })
+    } else {
+        serde_json::json!({
+            "status": "not_applicable",
+            "classification": "no_target_pid"
+        })
+    }
+}
+
+fn write_evidence_manifest(
+    turn_dir: &Path,
+    before: &TurnCapture,
+    after: &TurnCapture,
+    state_expected: bool,
+    click_expected: bool,
+    click_captured: bool,
+    click_not_applicable_classification: &'static str,
+) -> anyhow::Result<()> {
+    let manifest = serde_json::json!({
+        "schema": "cua-turn-evidence/v1",
+        "before": {
+            "state": capture_status(before.state.is_some(), state_expected, None),
+            "screenshot": capture_status(
+                before.screenshot.is_some(),
+                true,
+                before.screenshot_classification,
+            ),
+        },
+        "after": {
+            "state": capture_status(after.state.is_some(), state_expected, None),
+            "screenshot": capture_status(
+                after.screenshot.is_some(),
+                true,
+                after.screenshot_classification,
+            ),
+        },
+        "click": if click_expected {
+            capture_status(click_captured, true, None)
+        } else {
+            serde_json::json!({
+                "status": "not_applicable",
+                "classification": click_not_applicable_classification,
+            })
+        },
+    });
+    write_json_atomic(&turn_dir.join("evidence.json"), &manifest)
+}
 
 /// Drop reserved internal keys (any `_`-prefixed key, e.g. the daemon-injected
 /// `_session_id`) from a tool-call args object so they never persist into a
@@ -591,46 +844,52 @@ fn strip_internal_keys(args: &Value) -> std::borrow::Cow<'_, Value> {
 }
 
 fn write_turn(
-    turn_dir: &Path,
-    tool_name: &str,
-    args: &Value,
+    pending: PendingTurn,
     result_text: &str,
-    start_ms: u64,
-    session_start_ms: u64,
+    action_record: Option<&crate::action_record::ActionExecutionRecord>,
+    result_is_error: bool,
 ) -> anyhow::Result<()> {
-    std::fs::create_dir_all(turn_dir)?;
+    let PendingTurn {
+        generation: _,
+        turn_dir,
+        tool_name,
+        args,
+        start_ms,
+        session_start_ms,
+        window_id,
+        pid,
+        click_point,
+        capture_visual_state,
+        before,
+    } = pending;
+    std::fs::create_dir_all(&turn_dir)?;
     let now = now_ms();
-
-    use crate::tool_args::ArgsExt;
-    // Extract window_id and pid from args for screenshot capture.
-    let window_id = args.opt_u64("window_id");
-    let pid       = args.opt_i64("pid");
-    let element_index = args.opt_u64("element_index");
-
-    // Extract click point for click-family tools. Falls back to the
-    // platform element_index → window-local-pixels resolver when the call
-    // used `element_index` instead of explicit `x, y`, so click.png is
-    // written for AX-indexed clicks too.
-    let click_point: Option<(f64, f64)> = if matches!(
-        tool_name, "click" | "double_click" | "right_click"
-    ) {
-        match (args.opt_f64("x"), args.opt_f64("y")) {
-            (Some(x), Some(y)) => Some((x, y)),
-            _ => match (window_id, pid, element_index, ELEMENT_BOUNDS_FN.get()) {
-                (Some(wid), Some(p), Some(idx), Some(f)) => {
-                    u32::try_from(idx).ok().and_then(|idx32| f(wid, p, idx32))
-                }
-                _ => None,
-            },
-        }
+    let after = if capture_visual_state {
+        capture_turn(window_id, pid)
     } else {
-        None
+        TurnCapture {
+            state: None,
+            screenshot: None,
+            screenshot_classification: Some("privacy_suppressed"),
+        }
     };
+    let click_family = matches!(tool_name.as_str(), "click" | "double_click" | "right_click");
+    let action_refused = action_record
+        .is_some_and(|record| record.effect == crate::action_record::ActionEffect::Refused);
+    let refused_before_target_resolution = click_family && result_is_error && click_point.is_none();
+    // A target may resolve successfully and still be refused before input
+    // dispatch (for example, a minimized Windows element). Retaining the
+    // resolved point in action.json is useful diagnostic context, but a
+    // crosshair would falsely imply that a click was delivered.
+    let refused_before_dispatch = click_family && result_is_error && action_refused;
+    let click_expected =
+        click_family && !refused_before_target_resolution && !refused_before_dispatch;
 
     let mut payload = serde_json::json!({
         "tool": tool_name,
         "arguments": args,
         "result_summary": result_text,
+        "result_error": result_is_error,
         "timestamp": iso_now(),
         "t_ms_from_session_start": now.saturating_sub(session_start_ms),
         "t_start_ms_from_session_start": start_ms.saturating_sub(session_start_ms),
@@ -638,30 +897,51 @@ fn write_turn(
     if let Some((cx, cy)) = click_point {
         payload["click_point"] = serde_json::json!({"x": cx, "y": cy});
     }
+    if let Some(action_record) = action_record {
+        payload["action_truth"] = action_record.debug_json();
+    }
     write_json_atomic(&turn_dir.join("action.json"), &payload)?;
+    write_phase_artifacts(&turn_dir, "after", &after)?;
 
-    // Post-action AX/UIA snapshot — omitted on platforms that don't expose
-    // a cheap snapshot helper (today: Linux ATSPI).
-    if let Some(ax_fn) = AX_SNAPSHOT_FN.get() {
-        if let Some(json_bytes) = ax_fn(window_id, pid) {
-            let _ = std::fs::write(turn_dir.join("app_state.json"), &json_bytes);
-        }
+    // Preserve the original post-action names for existing trajectory readers.
+    if let Some(state) = &after.state {
+        std::fs::write(turn_dir.join("app_state.json"), state)?;
+    }
+    if let Some(screenshot) = &after.screenshot {
+        std::fs::write(turn_dir.join("screenshot.png"), screenshot)?;
     }
 
-    // Capture screenshot if a callback is registered.
-    if let Some(screenshot_fn) = SCREENSHOT_FN.get() {
-        if let Some(png_bytes) = screenshot_fn(window_id, pid) {
-            let _ = std::fs::write(turn_dir.join("screenshot.png"), &png_bytes);
-            // Write click.png (screenshot + red crosshair) for click-family tools.
-            if let Some((cx, cy)) = click_point {
-                if let Some(marker_fn) = CLICK_MARKER_FN.get() {
-                    if let Some(click_png) = marker_fn(&png_bytes, cx, cy) {
-                        let _ = std::fs::write(turn_dir.join("click.png"), &click_png);
-                    }
-                }
+    // A click marker describes where the action was aimed, so ground it on
+    // the pre-action image. This also keeps modal-dismiss evidence available
+    // after the modal HWND has closed.
+    let mut click_captured = false;
+    if click_expected {
+        if let (Some((cx, cy)), Some(screenshot), Some(marker)) = (
+            click_point,
+            before.screenshot.as_deref(),
+            CLICK_MARKER_FN.get(),
+        ) {
+            if let Some(click_png) = marker(screenshot, cx, cy) {
+                std::fs::write(turn_dir.join("click.png"), click_png)?;
+                click_captured = true;
             }
         }
     }
+    write_evidence_manifest(
+        &turn_dir,
+        &before,
+        &after,
+        pid.is_some() && capture_visual_state,
+        click_expected,
+        click_captured,
+        if refused_before_target_resolution {
+            "action_refused_before_target_resolution"
+        } else if refused_before_dispatch {
+            "action_refused_before_dispatch"
+        } else {
+            "not_a_click_action"
+        },
+    )?;
 
     Ok(())
 }
@@ -671,62 +951,6 @@ fn write_json_atomic(path: &Path, value: &Value) -> anyhow::Result<()> {
     std::fs::write(&tmp, serde_json::to_string_pretty(value)?)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
-}
-
-// ── Cross-process recording-state hint ────────────────────────────────────────
-//
-// Recording state lives in the recording process's memory only, which leaves
-// other processes (notably the CLI deciding whether an in-process fallback
-// would silently bypass an active trajectory recording) unable to ask "is a
-// recording live?" when the daemon socket itself is the thing that's failing.
-// The hint file is a tiny JSON breadcrumb — written on every successful
-// `start()`, removed on `stop_owner()` — that callers validate by matching
-// `pid` against the daemon's pid file, so a hint left behind by a crashed
-// process is ignored rather than trusted.
-
-/// Location of the recording-state hint file (`~/.cua-driver/recording.state`).
-pub fn state_hint_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(".cua-driver").join("recording.state"))
-}
-
-fn write_state_hint(output_dir: &Path) {
-    let Some(path) = state_hint_path() else { return };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let payload = serde_json::json!({
-        "pid": std::process::id(),
-        "output_dir": output_dir.to_string_lossy(),
-        "started_at_ms": now_ms(),
-    });
-    let _ = write_json_atomic(&path, &payload);
-}
-
-fn clear_state_hint() {
-    let Some(path) = state_hint_path() else { return };
-    // Only remove our own breadcrumb — a newer daemon may have started a
-    // recording (and rewritten the hint) since this process wrote it.
-    let ours = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v.get("pid").and_then(|p| p.as_u64()))
-        == Some(std::process::id() as u64);
-    if ours {
-        let _ = std::fs::remove_file(&path);
-    }
-}
-
-/// Read the recording-state hint, returning `(recorder_pid, output_dir)` when
-/// present and parseable. The hint is advisory: callers MUST validate that
-/// `recorder_pid` is the process they're about to bypass (e.g. compare with
-/// the daemon pid file) before treating a recording as active.
-pub fn read_state_hint() -> Option<(u32, String)> {
-    let path = state_hint_path()?;
-    let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
-    let pid = v.get("pid")?.as_u64()? as u32;
-    let dir = v.get("output_dir")?.as_str()?.to_owned();
-    Some((pid, dir))
 }
 
 /// Current wall-clock time as milliseconds since Unix epoch.
@@ -745,47 +969,16 @@ fn iso_now() -> String {
     format!("{:.3}", d.as_secs_f64())
 }
 
-/// Tear down backends started by a `start()` that lost its commit race
-/// (owning session ended, or a concurrent start/stop superseded it) and —
-/// when `finalize_session_json` — finalize the `session.json` it already
-/// wrote, so the orphaned output dir doesn't claim an in-flight recording
-/// (`present: true` with no final rewrite) forever. The caller passes
-/// `false` when the winning start committed the same dir and the file now
-/// describes the live recording.
-fn abort_uncommitted_start(
-    dir: &Path,
-    video: Option<Box<dyn VideoBackend>>,
-    cursor: Option<CursorSampler>,
-    finalize_session_json: bool,
-) {
-    let video_meta = video.and_then(|rec| rec.stop().ok());
-    let cursor_stats = cursor.map(|c| c.stop()).unwrap_or_default();
-    if !finalize_session_json {
-        return;
-    }
-    let video_block = if let Some(ref m) = video_meta {
-        video_session_payload(true, None, Some(m))
-    } else {
-        video_session_payload(false, None, None)
-    };
-    let session_payload = serde_json::json!({
-        "schema_version": 1,
-        "started_at_monotonic_ms": now_ms(),
-        "video": video_block,
-        "cursor": cursor_session_payload(cursor_stats)
-    });
-    let _ = write_json_atomic(&dir.join("session.json"), &session_payload);
-}
-
-/// Build the `session.json` `cursor` field. `dropped_offscreen` counts
-/// polls deliberately skipped while the cursor was off the recorded
-/// monitor (Linux multi-monitor), so a sub-30 Hz average sample rate is
-/// self-explaining rather than looking like sampler loss.
+/// Build the `session.json` `cursor` field. `sample_count` keeps its existing
+/// meaning (positions actually written to `cursor.jsonl`); the two additive
+/// counters explain skipped polls and output failures.
 fn cursor_session_payload(stats: crate::cursor_sampler::CursorStats) -> Value {
     serde_json::json!({
         "present": stats.samples > 0,
         "sample_count": stats.samples,
-        "dropped_offscreen": stats.dropped_offscreen,
+        "outside_capture_surface_count": stats.outside_capture_surface,
+        "unavailable_count": stats.unavailable,
+        "write_failure_count": stats.write_failures,
     })
 }
 
@@ -806,20 +999,13 @@ fn video_session_payload(
         return o;
     }
     if let Some(meta) = meta {
-        let mut o = serde_json::json!({
+        return serde_json::json!({
             "present": true,
             "path": "recording.mp4",
             "absolute_path": meta.path.to_string_lossy(),
             "duration_ms": meta.duration_ms,
             "finalized": meta.finalized,
         });
-        // Capture-health detail from the backend (persistent capture
-        // failure, frozen frames, encoder stderr) — present means "a file
-        // landed", not "the file is trustworthy".
-        if let Some(err) = &meta.error {
-            o["error"] = serde_json::Value::String(err.clone());
-        }
-        return o;
     }
     serde_json::json!({
         "present": true,
@@ -836,52 +1022,490 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn validate_video_metadata(meta: VideoMetadata) -> anyhow::Result<VideoMetadata> {
+    if !meta.finalized {
+        anyhow::bail!("video backend did not finalize {}", meta.path.display());
+    }
+    let output = std::fs::metadata(&meta.path).map_err(|error| {
+        anyhow::anyhow!(
+            "finalized video is missing at {}: {error}",
+            meta.path.display()
+        )
+    })?;
+    if output.len() == 0 {
+        anyhow::bail!("finalized video is empty at {}", meta.path.display());
+    }
+    Ok(meta)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn fresh_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("cua-rec-end-reason-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    struct FailingVideo;
+
+    impl VideoBackend for FailingVideo {
+        fn stop(self: Box<Self>) -> anyhow::Result<VideoMetadata> {
+            anyhow::bail!("recorder did not finalize")
+        }
     }
 
-    fn end_reason_in(dir: &std::path::Path) -> serde_json::Value {
-        let raw = std::fs::read_to_string(dir.join("session.json")).unwrap();
-        serde_json::from_str::<serde_json::Value>(&raw).unwrap()["end_reason"].clone()
-    }
-
-    /// #19: a finalized trajectory names why it ended, so a split or
-    /// truncated recording is self-explaining.
     #[test]
-    fn stop_writes_end_reason_into_session_json() {
+    fn turn_capture_brackets_action_and_preserves_post_action_aliases() {
+        static SCREENSHOTS: AtomicUsize = AtomicUsize::new(0);
+        static STATES: AtomicUsize = AtomicUsize::new(0);
+        set_screenshot_fn(|window_id, pid| {
+            if (window_id, pid) == (Some(2), Some(1)) {
+                let phase = SCREENSHOTS.fetch_add(1, Ordering::SeqCst);
+                return Some(if phase == 0 {
+                    b"before".to_vec()
+                } else {
+                    b"after".to_vec()
+                });
+            }
+            // Other recording tests share this process-global hook and may run
+            // concurrently. Give them stable bytes without advancing this
+            // test's before/after phase counter.
+            Some(b"after".to_vec())
+        });
+        set_ax_snapshot_fn(|_, _| {
+            let phase = STATES.fetch_add(1, Ordering::SeqCst);
+            Some(format!(r#"{{"phase":{phase}}}"#).into_bytes())
+        });
+        set_click_marker_fn(|_, _, _| Some(b"click".to_vec()));
+        set_element_bounds_fn(|window_id, pid, element_index| {
+            Some((window_id as f64 + element_index as f64, pid as f64))
+        });
+
+        let output_dir = std::env::temp_dir().join(format!(
+            "cua-recording-turn-evidence-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let session = RecordingSession::new();
+        {
+            let mut inner = session.inner.lock().expect("recording lock");
+            inner.enabled = true;
+            inner.output_dir = Some(output_dir.clone());
+            inner.session_start_ms = now_ms();
+        }
+        let pending = session
+            .begin_turn(
+                "click",
+                &serde_json::json!({"pid": 1, "window_id": 2, "x": 3, "y": 4}),
+                now_ms(),
+            )
+            .expect("recording should reserve a turn");
+        let turn = output_dir.join("turn-00001");
+        assert_eq!(std::fs::read(turn.join("before.png")).unwrap(), b"before");
+        assert!(!turn.join("after.png").exists());
+
+        let action_record = crate::action_record::ActionExecutionRecord::builder(
+            crate::action_record::ActionEffect::Unverifiable,
+            crate::action_record::ActionTransport::MacosCgEventPid,
+            crate::action_record::RequestedDelivery::Background,
+        )
+        .actual_delivery(crate::action_record::ActualDelivery::Background)
+        .build()
+        .expect("valid action record");
+        session.finish_turn_with_action(pending, "clicked", Some(&action_record));
+        assert_eq!(std::fs::read(turn.join("after.png")).unwrap(), b"after");
+        assert_eq!(
+            std::fs::read(turn.join("screenshot.png")).unwrap(),
+            std::fs::read(turn.join("after.png")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(turn.join("app_state.json")).unwrap(),
+            std::fs::read(turn.join("after_state.json")).unwrap()
+        );
+        assert_eq!(std::fs::read(turn.join("click.png")).unwrap(), b"click");
+        let action: Value = serde_json::from_slice(
+            &std::fs::read(turn.join("action.json")).expect("read action truth"),
+        )
+        .expect("parse action truth");
+        assert_eq!(action["action_truth"]["effect"], "unverifiable");
+        assert_eq!(action["action_truth"]["route"], "synthetic_events");
+        assert_eq!(action["action_truth"]["requested_delivery"], "background");
+
+        let snapshot_id = crate::element_token::global().register_snapshot(1, 77, 1);
+        let token = crate::element_token::token_for(snapshot_id, 0);
+        let pending = session
+            .begin_turn(
+                "click",
+                &serde_json::json!({"pid": 1, "element_token": token}),
+                now_ms(),
+            )
+            .expect("token-only click should reserve a targeted turn");
+        session.finish_turn(pending, "token click");
+        let token_turn = output_dir.join("turn-00002");
+        let token_action: Value = serde_json::from_slice(
+            &std::fs::read(token_turn.join("action.json")).expect("read token action"),
+        )
+        .expect("parse token action");
+        assert_eq!(token_action["click_point"]["x"], 77.0);
+        assert_eq!(token_action["click_point"]["y"], 1.0);
+        assert!(token_turn.join("click.png").exists());
+
+        let stale_snapshot = crate::element_token::global().register_snapshot(1, 88, 1);
+        let stale_token = crate::element_token::token_for(stale_snapshot, 0);
+        let _newer_snapshot = crate::element_token::global().register_snapshot(1, 88, 1);
+        let pending = session
+            .begin_turn(
+                "click",
+                &serde_json::json!({"pid": 1, "element_token": stale_token}),
+                now_ms(),
+            )
+            .expect("stale-token refusal should reserve an evidence turn");
+        session.finish_turn_with_outcome(pending, "stale token", None, true);
+        let refused_turn = output_dir.join("turn-00003");
+        let refused_action: Value = serde_json::from_slice(
+            &std::fs::read(refused_turn.join("action.json")).expect("read refused action"),
+        )
+        .expect("parse refused action");
+        assert_eq!(refused_action["result_error"], true);
+        assert!(refused_action.get("click_point").is_none());
+        assert!(!refused_turn.join("click.png").exists());
+        let refused_manifest: Value = serde_json::from_slice(
+            &std::fs::read(refused_turn.join("evidence.json")).expect("read refused evidence"),
+        )
+        .expect("parse refused evidence");
+        assert_eq!(refused_manifest["click"]["status"], "not_applicable");
+        assert_eq!(
+            refused_manifest["click"]["classification"],
+            "action_refused_before_target_resolution"
+        );
+
+        let pending = session
+            .begin_turn(
+                "click",
+                &serde_json::json!({"pid": 1, "window_id": 2, "x": 3, "y": 4}),
+                now_ms(),
+            )
+            .expect("resolved refusal should reserve an evidence turn");
+        let refusal_record = crate::action_record::ActionExecutionRecord::builder(
+            crate::action_record::ActionEffect::Refused,
+            crate::action_record::ActionTransport::WindowsTargetedInjection,
+            crate::action_record::RequestedDelivery::Background,
+        )
+        .build()
+        .expect("valid refusal record");
+        session.finish_turn_with_outcome(
+            pending,
+            "refused before dispatch",
+            Some(&refusal_record),
+            true,
+        );
+        let resolved_refusal_turn = output_dir.join("turn-00004");
+        let resolved_refusal_action: Value = serde_json::from_slice(
+            &std::fs::read(resolved_refusal_turn.join("action.json"))
+                .expect("read resolved refusal action"),
+        )
+        .expect("parse resolved refusal action");
+        assert_eq!(resolved_refusal_action["click_point"]["x"], 3.0);
+        assert_eq!(resolved_refusal_action["action_truth"]["effect"], "refused");
+        assert!(!resolved_refusal_turn.join("click.png").exists());
+        let resolved_refusal_manifest: Value = serde_json::from_slice(
+            &std::fs::read(resolved_refusal_turn.join("evidence.json"))
+                .expect("read resolved refusal evidence"),
+        )
+        .expect("parse resolved refusal evidence");
+        assert_eq!(
+            resolved_refusal_manifest["click"]["status"],
+            "not_applicable"
+        );
+        assert_eq!(
+            resolved_refusal_manifest["click"]["classification"],
+            "action_refused_before_dispatch"
+        );
+
+        let files = [
+            "action.json",
+            "app_state.json",
+            "screenshot.png",
+            "click.png",
+            "before_state.json",
+            "before.png",
+            "after_state.json",
+            "after.png",
+            "evidence.json",
+        ];
+        for directory in [&turn, &token_turn] {
+            for file in files {
+                std::fs::remove_file(directory.join(file)).expect("remove turn fixture file");
+            }
+            std::fs::remove_dir(directory).expect("remove turn fixture directory");
+        }
+        for directory in [&refused_turn, &resolved_refusal_turn] {
+            for file in files.iter().copied().filter(|file| *file != "click.png") {
+                std::fs::remove_file(directory.join(file))
+                    .expect("remove refused turn fixture file");
+            }
+            std::fs::remove_dir(directory).expect("remove refused turn fixture directory");
+        }
+        std::fs::remove_dir(&output_dir).expect("remove recording fixture directory");
+    }
+
+    #[test]
+    fn stale_recording_generation_cannot_finalize_a_reserved_turn() {
+        let output_dir = std::env::temp_dir().join(format!(
+            "cua-recording-generation-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let session = RecordingSession::new();
+        {
+            let mut inner = session.inner.lock().expect("recording lock");
+            inner.enabled = true;
+            inner.generation = 1;
+            inner.output_dir = Some(output_dir.clone());
+            inner.session_start_ms = now_ms();
+        }
+        let pending = session
+            .begin_turn("click", &serde_json::json!({"x": 1, "y": 2}), now_ms())
+            .expect("reserve first generation turn");
+        session.inner.lock().unwrap().generation = 2;
+        session.finish_turn(pending, "must be discarded");
+
+        let turn = output_dir.join("turn-00001");
+        assert!(!turn.join("action.json").exists());
+        for entry in std::fs::read_dir(&turn).expect("read partial turn") {
+            std::fs::remove_file(entry.expect("turn entry").path()).expect("remove partial file");
+        }
+        std::fs::remove_dir(&turn).expect("remove partial turn");
+        std::fs::remove_dir(&output_dir).expect("remove recording directory");
+    }
+
+    #[test]
+    fn private_turn_records_metadata_without_visual_or_ax_artifacts() {
+        let output_dir = std::env::temp_dir().join(format!(
+            "cua-recording-private-turn-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let session = RecordingSession::new();
+        {
+            let mut inner = session.inner.lock().expect("recording lock");
+            inner.enabled = true;
+            inner.output_dir = Some(output_dir.clone());
+            inner.session_start_ms = now_ms();
+        }
+        let pending = session
+            .begin_private_turn(
+                "browser_prepare",
+                &serde_json::json!({"pid": 1, "window_id": 2}),
+                now_ms(),
+            )
+            .expect("reserve private consent turn");
+        session.finish_turn(pending, "attached");
+
+        let turn = output_dir.join("turn-00001");
+        assert!(turn.join("action.json").exists());
+        assert!(turn.join("evidence.json").exists());
+        for private_artifact in [
+            "before.png",
+            "after.png",
+            "screenshot.png",
+            "before_state.json",
+            "after_state.json",
+            "app_state.json",
+        ] {
+            assert!(!turn.join(private_artifact).exists(), "{private_artifact}");
+        }
+        let evidence: Value = serde_json::from_slice(
+            &std::fs::read(turn.join("evidence.json")).expect("read private evidence"),
+        )
+        .expect("parse private evidence");
+        assert_eq!(
+            evidence["before"]["screenshot"]["classification"],
+            "privacy_suppressed"
+        );
+        assert_eq!(
+            evidence["after"]["screenshot"]["classification"],
+            "privacy_suppressed"
+        );
+
+        for file in ["action.json", "evidence.json"] {
+            std::fs::remove_file(turn.join(file)).expect("remove private turn artifact");
+        }
+        std::fs::remove_dir(&turn).expect("remove private turn directory");
+        std::fs::remove_dir(&output_dir).expect("remove private recording directory");
+    }
+
+    #[test]
+    fn stop_owner_surfaces_video_finalization_failure() {
+        let output_dir = std::env::temp_dir().join(format!(
+            "cua-recording-stop-failure-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&output_dir).expect("create recording test directory");
+        let session = RecordingSession::new();
+        {
+            let mut inner = session.inner.lock().expect("recording lock");
+            inner.enabled = true;
+            inner.output_dir = Some(output_dir.clone());
+            inner.video = Some(Box::new(FailingVideo));
+        }
+
+        let error = session
+            .stop_owner(None)
+            .expect_err("video finalization failure must reach the caller");
+        assert!(error.to_string().contains("recorder did not finalize"));
+        let state = session.current_state();
+        assert!(!state.enabled);
+        assert!(state.last_video_path.is_none());
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("recorder did not finalize")
+        );
+
+        let manifest: Value = serde_json::from_slice(
+            &std::fs::read(output_dir.join("session.json")).expect("read session manifest"),
+        )
+        .expect("parse session manifest");
+        assert_eq!(manifest["video"]["present"], false);
+        assert_eq!(manifest["video"]["error"], "recorder did not finalize");
+        let _ = std::fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn final_session_json_preserves_original_start_timestamp() {
+        let output_dir = std::env::temp_dir().join(format!(
+            "cua-recording-start-timestamp-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let session = RecordingSession::new();
+        session
+            .start(output_dir.to_str().expect("utf-8 path"), false, None)
+            .expect("start recording");
+        let live: Value = serde_json::from_slice(
+            &std::fs::read(output_dir.join("session.json")).expect("read live manifest"),
+        )
+        .expect("parse live manifest");
+
+        session.stop_owner(None).expect("stop recording");
+        let finalized: Value = serde_json::from_slice(
+            &std::fs::read(output_dir.join("session.json")).expect("read final manifest"),
+        )
+        .expect("parse final manifest");
+
+        assert_eq!(
+            finalized["started_at_monotonic_ms"],
+            live["started_at_monotonic_ms"]
+        );
+        let _ = std::fs::remove_dir_all(output_dir);
+    }
+
+    /// A finalized trajectory names why it ended; a live one has no
+    /// `end_reason` at all, so absence means "never finalized".
+    #[test]
+    fn session_json_records_why_the_recording_ended() {
+        fn reason_in(dir: &Path) -> Value {
+            let raw = std::fs::read(dir.join("session.json")).expect("read session manifest");
+            serde_json::from_slice::<Value>(&raw).expect("parse session manifest")["end_reason"]
+                .clone()
+        }
+        fn fresh_dir(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "cua-recording-end-reason-{tag}-{}-{}",
+                std::process::id(),
+                now_ms()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            dir
+        }
+
         let session = RecordingSession::new();
 
-        // Explicit reason wins (the idle reapers pass IdleTtl).
-        let dir = fresh_dir("idle");
-        session.start(dir.to_str().unwrap(), false, Some("end-reason-idle-sid")).unwrap();
+        // A live recording carries no end reason.
+        let live = fresh_dir("live");
         session
-            .stop_owner_with_reason(Some("end-reason-idle-sid"), RecordingEndReason::IdleTtl)
-            .unwrap();
-        assert_eq!(end_reason_in(&dir), "idle_ttl");
+            .start(live.to_str().expect("utf-8 path"), false, None)
+            .expect("start anonymous recording");
+        assert_eq!(reason_in(&live), Value::Null);
 
-        // Session-scoped stop defaults to session_end.
-        let dir = fresh_dir("session-end");
-        session.start(dir.to_str().unwrap(), false, Some("end-reason-end-sid")).unwrap();
-        session.stop_owner(Some("end-reason-end-sid")).unwrap();
-        assert_eq!(end_reason_in(&dir), "session_end");
+        // An unconditional stop is the manual family.
+        session.stop_owner(None).expect("manual stop");
+        assert_eq!(reason_in(&live), "manual");
 
-        // Unconditional stop defaults to manual.
-        let dir = fresh_dir("manual");
-        session.start(dir.to_str().unwrap(), false, None).unwrap();
-        session.stop_owner(None).unwrap();
-        assert_eq!(end_reason_in(&dir), "manual");
+        // A session-scoped stop reads back that episode's lifecycle reason.
+        let explicit = fresh_dir("explicit");
+        let owner = "test-recording-reason-EXPL";
+        crate::session::touch_session(owner);
+        session
+            .start(explicit.to_str().expect("utf-8 path"), false, Some(owner))
+            .expect("start owned recording");
+        crate::session::end_session(owner);
+        session.stop_owner(Some(owner)).expect("session stop");
+        assert_eq!(reason_in(&explicit), "session_explicit");
+        crate::session::forget_ended_sessions_with_prefix(owner);
 
-        // A live recording's session.json has no end_reason yet.
-        let dir = fresh_dir("live");
-        session.start(dir.to_str().unwrap(), false, None).unwrap();
-        assert_eq!(end_reason_in(&dir), serde_json::Value::Null);
-        session.stop_owner(None).unwrap();
+        // An owner whose episode ended through a reason-less path is
+        // reported as unknown rather than guessed.
+        let unknown = fresh_dir("unknown");
+        let eof_owner = "test-recording-reason-EOF";
+        session
+            .start(
+                unknown.to_str().expect("utf-8 path"),
+                false,
+                Some(eof_owner),
+            )
+            .expect("start owned recording");
+        session.stop_owner(Some(eof_owner)).expect("session stop");
+        assert_eq!(reason_in(&unknown), "session_unknown");
+
+        // An explicitly named reason wins over the requester default.
+        let backstop = fresh_dir("backstop");
+        session
+            .start(backstop.to_str().expect("utf-8 path"), false, None)
+            .expect("start anonymous recording");
+        session
+            .stop_owner_with_reason(None, RecordingEndReason::IdleBackstop)
+            .expect("backstop stop");
+        assert_eq!(reason_in(&backstop), "idle_backstop");
+
+        for dir in [live, explicit, unknown, backstop] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn video_metadata_requires_finalized_nonempty_output() {
+        let output_dir = std::env::temp_dir().join(format!(
+            "cua-recording-metadata-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&output_dir).expect("create video metadata test directory");
+        let path = output_dir.join("recording.mp4");
+        std::fs::write(&path, b"video").expect("write video fixture");
+
+        let error = validate_video_metadata(VideoMetadata {
+            path: path.clone(),
+            duration_ms: 1,
+            finalized: false,
+        })
+        .expect_err("unfinalized output must fail");
+        assert!(error.to_string().contains("did not finalize"));
+
+        std::fs::write(&path, []).expect("empty video fixture");
+        let error = validate_video_metadata(VideoMetadata {
+            path: path.clone(),
+            duration_ms: 1,
+            finalized: true,
+        })
+        .expect_err("empty finalized output must fail");
+        assert!(error.to_string().contains("is empty"));
+
+        std::fs::write(&path, b"video").expect("restore video fixture");
+        validate_video_metadata(VideoMetadata {
+            path,
+            duration_ms: 1,
+            finalized: true,
+        })
+        .expect("finalized nonempty output must pass");
+        let _ = std::fs::remove_dir_all(output_dir);
     }
 }

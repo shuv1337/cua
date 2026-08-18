@@ -13,8 +13,7 @@
 //! stop|status`) and removes the "is this a setting write?" ambiguity of
 //! the old `set_*` name.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -25,48 +24,7 @@ use crate::{
     tool::{Tool, ToolDef, ToolRegistry},
 };
 
-// ── Process-global weak reference to the registry (for replay) ───────────────
-//
-// Set once by `ToolRegistry::init_replay(weak)` after `Arc::new(registry)`.
-
-static REPLAY_REGISTRY: OnceLock<Weak<ToolRegistry>> = OnceLock::new();
-
-/// Called from `main.rs` after wrapping the registry in `Arc`.
-pub fn init_replay_registry(weak: Weak<ToolRegistry>) {
-    let _ = REPLAY_REGISTRY.set(weak);
-}
-
-fn get_replay_registry() -> Option<Arc<ToolRegistry>> {
-    REPLAY_REGISTRY.get()?.upgrade()
-}
-
-// ── Recording opt-in gate ─────────────────────────────────────────────────────
-//
-// Continuous capture (per-turn screenshots + AX dumps + optional video,
-// persisted to disk) is strictly more powerful than the on-demand
-// screenshot / get_window_state tools, so it is off by default: the
-// operator opts in by launching the daemon with `--allow-recording` or by
-// setting CUA_RECORDING_ENABLED=1. Without it, `start_recording` errors
-// and no per-turn capture can be enabled.
-
-static RECORDING_ALLOWED_FLAG: AtomicBool = AtomicBool::new(false);
-
-/// Called from `main.rs` when `--allow-recording` is on argv.
-pub fn allow_recording() {
-    RECORDING_ALLOWED_FLAG.store(true, Ordering::SeqCst);
-}
-
-/// True when recording capture was opted into via `--allow-recording` or
-/// `CUA_RECORDING_ENABLED=1` / `=true`.
-pub fn recording_allowed() -> bool {
-    RECORDING_ALLOWED_FLAG.load(Ordering::SeqCst)
-        || std::env::var("CUA_RECORDING_ENABLED")
-            .map(|v| {
-                let v = v.trim();
-                v == "1" || v.eq_ignore_ascii_case("true")
-            })
-            .unwrap_or(false)
-}
+pub type ReplayRegistrySlot = Arc<Mutex<Weak<ToolRegistry>>>;
 
 // ── start_recording ──────────────────────────────────────────────────────────
 
@@ -75,7 +33,9 @@ pub struct StartRecordingTool {
 }
 
 impl StartRecordingTool {
-    pub fn new(session: Arc<RecordingSession>) -> Self { Self { session } }
+    pub fn new(session: Arc<RecordingSession>) -> Self {
+        Self { session }
+    }
 }
 
 static START_REC_DEF: OnceLock<ToolDef> = OnceLock::new();
@@ -88,21 +48,28 @@ impl Tool for StartRecordingTool {
             description: "Start trajectory recording. Every subsequent action-tool \
                 invocation (click, right_click, scroll, type_text, press_key, hotkey, \
                 set_value) writes a turn folder under `output_dir`:\n\n\
+                - `before_state.json` / `after_state.json` — application AX/UIA/AT-SPI \
+                  state immediately before and after the action.\n\
+                - `before.png` / `after.png` — target-window screenshots immediately \
+                  before and after the action.\n\
+                - `evidence.json` — capture status and a stable classification when an \
+                  expected artifact could not be captured.\n\
                 - `app_state.json` — post-action AX/UIA snapshot for the target pid.\n\
-                - `screenshot.png` — post-action per-window screenshot of the target's \
-                  frontmost on-screen window.\n\
-                - `action.json` — tool name, full input arguments, result summary, pid, \
-                  click point (when applicable), ISO-8601 timestamp.\n\
-                - `click.png` — for click-family actions only, `screenshot.png` with a \
-                  red dot drawn at the click point.\n\n\
+                - `screenshot.png` — compatibility alias of `after.png`.\n\
+                - `action.json` — tool name, full input arguments, result summary, \
+                  result-error flag, pid, click point (when applicable), ISO-8601 \
+                  timestamp.\n\
+                - `click.png` — for dispatched click-family actions only, `before.png` \
+                  with a red marker at the click point. A call refused before target \
+                  resolution is explicitly not applicable instead.\n\n\
                 Turn folders are named `turn-00001/`, `turn-00002/`, etc.  Turn \
                 numbering restarts at 1 each time recording is (re-)started.\n\n\
                 **Video is off by default.** Pass `record_video: true` to also \
                 capture the main display to `<output_dir>/recording.mp4` (H.264 / \
                 30 fps) for the lifetime of the session. The recording is torn \
                 down automatically when the MCP client disconnects.\n\n\
-                **macOS uses native ScreenCaptureKit** (in-process SCStream + \
-                SCRecordingOutput) so video inherits Cua Driver's own Screen \
+                **macOS uses native ScreenCaptureKit** (daemon-owned SCStream + \
+                SCRecordingOutput) so video inherits the daemon's Screen \
                 Recording grant — no extra TCC prompt, no ffmpeg subprocess. \
                 Requires macOS 15.0+.\n\n\
                 **Windows + Linux use an ffmpeg subprocess** (`gdigrab` / \
@@ -111,12 +78,10 @@ impl Tool for StartRecordingTool {
                 fails on startup the per-turn capture (screenshots + \
                 action.json) still runs and the session's `last_error` field \
                 carries the diagnostic.\n\n\
-                State persists for the life of the daemon / MCP session; a restart \
+                State persists for the life of the daemon; a restart \
                 resets to disabled with no on-disk state. Call `stop_recording` to \
-                disable + finalize the mp4.\n\n\
-                **Opt-in required.** Continuous capture is off by default; this \
-                tool errors unless the daemon was started with `--allow-recording` \
-                or `CUA_RECORDING_ENABLED=1`.".into(),
+                disable + finalize the mp4."
+                .into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["output_dir"],
@@ -147,13 +112,6 @@ impl Tool for StartRecordingTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use crate::tool_args::ArgsExt;
-        if !recording_allowed() {
-            return ToolResult::error(
-                "Recording is disabled by default. Start the daemon with \
-                 --allow-recording (or set CUA_RECORDING_ENABLED=1) to opt in \
-                 to continuous per-turn capture.",
-            );
-        }
         let output_dir = args.opt_str("output_dir");
         if output_dir.as_deref().map(str::is_empty).unwrap_or(true) {
             return ToolResult::error("`output_dir` is required.");
@@ -164,7 +122,11 @@ impl Tool for StartRecordingTool {
         // (session_end) only stops the recording its own session started.
         let owner = args.opt_str("_session_id");
 
-        match self.session.start(output_dir.as_deref().unwrap(), record_video, owner.as_deref()) {
+        match self.session.start(
+            output_dir.as_deref().unwrap(),
+            record_video,
+            owner.as_deref(),
+        ) {
             Ok(()) => {
                 let state = self.session.current_state();
                 // When the caller asked for video and it failed (e.g. macOS
@@ -176,11 +138,21 @@ impl Tool for StartRecordingTool {
                     " (video → recording.mp4)".to_string()
                 } else if video_failed {
                     let err = state.last_error.clone().unwrap_or_else(|| "unknown".into());
-                    format!("\n\n⚠️ Video capture failed (per-turn JSON+screenshot still running):\n{err}")
-                } else { String::new() };
-                let msg = format!("✅ Recording started -> {}{}",
+                    let hint = if crate::video_ffmpeg::find_ffmpeg().is_none() {
+                        "\n\nffmpeg was not found. Call install_ffmpeg (then again with \
+                         confirm=true) to install it, then restart recording."
+                    } else {
+                        ""
+                    };
+                    format!("\n\n⚠️ Video capture failed (per-turn JSON+screenshot still running):\n{err}{hint}")
+                } else {
+                    String::new()
+                };
+                let msg = format!(
+                    "✅ Recording started -> {}{}",
                     state.output_dir.as_deref().unwrap_or("?"),
-                    video_note);
+                    video_note
+                );
                 ToolResult::text(msg).with_structured(recording_state_json(&state))
             }
             Err(e) => ToolResult::error(format!("Failed to start recording: {e}")),
@@ -195,7 +167,9 @@ pub struct StopRecordingTool {
 }
 
 impl StopRecordingTool {
-    pub fn new(session: Arc<RecordingSession>) -> Self { Self { session } }
+    pub fn new(session: Arc<RecordingSession>) -> Self {
+        Self { session }
+    }
 }
 
 static STOP_REC_DEF: OnceLock<ToolDef> = OnceLock::new();
@@ -212,9 +186,10 @@ impl Tool for StopRecordingTool {
                 `last_video_path` pointing at the finalized mp4 (when video was on).\n\n\
                 A manual `stop_recording` is **unconditional** — it stops whatever \
                 recording is active regardless of which session started it. \
-                Ownership-scoped teardown (so one MCP client disconnecting can't stop a \
-                recording a later client started) is handled by the daemon's \
-                `session_end` lifecycle signal, not by this tool.".into(),
+                Ownership-scoped teardown (so one client disconnecting can't stop a \
+                recording a later client started) is handled by the registry's \
+                `session_end` lifecycle hook, not by this tool."
+                .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -230,11 +205,13 @@ impl Tool for StopRecordingTool {
     async fn invoke(&self, _args: Value) -> ToolResult {
         // Manual stop is unconditional — `None` requester tears down whatever
         // recording is active. Session-scoped teardown is driven by the
-        // daemon's `session_end` arm (serve.rs), which calls `stop_owner(sid)`.
+        // registry-owned session-end hook, which calls `stop_owner(sid)`.
         match self.session.stop_owner(None) {
             Ok(()) => {
                 let state = self.session.current_state();
-                let video_note = state.last_video_path.as_deref()
+                let video_note = state
+                    .last_video_path
+                    .as_deref()
                     .map(|p| format!(" (video → {p})"))
                     .unwrap_or_default();
                 ToolResult::text(format!("✅ Recording stopped.{video_note}"))
@@ -252,7 +229,9 @@ pub struct GetRecordingStateTool {
 }
 
 impl GetRecordingStateTool {
-    pub fn new(session: Arc<RecordingSession>) -> Self { Self { session } }
+    pub fn new(session: Arc<RecordingSession>) -> Self {
+        Self { session }
+    }
 }
 
 static GET_REC_DEF: OnceLock<ToolDef> = OnceLock::new();
@@ -297,7 +276,15 @@ impl Tool for GetRecordingStateTool {
 
 // ── replay_trajectory ─────────────────────────────────────────────────────────
 
-pub struct ReplayTrajectoryTool;
+pub struct ReplayTrajectoryTool {
+    registry: ReplayRegistrySlot,
+}
+
+impl ReplayTrajectoryTool {
+    pub fn new(registry: ReplayRegistrySlot) -> Self {
+        Self { registry }
+    }
+}
 
 static REPLAY_DEF: OnceLock<ToolDef> = OnceLock::new();
 
@@ -330,7 +317,7 @@ impl Tool for ReplayTrajectoryTool {
                 "type": "object",
                 "required": ["dir"],
                 "properties": {
-                    "dir":           { "type": "string",  "description": "Trajectory directory previously written by `set_recording`. Absolute or ~-rooted." },
+                    "dir":           { "type": "string",  "description": "Trajectory directory previously written by `start_recording`. Absolute or ~-rooted." },
                     "delay_ms":      { "type": "integer", "minimum": 0, "maximum": 10000, "description": "Milliseconds to sleep between turns, for human-observable pacing. Default 500." },
                     "stop_on_error": { "type": "boolean", "description": "Stop replay on the first tool-call error. Default true — set false to best-effort through the full trajectory." }
                 },
@@ -356,15 +343,22 @@ impl Tool for ReplayTrajectoryTool {
         // Expand ~/
         let dir = {
             let p = std::path::PathBuf::from(&dir_str);
-            if dir_str.starts_with("~/") {
+            if let Some(relative) = dir_str.strip_prefix("~/") {
                 if let Ok(home) = std::env::var("HOME") {
-                    std::path::PathBuf::from(home).join(&dir_str[2..])
-                } else { p }
-            } else { p }
+                    std::path::PathBuf::from(home).join(relative)
+                } else {
+                    p
+                }
+            } else {
+                p
+            }
         };
 
         if !dir.exists() {
-            return ToolResult::error(format!("Trajectory directory does not exist: {}", dir.display()));
+            return ToolResult::error(format!(
+                "Trajectory directory does not exist: {}",
+                dir.display()
+            ));
         }
 
         // Collect and sort turn-NNNNN directories.
@@ -372,22 +366,30 @@ impl Tool for ReplayTrajectoryTool {
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
                     .map(|e| e.path())
-                    .filter(|p| p.is_dir() && p.file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| n.starts_with("turn-"))
-                        .unwrap_or(false))
+                    .filter(|p| {
+                        p.is_dir()
+                            && p.file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|n| n.starts_with("turn-"))
+                                .unwrap_or(false)
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
         turn_dirs.sort();
 
         if turn_dirs.is_empty() {
-            return ToolResult::error(format!("No turn-NNNNN folders found under {}", dir.display()));
+            return ToolResult::error(format!(
+                "No turn-NNNNN folders found under {}",
+                dir.display()
+            ));
         }
 
-        let registry = match get_replay_registry() {
+        let registry = match self.registry.lock().unwrap().upgrade() {
             Some(r) => r,
-            None => return ToolResult::error("Replay not available: registry not initialised yet."),
+            None => {
+                return ToolResult::error("Replay not available: registry not initialised yet.")
+            }
         };
 
         let mut attempted = 0u32;
@@ -397,7 +399,8 @@ impl Tool for ReplayTrajectoryTool {
         let mut first_failure: Option<(String, String, String)> = None;
 
         for turn_dir in &turn_dirs {
-            let turn_name = turn_dir.file_name()
+            let turn_name = turn_dir
+                .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("?")
                 .to_owned();
@@ -408,14 +411,17 @@ impl Tool for ReplayTrajectoryTool {
                 Err(e) => {
                     failed += 1;
                     if first_failure.is_none() {
-                        first_failure = Some((turn_name.clone(), "action.json".into(), e.to_string()));
+                        first_failure =
+                            Some((turn_name.clone(), "action.json".into(), e.to_string()));
                     }
                     turns_json.push(json!({
                         "turn": turn_name,
                         "ok": false,
                         "parse_error": e.to_string()
                     }));
-                    if stop_on_error { break; }
+                    if stop_on_error {
+                        break;
+                    }
                     continue;
                 }
             };
@@ -423,11 +429,15 @@ impl Tool for ReplayTrajectoryTool {
             attempted += 1;
             let result = registry.invoke(&tool_name, tool_args).await;
             let is_err = result.is_error.unwrap_or(false);
-            let summary = result.content.iter()
+            let summary = result
+                .content
+                .iter()
                 .find_map(|c| {
                     if let crate::protocol::Content::Text { text, .. } = c {
                         Some(text.as_str())
-                    } else { None }
+                    } else {
+                        None
+                    }
                 })
                 .unwrap_or("")
                 .to_owned();
@@ -444,7 +454,9 @@ impl Tool for ReplayTrajectoryTool {
                 if first_failure.is_none() {
                     first_failure = Some((turn_name.clone(), tool_name.clone(), summary));
                 }
-                if stop_on_error { break; }
+                if stop_on_error {
+                    break;
+                }
             } else {
                 succeeded += 1;
             }
@@ -454,9 +466,7 @@ impl Tool for ReplayTrajectoryTool {
             }
         }
 
-        let dir_name = dir.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?");
+        let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
         let mut summary_text = format!(
             "replay {dir_name}: attempted={attempted} succeeded={succeeded} failed={failed}"
         );
@@ -476,8 +486,7 @@ impl Tool for ReplayTrajectoryTool {
             structured["first_failure"] = json!({ "turn": turn, "tool": tool, "error": error });
         }
 
-        ToolResult::text(summary_text)
-            .with_structured(structured)
+        ToolResult::text(summary_text).with_structured(structured)
     }
 }
 
@@ -507,10 +516,105 @@ fn parse_action_json(path: &std::path::Path) -> anyhow::Result<(String, Value)> 
     }
     let text = std::fs::read_to_string(path)?;
     let obj: Value = serde_json::from_str(&text)?;
-    let tool = obj.get("tool")
+    let tool = obj
+        .get("tool")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("action.json missing 'tool' string field"))?
         .to_owned();
-    let tool_args = obj.get("arguments").cloned().unwrap_or(Value::Object(Default::default()));
+    let tool_args = obj
+        .get("arguments")
+        .cloned()
+        .unwrap_or(Value::Object(Default::default()));
     Ok((tool, tool_args))
+}
+
+// ── install_ffmpeg ────────────────────────────────────────────────────────────
+//
+// Confirmation-gated installer for the ffmpeg binary that the Linux/Windows
+// video backend shells out to. Called without `confirm` it only REPORTS the
+// command it would run (read-only preview); `confirm: true` runs it. Marked
+// destructive + open_world so conforming MCP clients also gate it behind a
+// human approval. ffmpeg is invoked as a separate process, never linked.
+
+pub struct InstallFfmpegTool;
+static INSTALL_FFMPEG_DEF: OnceLock<ToolDef> = OnceLock::new();
+
+#[async_trait]
+impl Tool for InstallFfmpegTool {
+    fn def(&self) -> &ToolDef {
+        INSTALL_FFMPEG_DEF.get_or_init(|| ToolDef {
+            name: "install_ffmpeg".into(),
+            description: "Install the ffmpeg binary used by start_recording's video \
+                capture (Linux/Windows; macOS records natively and needs no ffmpeg). \
+                Two-step and confirmed: called without `confirm` it only REPORTS the \
+                exact install command for this platform's package manager; pass \
+                `confirm: true` to actually run it. No-op if ffmpeg is already on PATH. \
+                ffmpeg is run as a separate process, never linked into the driver."
+                .into(),
+            input_schema: json!({"type":"object","properties":{
+                "confirm":{"type":"boolean","description":"Run the install command. Without it, only the planned command is reported."}
+            },"additionalProperties":false}),
+            read_only: false,
+            destructive: true,
+            idempotent: false,
+            open_world: true,
+        })
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        use crate::tool_args::ArgsExt;
+
+        if let Some(path) = crate::video_ffmpeg::find_ffmpeg() {
+            return ToolResult::text(format!(
+                "✅ ffmpeg already available ({}). Nothing to install.",
+                path.display()
+            ))
+            .with_structured(json!({
+                "installed": true, "ran": false, "path": path.display().to_string()
+            }));
+        }
+
+        let Some(plan) = crate::ffmpeg_install::install_plan() else {
+            return ToolResult::error(
+                "ffmpeg is not installed and no supported package manager was found to \
+                 install it automatically. Install ffmpeg manually and put it on PATH \
+                 (Linux: apt/dnf/pacman/zypper/apk/snap; macOS: `brew install ffmpeg`; \
+                 Windows: `winget install Gyan.FFmpeg`).",
+            );
+        };
+
+        if !args.bool_or("confirm", false) {
+            return ToolResult::text(format!(
+                "ffmpeg is not installed. To install it via {}, re-call install_ffmpeg \
+                 with confirm=true.\n\nCommand that will run:\n  {}",
+                plan.manager,
+                plan.display()
+            ))
+            .with_structured(json!({
+                "installed": false, "ran": false,
+                "manager": plan.manager, "command": plan.display()
+            }));
+        }
+
+        let display = plan.display();
+        let result =
+            tokio::task::spawn_blocking(move || crate::ffmpeg_install::run_install(&plan)).await;
+        match result {
+            Ok(Ok((cmd_ok, output))) => match crate::video_ffmpeg::find_ffmpeg() {
+                Some(path) => ToolResult::text(format!("✅ ffmpeg installed via `{display}`."))
+                    .with_structured(json!({
+                        "installed": true, "ran": true,
+                        "command": display, "path": path.display().to_string()
+                    })),
+                None => ToolResult::error(format!(
+                    "Ran the install command but ffmpeg is still not found.\n\
+                     Command: {display}\ncommand_succeeded={cmd_ok}\nOutput tail:\n{output}"
+                )),
+            },
+            Ok(Err(e)) => {
+                ToolResult::error(format!("ffmpeg install failed: {e}\nCommand: {display}"))
+            }
+            Err(e) => ToolResult::error(format!("install task error: {e}")),
+        }
+    }
 }
