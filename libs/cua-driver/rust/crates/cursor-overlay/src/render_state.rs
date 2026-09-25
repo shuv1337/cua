@@ -76,6 +76,11 @@ pub struct RenderStateCore {
     pub theme_fallback: Option<String>,
     /// User-controlled visibility.
     pub visible: bool,
+    /// The pinned target window is on another workspace (macOS Space), so the
+    /// cursor must not paint over the user's current workspace at that
+    /// window's coordinates. Platform adapters set it when handling
+    /// `PinAbove`; `false` when membership is unknown.
+    pub pinned_target_off_workspace: bool,
     /// Idle-hide: elapsed seconds since last activity.
     pub idle_secs: f64,
     /// Idle-hide fade: 1.0 = fully visible, 0.0 = fully hidden.
@@ -138,6 +143,7 @@ impl RenderStateCore {
             idle_secs: 0.0,
             idle_alpha: 1.0,
             pinned_wid: None,
+            pinned_target_off_workspace: false,
             session_label: None,
             session_badge_secs: SESSION_BADGE_HOLD_SECS + SESSION_BADGE_FADE_SECS,
             session_badge_hovered: false,
@@ -810,7 +816,11 @@ pub fn paint_cursor(
     focus_rect: Option<FocusRect>,
     backing_scale: f32,
 ) {
-    if !core.visible || core.pos.0 < -100.0 || core.idle_alpha < 0.004 {
+    if !core.visible
+        || core.pinned_target_off_workspace
+        || core.pos.0 < -100.0
+        || core.idle_alpha < 0.004
+    {
         return;
     }
 
@@ -991,6 +1001,23 @@ mod session_badge_and_action_tests {
     use crate::{CursorConfig, DeliveryModifier, TargetModifier};
 
     #[test]
+    fn idle_hide_zero_keeps_a_positioned_session_cursor_visible() {
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        core.motion.idle_hide_ms = 0.0;
+        assert!(core.apply_command_base(
+            OverlayCommand::ClickPulse { x: 40.0, y: 60.0 },
+            false,
+            false,
+        ));
+
+        core.tick_motion(2.0);
+
+        assert!(core.cursor_is_revealed());
+        assert_eq!(core.pos, (40.0, 60.0));
+        assert_eq!(core.idle_alpha, 1.0);
+    }
+
+    #[test]
     fn session_badge_holds_then_fades_once() {
         let mut core = RenderStateCore::new(CursorConfig::default());
         assert_eq!(core.session_badge_alpha(), 0.0);
@@ -1097,36 +1124,53 @@ mod session_badge_and_action_tests {
     }
 
     #[test]
-    fn movement_preserves_the_active_semantic_action() {
-        let mut core = RenderStateCore::new(CursorConfig::default());
-        core.pos = (20.0, 20.0);
-        core.apply_command_base(
-            OverlayCommand::BeginAction {
-                action: CursorAction::Text,
-                delivery: None,
-                target: Some(TargetModifier::Ax),
-            },
-            false,
-            false,
-        );
-        core.apply_command_base(
-            OverlayCommand::MoveTo {
-                x: 200.0,
-                y: 100.0,
-                end_heading_radians: 0.0,
-            },
-            false,
-            false,
-        );
-        assert_eq!(core.visual.resolved_action, CursorAction::Text);
-        assert_eq!(core.visual.target, Some(TargetModifier::Ax));
-        core.apply_command_base(
-            OverlayCommand::ClickPulse { x: 200.0, y: 100.0 },
-            false,
-            false,
-        );
-        assert_eq!(core.visual.resolved_action, CursorAction::Text);
-        assert_eq!(core.visual.target, Some(TargetModifier::Ax));
+    fn movement_and_click_pulse_preserve_the_active_semantic_context() {
+        // Text keeps its action through a pulse; Click re-begins itself and
+        // must carry the declared delivery and target across that restart.
+        for action in [CursorAction::Text, CursorAction::Click] {
+            let mut core = RenderStateCore::new(CursorConfig::default());
+            core.pos = (20.0, 20.0);
+            core.apply_command_base(
+                OverlayCommand::BeginAction {
+                    action,
+                    delivery: Some(DeliveryModifier::Background),
+                    target: Some(TargetModifier::Ax),
+                },
+                false,
+                false,
+            );
+            core.apply_command_base(
+                OverlayCommand::MoveTo {
+                    x: 200.0,
+                    y: 100.0,
+                    end_heading_radians: 0.0,
+                },
+                false,
+                false,
+            );
+            assert_eq!(core.visual.resolved_action, action);
+            assert_eq!(
+                (core.visual.delivery, core.visual.target),
+                (Some(DeliveryModifier::Background), Some(TargetModifier::Ax)),
+                "{action:?} after move"
+            );
+            core.apply_command_base(
+                OverlayCommand::ClickPulse { x: 200.0, y: 100.0 },
+                false,
+                false,
+            );
+            assert_eq!(core.visual.resolved_action, action);
+            assert_eq!(
+                (core.visual.delivery, core.visual.target),
+                (Some(DeliveryModifier::Background), Some(TargetModifier::Ax)),
+                "{action:?} after click pulse"
+            );
+            assert_eq!(
+                core.badge_modifiers,
+                Some((Some(DeliveryModifier::Background), Some(TargetModifier::Ax))),
+                "{action:?} badge context"
+            );
+        }
     }
 
     #[test]
@@ -1196,33 +1240,6 @@ mod session_badge_and_action_tests {
         assert_eq!(core.badge_modifier_fade_secs, None);
         assert_eq!(core.session_badge_chip_alpha(), 1.0);
     }
-
-    #[test]
-    fn click_pulse_preserves_declared_context_until_the_action_fades() {
-        let mut core = RenderStateCore::new(CursorConfig::default());
-        core.apply_command_base(
-            OverlayCommand::BeginAction {
-                action: CursorAction::Click,
-                delivery: Some(DeliveryModifier::Background),
-                target: Some(TargetModifier::Ax),
-            },
-            false,
-            false,
-        );
-        core.apply_command_base(
-            OverlayCommand::ClickPulse { x: 40.0, y: 60.0 },
-            false,
-            false,
-        );
-        assert_eq!(
-            (core.visual.delivery, core.visual.target),
-            (Some(DeliveryModifier::Background), Some(TargetModifier::Ax))
-        );
-        assert_eq!(
-            core.badge_modifiers,
-            Some((Some(DeliveryModifier::Background), Some(TargetModifier::Ax)))
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1273,6 +1290,22 @@ mod backing_scale_tests {
         let mut pm = tiny_skia::Pixmap::new(pm_size, pm_size).unwrap();
         paint_cursor(&mut pm, &core, 0.0, 0.0, None, backing_scale);
         pm
+    }
+
+    #[test]
+    fn cursor_pinned_to_an_off_workspace_window_paints_nothing() {
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        core.pos = (32.0, 32.0);
+        core.idle_alpha = 1.0;
+        core.visible = true;
+        core.pinned_target_off_workspace = true;
+        let mut pm = tiny_skia::Pixmap::new(64, 64).unwrap();
+        paint_cursor(&mut pm, &core, 0.0, 0.0, None, 1.0);
+        assert_eq!(visible_pixel_count(&pm), 0);
+
+        core.pinned_target_off_workspace = false;
+        paint_cursor(&mut pm, &core, 0.0, 0.0, None, 1.0);
+        assert!(visible_pixel_count(&pm) > 0);
     }
 
     /// The compiled artifact contains vector geometry. Skia must rasterize it

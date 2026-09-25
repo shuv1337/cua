@@ -650,7 +650,122 @@ fn invoke_operation(
         Delivery::Foreground => "foreground",
         Delivery::NotApplicable => unreachable!("catalog operations require delivery"),
     };
-    let pre = snapshot(driver, pid, window_id);
+    let resize_probe = !expect_refusal
+        && matches!(
+            row.operation,
+            Operation::PxClick {
+                button: "left",
+                count: 1,
+                ..
+            }
+        );
+    if resize_probe {
+        let config = driver.call(
+            "set_config",
+            serde_json::json!({"max_image_dimension": 200}),
+        );
+        assert!(
+            !config.is_error(),
+            "small capture config: {}",
+            config.text()
+        );
+    }
+    let mut pre = snapshot(driver, pid, window_id);
+    let _observer = if let Operation::PxClick { target, .. } = row.operation {
+        resize_probe.then(|| {
+            let small_width = pre.structured()["screenshot_width"]
+                .as_u64()
+                .expect("small screenshot width");
+            let (x, y, width, height) = element_rect(driver, pid, window_id, &pre, target);
+            let zoom = driver.call(
+                "zoom",
+                serde_json::json!({
+                    "pid": pid as i64, "window_id": window_id,
+                    "x1": x, "y1": y, "x2": x + width, "y2": y + height
+                }),
+            );
+            assert!(!zoom.is_error(), "create owned zoom context: {}", zoom.text());
+            let mut observer = driver
+                .spawn_peer_unrecorded()
+                .expect("start independent capture client on the same daemon");
+            let config = observer.call("set_config", serde_json::json!({"max_image_dimension": 0}));
+            assert!(
+                !config.is_error(),
+                "native capture config: {}",
+                config.text()
+            );
+            let other = snapshot(&mut observer, pid, window_id);
+            assert!(
+                other.structured()["screenshot_width"]
+                    .as_u64()
+                    .expect("native screenshot width")
+                    > small_width
+            );
+            for (tool, args) in [
+                (
+                    "double_click",
+                    serde_json::json!({"pid":pid as i64,"window_id":window_id,"x":x,"y":y,"delivery_mode":"foreground"}),
+                ),
+                (
+                    "right_click",
+                    serde_json::json!({"pid":pid as i64,"window_id":window_id,"x":x,"y":y,"delivery_mode":"foreground"}),
+                ),
+                (
+                    "scroll",
+                    serde_json::json!({"pid":pid as i64,"window_id":window_id,"x":x,"y":y,"direction":"down","amount":1,"delivery_mode":"foreground"}),
+                ),
+                (
+                    "drag",
+                    serde_json::json!({"pid":pid as i64,"window_id":window_id,"from_x":x,"from_y":y,"to_x":x+1.0,"to_y":y+1.0,"duration_ms":0,"steps":1,"delivery_mode":"foreground"}),
+                ),
+                (
+                    "mouse_button_down",
+                    serde_json::json!({"pid":pid as i64,"window_id":window_id,"x":x,"y":y}),
+                ),
+            ] {
+                let stale = driver.call(tool, args);
+                assert_eq!(
+                    stale.structured()["code"],
+                    "screenshot_context_missing",
+                    "{tool} must refuse another client's screenshot transform"
+                );
+            }
+            for (tool, args) in [
+                (
+                    "click",
+                    serde_json::json!({"pid":pid as i64,"window_id":window_id,"x":1.0,"y":1.0,"from_zoom":true,"delivery_mode":"foreground"}),
+                ),
+                (
+                    "drag",
+                    serde_json::json!({"pid":pid as i64,"window_id":window_id,"from_x":1.0,"from_y":1.0,"to_x":2.0,"to_y":2.0,"from_zoom":true,"duration_ms":0,"steps":1,"delivery_mode":"foreground"}),
+                ),
+                (
+                    "mouse_button_down",
+                    serde_json::json!({"pid":pid as i64,"window_id":window_id,"x":1.0,"y":1.0,"from_zoom":true}),
+                ),
+            ] {
+                let stale = driver.call(tool, args);
+                assert_eq!(
+                    stale.structured()["code"],
+                    "zoom_context_missing",
+                    "{tool} must refuse a zoom bound to the replaced snapshot"
+                );
+            }
+            let stale = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64, "window_id": window_id,
+                    "x": x + width / 2.0, "y": y + height / 2.0,
+                    "delivery_mode": mode
+                }),
+            );
+            assert_eq!(stale.structured()["code"], "screenshot_context_missing");
+            pre = snapshot(driver, pid, window_id);
+            observer
+        })
+    } else {
+        None
+    };
     assert!(
         !ax::looks_empty(pre.tree_text()),
         "required GTK3 AT-SPI tree is empty"
@@ -713,7 +828,15 @@ fn invoke_operation(
             count,
             expected,
         } => {
-            let (x, y, width, height) = element_rect(driver, pid, window_id, &pre, target);
+            // A native Wayland refusal is expected when compositor-attested
+            // capture geometry is unavailable. Use harmless coordinates so
+            // the driver can return its typed refusal without requiring a
+            // screenshot oracle that the compositor cannot prove.
+            let (x, y, width, height) = if expect_refusal {
+                (0.0, 0.0, 1.0, 1.0)
+            } else {
+                element_rect(driver, pid, window_id, &pre, target)
+            };
             let tool = if count == 2 {
                 "double_click"
             } else if button == "right" {
@@ -737,7 +860,11 @@ fn invoke_operation(
             text,
             expected,
         } => {
-            let (x, y, width, height) = element_rect(driver, pid, window_id, &pre, target);
+            let (x, y, width, height) = if expect_refusal {
+                (0.0, 0.0, 1.0, 1.0)
+            } else {
+                element_rect(driver, pid, window_id, &pre, target)
+            };
             (
                 driver.call(
                     "type_text",
@@ -780,7 +907,11 @@ fn invoke_operation(
                 "direction": "down", "amount": 6, "delivery_mode": mode
             });
             if pixel {
-                let (x, y, width, height) = element_rect(driver, pid, window_id, &pre, target);
+                let (x, y, width, height) = if expect_refusal {
+                    (0.0, 0.0, 1.0, 1.0)
+                } else {
+                    element_rect(driver, pid, window_id, &pre, target)
+                };
                 args["x"] = serde_json::json!(x + width / 2.0);
                 args["y"] = serde_json::json!(y + height / 2.0);
             } else {
@@ -797,11 +928,27 @@ fn invoke_operation(
                 "GTK3 scroll failed: {}",
                 response.text()
             );
+            if !pixel
+                && mode == "foreground"
+                && platform_linux::wayland::wayland_input_enabled()
+                && platform_linux::wayland::hyprland::is_session()
+            {
+                assert_eq!(
+                    response.action_route(),
+                    Some("accessibility"),
+                    "GTK3 AX scroll must use its semantic action: {}",
+                    response.raw
+                );
+            }
             wait_for_positive_state(driver, pid, window_id, state_key);
             return false;
         }
         Operation::Drag { target, state_key } => {
-            let (x, y, width, height) = element_rect(driver, pid, window_id, &pre, target);
+            let (x, y, width, height) = if expect_refusal {
+                (0.0, 0.0, 1.0, 1.0)
+            } else {
+                element_rect(driver, pid, window_id, &pre, target)
+            };
             let response = driver.call(
                 "drag",
                 serde_json::json!({
@@ -839,6 +986,17 @@ fn invoke_operation(
                 "GTK3 popover click failed: {}",
                 response.text()
             );
+            if mode == "foreground"
+                && platform_linux::wayland::wayland_input_enabled()
+                && platform_linux::wayland::hyprland::is_session()
+            {
+                assert_eq!(
+                    response.action_route(),
+                    Some("accessibility"),
+                    "GTK3 popover must use its semantic action: {}",
+                    response.raw
+                );
+            }
             wait_for_state(driver, pid, window_id, expected);
             assert_popover_marker(driver, pid, window_id);
             return false;
@@ -866,18 +1024,19 @@ fn row_expects_refusal(row: CatalogRow) -> bool {
     if row.delivery != Delivery::Background {
         return false;
     }
-    // A plain left single-click on an accessible GTK control is intentionally
-    // promoted from pixel targeting to the focus-free AT-SPI action bridge.
-    // The fixture target is accessible, so this catalog row must exercise the
-    // delivered bridge instead of the focus-bound pointer refusal path.
-    if matches!(
-        row.operation,
-        Operation::PxClick {
-            button: "left",
-            count: 1,
-            ..
-        }
-    ) {
+    // X11 promotes a plain left click on an accessible GTK control to the
+    // focus-free AT-SPI action bridge. Native Wayland still exercises the
+    // typed refusal because compositor-attested pixel geometry is unavailable.
+    if DisplayServer::current() == DisplayServer::X11
+        && matches!(
+            row.operation,
+            Operation::PxClick {
+                button: "left",
+                count: 1,
+                ..
+            }
+        )
+    {
         return false;
     }
     let inject_mode = std::env::var_os("CUA_INJECT_SOCKET").is_some();

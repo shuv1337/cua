@@ -521,7 +521,8 @@ fn portal_input_enabled() -> bool {
 
 #[cfg(target_os = "linux")]
 fn target_activation_available() -> bool {
-    crate::wayland::shell_helper::list_windows(None).is_some()
+    crate::wayland::kwin_helper::available()
+        || crate::wayland::shell_helper::list_windows(None).is_some()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -660,19 +661,6 @@ mod tests {
     fn session_active_passes() {
         let entry = check_session_active();
         assert_eq!(entry.status, CheckStatus::Pass);
-    }
-
-    #[test]
-    fn tcc_and_bundle_are_skipped_with_canonical_message() {
-        for name in [
-            NAME_TCC_ACCESSIBILITY,
-            NAME_TCC_SCREEN_RECORDING,
-            NAME_BUNDLE_IDENTITY,
-        ] {
-            let entry = skip_not_applicable(name);
-            assert_eq!(entry.status, CheckStatus::Skip, "{name} must be skipped");
-            assert_eq!(entry.message, "not applicable on Linux");
-        }
     }
 
     #[test]

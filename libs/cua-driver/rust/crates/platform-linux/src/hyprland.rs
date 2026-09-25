@@ -140,9 +140,9 @@ pub fn screenshot_display_bytes_grim() -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// True when running inside a Hyprland session (hyprctl reachable).
+/// Use the attested Wayland adapter's session gate for fork-only launch work.
 pub fn is_hyprland_session() -> bool {
-    std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
+    crate::wayland::hyprland::is_session()
 }
 
 /// Name of the currently focused monitor (e.g. "DP-1"), for selecting the

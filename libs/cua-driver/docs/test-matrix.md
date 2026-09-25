@@ -47,7 +47,7 @@ These run without the repo-local GUI applications:
 | MCP and CLI boundary | `rust/crates/cua-driver/tests/protocol_*` | Handshake, tool registration, tool calls, media, sessions, and errors |
 | Lifecycle sessions and target migration | Core `session`, `session_tools`, `action_target`, and compatibility `capture_scope` tests plus `session_capture_scope_test.rs` | One implicit session per transport, five-minute idle policy, in-flight and exact-once cleanup, owner-scoped inspection and revival, per-call target validation, and legacy capture-scope compatibility |
 | Tool-contract gate | `schema_consistency_test.rs` | Shared tool schema parity and reviewed risk metadata across OS backends |
-| Configuration transport | `transport_config_persistence_test.rs` | CLI and MCP configuration persistence |
+| Configuration transport | `transport_config_persistence_test.rs` | CLI configuration persistence across daemon-backed processes |
 | Token and protocol surfaces | `protocol_element_token_test.rs`, related tests | JSON-RPC-visible contract behavior |
 | Permission modes and policy startup | `permission_policy_startup_test.rs`, `daemon_required_test.rs`, core `authorization`, `policy`, and `session_manifest` tests | Fail-before-bind policy loading, managed/user intersection, immutable standard/autonomous/unrestricted startup, danger acknowledgement, admin disable, deny-by-default manifests, and canonical daemon dispatch |
 | Protected browser grants | Core `consent`, `browser::grant`, `browser::engine`, and `browser::v2_tests` | Exact request digests, provider authentication seam and deadline, persistent-indicator activation, Stop/session teardown, forged legacy artifact refusal, exact PID/window manifest scope, and the live-origin decision path used before mutation |
@@ -127,6 +127,12 @@ background delivery and attach desktop-side-effect oracles.
 | Installed-app launch/focus | `installed_app_launch_macos_test.rs` | Real Calculator/TextEdit launch and focus behavior in the canonical logged-in lane |
 | Installed-app text | `installed_app_textedit_macos_test.rs` | Real TextEdit AX background write and verification in the canonical logged-in lane |
 
+The AppKit `snapshot_publication` regression holds a fixture PNG write with FIFO
+backpressure while replacing a button at the same AX index. It exercises the
+built-in `get_window_state` and `click` tools and uses an independent fixture
+activation journal to reject wrong-target activation and verify fresh-token
+recovery. The macOS runner includes this regression.
+
 macOS uses the installed ScreenCaptureKit/AX permissions for GUI runs. Its
 maintainer acceptance gate runs in a disposable clone of the stopped Lume
 SIP-off golden image described in the [macOS Lume runner
@@ -189,7 +195,7 @@ allowed, and the desktop-side-effect oracles pass.
 | Linux Sway Harness E2E | Controlled wlroots session | `scripts/ci/linux/run-rust-e2e-wayland.sh` |
 | Linux nested-compositor E2E | Controlled experimental session | `scripts/ci/linux/run-rust-e2e-inject.sh` |
 | Linux representative desktop E2E | Existing GNOME, KDE, or Xorg login | `scripts/ci/linux/run-rust-e2e-desktop.sh <desktop>` |
-| macOS Harness E2E | Maintainer Lume SIP-off worker with a logged-in session and inherited grants | `libs/cua-driver/tests/runners/macos-lume/run-all.sh` |
+| macOS Harness E2E | Maintainer Lume SIP-off worker with a logged-in session and inherited grants, or a disposable worker prepared with the checked-in macOS consent seed helper | `libs/cua-driver/tests/runners/macos-lume/run-all.sh` |
 
 Workflows select private execution lanes. Rust source owns scenario definitions,
 fixture oracles, and result records. OS runners only build the driver, stage the

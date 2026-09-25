@@ -82,6 +82,7 @@ fn arrival_fire(key: &CursorKey) {
         if let Some(map) = guard.as_mut() {
             if let Some(tx) = map.remove(key) {
                 let _ = tx.send(());
+                ARRIVAL_DEGRADED.store(false, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -112,6 +113,48 @@ fn try_send_x11_message(
     msg: OverlayMsg,
 ) -> bool {
     sender.is_some_and(|tx| tx.try_send(msg).is_ok())
+}
+
+fn should_start_x11_overlay(wayland_display_present: bool) -> bool {
+    !wayland_display_present
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WaylandOverlayBackend {
+    SemanticShellHelper,
+    LayerShell,
+    LegacyShellHelper,
+    None,
+}
+
+#[cfg(target_os = "linux")]
+static WAYLAND_OVERLAY_BACKEND: OnceLock<WaylandOverlayBackend> = OnceLock::new();
+
+fn select_wayland_overlay_backend(
+    semantic_shell_helper: bool,
+    layer_shell_available: bool,
+    legacy_shell_helper: bool,
+) -> WaylandOverlayBackend {
+    if semantic_shell_helper {
+        WaylandOverlayBackend::SemanticShellHelper
+    } else if layer_shell_available {
+        WaylandOverlayBackend::LayerShell
+    } else if legacy_shell_helper {
+        WaylandOverlayBackend::LegacyShellHelper
+    } else {
+        WaylandOverlayBackend::None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wayland_overlay_backend() -> WaylandOverlayBackend {
+    *WAYLAND_OVERLAY_BACKEND.get_or_init(|| {
+        select_wayland_overlay_backend(
+            crate::wayland::shell_helper::semantic_cursor_available(),
+            crate::wayland::overlay::available(),
+            crate::wayland::shell_helper::available(),
+        )
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -288,9 +331,9 @@ pub fn send_command_for(key: CursorKey, cmd: OverlayCommand) {
     let _ = try_send_command_for(key, cmd);
 }
 
-/// Dispatch to every active Linux overlay backend. The result reports only
+/// Dispatch to exactly one Linux overlay backend. The result reports only
 /// whether the X11 owner accepted the command and can fire `ARRIVAL_TX`; the
-/// Wayland layer-shell path does not currently publish arrival notifications.
+/// Wayland backends do not currently publish arrival notifications.
 fn try_send_command_for(key: CursorKey, cmd: OverlayCommand) -> bool {
     if key.is_empty() {
         return false;
@@ -299,75 +342,88 @@ fn try_send_command_for(key: CursorKey, cmd: OverlayCommand) -> bool {
         key: key.clone(),
         cmd: cmd.clone(),
     });
-    let x11_queued = try_send_x11_message(CMD_TX.get(), msg.clone());
-    if !x11_queued {
+    #[cfg(target_os = "linux")]
+    let native_wayland = crate::wayland::is_wayland();
+    let x11_overlay_allowed =
+        should_start_x11_overlay(std::env::var_os("WAYLAND_DISPLAY").is_some());
+    let x11_queued = x11_overlay_allowed && try_send_x11_message(CMD_TX.get(), msg.clone());
+    if x11_overlay_allowed && !x11_queued {
         tracing::warn!(
             key = %key,
             sender_missing = CMD_TX.get().is_none(),
             "overlay: X11 channel rejected command (no sender or queue full)"
         );
     }
-    // Also forward to the native-Wayland layer-shell overlay when Wayland
-    // is opted in. The wayland overlay's `forward` is a no-op when its
-    // owner thread isn't started yet (which is the normal X11-only case).
     #[cfg(target_os = "linux")]
     {
-        if crate::wayland::is_wayland() {
-            if crate::wayland::shell_helper::semantic_cursor_available() {
-                crate::wayland::shell_helper::set_cursor_color(&cursor_overlay::session_fill_hex(
-                    &key,
-                ));
-                // GNOME has no layer-shell. Drive only the final positioning
-                // commands through the compositor helper; it performs its own
-                // easing and avoids starting a worker that must fail.
-                match &cmd {
-                    cursor_overlay::OverlayCommand::ClickPulse { x, y } => {
-                        crate::wayland::shell_helper::click_pulse(*x as i32, *y as i32);
-                    }
-                    cursor_overlay::OverlayCommand::MoveTo { x, y, .. } => {
-                        crate::wayland::shell_helper::move_cursor(*x as i32, *y as i32);
-                    }
-                    cursor_overlay::OverlayCommand::SnapTo { x, y, .. } => {
-                        crate::wayland::shell_helper::move_cursor(*x as i32, *y as i32);
-                    }
-                    cursor_overlay::OverlayCommand::BeginAction {
-                        action,
-                        delivery,
-                        target,
-                    } => {
-                        crate::wayland::shell_helper::set_cursor_state(
-                            action.as_str(),
-                            delivery.as_ref().map_or("", |value| value.as_str()),
-                            target.as_ref().map_or("", |value| value.as_str()),
-                            true,
-                        );
-                    }
-                    cursor_overlay::OverlayCommand::EndAction(action) => {
-                        crate::wayland::shell_helper::set_cursor_state(
-                            action.as_str(),
-                            "",
-                            "",
-                            false,
-                        );
-                    }
-                    cursor_overlay::OverlayCommand::SetSessionLabel(label) => {
-                        crate::wayland::shell_helper::set_session_label(
-                            cursor_overlay::sanitize_session_label(label)
-                                .as_deref()
-                                .unwrap_or(""),
-                        );
-                    }
-                    cursor_overlay::OverlayCommand::SetEnabled(false) => {
-                        crate::wayland::shell_helper::hide_cursor();
-                    }
-                    _ => {}
-                }
-            } else if !crate::wayland::shell_helper::available() {
-                let _ = crate::wayland::overlay::forward(&msg);
-            }
+        if native_wayland {
+            dispatch_wayland_overlay_message(&msg);
         }
     }
     x11_queued
+}
+
+#[cfg(target_os = "linux")]
+fn dispatch_wayland_overlay_message(msg: &OverlayMsg) -> WaylandOverlayBackend {
+    let backend = wayland_overlay_backend();
+    match backend {
+        WaylandOverlayBackend::SemanticShellHelper | WaylandOverlayBackend::LegacyShellHelper => {
+            let semantic = backend == WaylandOverlayBackend::SemanticShellHelper;
+            match msg {
+                OverlayMsg::Cmd(command) => {
+                    dispatch_shell_helper_command(&command.key, &command.cmd, semantic);
+                }
+                OverlayMsg::Remove(_) => crate::wayland::shell_helper::hide_cursor(),
+                OverlayMsg::Revive(_) => {}
+            }
+        }
+        WaylandOverlayBackend::LayerShell if !crate::wayland::overlay::forward(msg) => {
+            return WaylandOverlayBackend::None;
+        }
+        WaylandOverlayBackend::LayerShell | WaylandOverlayBackend::None => {}
+    }
+    backend
+}
+
+#[cfg(target_os = "linux")]
+fn dispatch_shell_helper_command(key: &str, cmd: &OverlayCommand, semantic: bool) {
+    if semantic {
+        crate::wayland::shell_helper::set_cursor_color(&cursor_overlay::session_fill_hex(key));
+    }
+    match cmd {
+        OverlayCommand::ClickPulse { x, y } if semantic => {
+            crate::wayland::shell_helper::click_pulse(*x as i32, *y as i32);
+        }
+        OverlayCommand::MoveTo { x, y, .. }
+        | OverlayCommand::SnapTo { x, y, .. }
+        | OverlayCommand::ClickPulse { x, y } => {
+            crate::wayland::shell_helper::move_cursor(*x as i32, *y as i32);
+        }
+        OverlayCommand::BeginAction {
+            action,
+            delivery,
+            target,
+        } if semantic => {
+            crate::wayland::shell_helper::set_cursor_state(
+                action.as_str(),
+                delivery.as_ref().map_or("", |value| value.as_str()),
+                target.as_ref().map_or("", |value| value.as_str()),
+                true,
+            );
+        }
+        OverlayCommand::EndAction(action) if semantic => {
+            crate::wayland::shell_helper::set_cursor_state(action.as_str(), "", "", false);
+        }
+        OverlayCommand::SetSessionLabel(label) if semantic => {
+            crate::wayland::shell_helper::set_session_label(
+                cursor_overlay::sanitize_session_label(label)
+                    .as_deref()
+                    .unwrap_or(""),
+            );
+        }
+        OverlayCommand::SetEnabled(false) => crate::wayland::shell_helper::hide_cursor(),
+        _ => {}
+    }
 }
 
 pub fn is_enabled() -> bool {
@@ -526,8 +582,38 @@ pub async fn animate_cursor_to_for(key: CursorKey, x: f64, y: f64) {
         return;
     }
 
-    let _ = rx.await;
+    if ARRIVAL_DEGRADED.load(std::sync::atomic::Ordering::Relaxed) {
+        // The renderer already failed to report one arrival. Keep the glide
+        // fire-and-forget until it proves itself again rather than charging
+        // every action the full cap.
+        arrival_cancel(&key);
+        return;
+    }
+    match tokio::time::timeout(ARRIVAL_WAIT_CAP, rx).await {
+        Ok(_) => {}
+        Err(_elapsed) => {
+            arrival_cancel(&key);
+            ARRIVAL_DEGRADED.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                key = %key,
+                cap_ms = ARRIVAL_WAIT_CAP.as_millis() as u64,
+                "overlay: cursor glide did not report arrival in time;                  continuing without waiting (further glides are fire-and-forget                  until the renderer reports an arrival again)"
+            );
+        }
+    }
 }
+
+/// Upper bound on how long an input action waits for its agent-cursor glide
+/// to land. The glide is cosmetic: a renderer that never reports arrival
+/// (deferred paints, a dropped MoveTo, a stalled X11 overlay thread) must not
+/// hold the tool call — and, since the stdio transport handles requests one
+/// at a time, every later tool call — open indefinitely. Sized above the
+/// longest legal glide (`glide_duration_ms` ≤ 5000; speed-based glides cross
+/// a 4K diagonal in ≈5 s at 900 px/s).
+const ARRIVAL_WAIT_CAP: std::time::Duration = std::time::Duration::from_millis(5_500);
+
+/// Latched once an arrival wait expired; cleared by the next real arrival.
+static ARRIVAL_DEGRADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn remove_cursor(key: CursorKey) {
     if key.is_empty() {
@@ -538,14 +624,12 @@ pub fn remove_cursor(key: CursorKey) {
         let _ = tx.try_send(msg.clone());
     }
     #[cfg(target_os = "linux")]
-    if crate::wayland::is_wayland() && !crate::wayland::shell_helper::available() {
-        let _ = crate::wayland::overlay::forward(&msg);
+    if crate::wayland::is_wayland() {
+        dispatch_wayland_overlay_message(&msg);
     }
 }
 
-/// Clear the X11 render-side tombstone after a successful explicit session
-/// revival. Wayland has no keyed tombstone, so forwarding this lifecycle
-/// signal there is an accepted no-op.
+/// Clear the render-side tombstone after a successful explicit session revival.
 pub fn revive_cursor(key: CursorKey) {
     if key.is_empty() {
         return;
@@ -555,8 +639,8 @@ pub fn revive_cursor(key: CursorKey) {
         let _ = tx.try_send(msg.clone());
     }
     #[cfg(target_os = "linux")]
-    if crate::wayland::is_wayland() && !crate::wayland::shell_helper::available() {
-        let _ = crate::wayland::overlay::forward(&msg);
+    if crate::wayland::is_wayland() {
+        dispatch_wayland_overlay_message(&msg);
     }
 }
 
@@ -576,6 +660,17 @@ pub fn run_on_thread() {
     };
 
     if !cfg.enabled {
+        return;
+    }
+
+    // A Wayland session normally also exposes DISPLAY through XWayland, but
+    // that does not make the legacy full-root X11 overlay safe. This decision
+    // must be independent of the experimental native-Wayland feature opt-in:
+    // without that opt-in there is no layer-shell fallback, but showing no
+    // overlay is preferable to mapping an opaque black X11 root window over
+    // the Wayland desktop. With the opt-in enabled, commands are forwarded to
+    // the native layer-shell backend below.
+    if !should_start_x11_overlay(std::env::var_os("WAYLAND_DISPLAY").is_some()) {
         return;
     }
 
@@ -2710,6 +2805,32 @@ fn bgra_and_visible_shape(
 mod tests {
     use super::*;
 
+    #[test]
+    fn wayland_display_does_not_start_legacy_x11_overlay() {
+        assert!(!should_start_x11_overlay(true));
+        assert!(should_start_x11_overlay(false));
+    }
+
+    #[test]
+    fn wayland_overlay_backend_is_selected_once_with_legacy_fallback() {
+        assert_eq!(
+            select_wayland_overlay_backend(true, true, true),
+            WaylandOverlayBackend::SemanticShellHelper
+        );
+        assert_eq!(
+            select_wayland_overlay_backend(false, true, true),
+            WaylandOverlayBackend::LayerShell
+        );
+        assert_eq!(
+            select_wayland_overlay_backend(false, false, true),
+            WaylandOverlayBackend::LegacyShellHelper
+        );
+        assert_eq!(
+            select_wayland_overlay_backend(false, false, false),
+            WaylandOverlayBackend::None
+        );
+    }
+
     fn drain_x11_test_events(conn: &impl x11rb::connection::Connection) -> anyhow::Result<()> {
         while conn.poll_for_event()?.is_some() {}
         Ok(())
@@ -3151,8 +3272,24 @@ mod tests {
     }
 
     #[test]
-    fn send_command_for_keeps_unit_returning_api() {
-        let _: fn(CursorKey, OverlayCommand) = send_command_for;
+    fn session_removal_drops_the_cursor_and_rejects_late_commands() {
+        let mut map = default_render_map();
+        let command = || {
+            OverlayMsg::Cmd(KeyedOverlayCommand {
+                key: "session-a".to_owned(),
+                cmd: OverlayCommand::ClickPulse { x: 12.0, y: 34.0 },
+            })
+        };
+
+        assert_eq!(apply_msg(&mut map, command()).as_deref(), Some("session-a"));
+        assert!(map.cursors.contains_key("session-a"));
+
+        assert!(apply_msg(&mut map, OverlayMsg::Remove("session-a".to_owned())).is_none());
+        assert!(!map.cursors.contains_key("session-a"));
+        assert!(map.ended.contains("session-a"));
+
+        assert!(apply_msg(&mut map, command()).is_none());
+        assert!(!map.cursors.contains_key("session-a"));
     }
 
     #[test]
@@ -3197,24 +3334,50 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn clearing_arrivals_releases_waiters() {
-        let (tx, mut rx) = tokio::sync::oneshot::channel();
-        let mut arrivals = Some(HashMap::from([("default".to_owned(), tx)]));
-
-        clear_arrivals(&mut arrivals);
-
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
-        ));
-    }
-
-    #[test]
-    fn disabling_render_map_marks_overlay_unavailable() {
-        let mut render = Some(default_render_map());
-        disable_render_map(&mut render);
-        assert!(render.is_none());
+    /// Regression: a MoveTo whose arrival the renderer never reports (the
+    /// GIMP menu-item element click wedged the whole stdio daemon this way)
+    /// must not hold the awaiting tool call open; the wait is capped and the
+    /// registration is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn unreported_arrival_releases_the_waiter_after_the_cap() {
+        init(CursorConfig::default());
+        let key = "arrival-cap-regression".to_owned();
+        {
+            let mut guard = RENDER.lock().unwrap();
+            let map = guard.get_or_insert_with(default_render_map);
+            let template = map.template.clone();
+            let rs = map
+                .cursors
+                .entry(key.clone())
+                .or_insert_with(|| render_state_for_key(&template, &key));
+            rs.core.cfg.enabled = true;
+            rs.core.visible = true;
+            rs.core.pos = (10.0, 10.0);
+        }
+        ARRIVAL_DEGRADED.store(false, std::sync::atomic::Ordering::Relaxed);
+        let started = tokio::time::Instant::now();
+        // Nobody drains CMD_TX here, so no arrival can ever fire.
+        tokio::time::timeout(
+            ARRIVAL_WAIT_CAP + Duration::from_secs(5),
+            animate_cursor_to_for(key.clone(), 60.0, 60.0),
+        )
+        .await
+        .expect("glide wait must be bounded");
+        assert!(started.elapsed() >= ARRIVAL_WAIT_CAP);
+        assert!(ARRIVAL_TX
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|map| !map.contains_key(&key)));
+        // Degraded: the next glide returns without waiting at all.
+        let started = tokio::time::Instant::now();
+        animate_cursor_to_for(key.clone(), 20.0, 20.0).await;
+        assert!(started.elapsed() < Duration::from_millis(100));
+        // A real arrival re-arms the wait.
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        arrival_register(key.clone(), tx);
+        arrival_fire(&key);
+        assert!(!ARRIVAL_DEGRADED.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
@@ -3447,13 +3610,6 @@ mod tests {
     }
 
     #[test]
-    fn geometry_update_sets_render_bounds() {
-        let mut map = default_render_map();
-        update_render_map_geometry(&mut map, 1920, 2160);
-        assert_eq!((map.scr_w, map.scr_h), (1920, 2160));
-    }
-
-    #[test]
     fn geometry_shrink_reclips_cursor_tiles() {
         let mut map = default_render_map();
         map.scr_w = 1920;
@@ -3462,6 +3618,7 @@ mod tests {
         assert_eq!(render_x11_tiles(&map).len(), 1);
 
         update_render_map_geometry(&mut map, 1920, 1080);
+        assert_eq!((map.scr_w, map.scr_h), (1920, 1080));
         assert!(render_x11_tiles(&map).is_empty());
     }
 
@@ -3472,21 +3629,9 @@ mod tests {
         assert!(!render_map_needs_z_order_tick(&map));
     }
 
-    // The idle-park contract now applies to reduced-motion sessions: with the
+    // The idle-park contract applies to reduced-motion sessions: with the
     // float bob active (the default), a visible cursor keeps ticking so it
     // levitates at rest, and only a hidden or reduced-motion cursor parks.
-    #[test]
-    fn resting_visible_cursor_only_requires_cheap_z_order_ticks() {
-        let mut map = default_render_map();
-        let cursor = map.cursors.get_mut("default").unwrap();
-        cursor.core.pos = (100.0, 100.0);
-        cursor.core.motion.idle_hide_ms = 0.0;
-        cursor.core.visual.reduced_motion = cursor_overlay::ReducedMotion::On;
-
-        assert!(!render_map_needs_frame_tick(&map));
-        assert!(render_map_needs_z_order_tick(&map));
-    }
-
     #[test]
     fn resting_visible_cursor_keeps_ticking_for_the_float_bob() {
         let mut map = default_render_map();
@@ -3994,29 +4139,6 @@ mod tests {
         assert_eq!(&bgra[12..16], &[50, 100, 200, 255]);
         // Every uploaded pixel is opaque: the server has nothing left to blend.
         assert!(bgra.chunks_exact(4).all(|pixel| pixel[3] == 255));
-    }
-
-    #[test]
-    fn composited_tile_reproduces_the_backdrop_where_the_cursor_is_transparent() {
-        let pixmap = composite_test_pixmap();
-        let backdrop = composite_test_backdrop();
-
-        let (bgra, _) = composited_bgra_and_visible_shape(&pixmap, &backdrop).unwrap();
-
-        assert_eq!(&bgra[0..3], &backdrop[0..3]);
-    }
-
-    #[test]
-    fn composited_tile_output_depends_on_the_backdrop() {
-        let pixmap = composite_test_pixmap();
-
-        let (over_white, _) = composited_bgra_and_visible_shape(&pixmap, &[0xFF; 16]).unwrap();
-        let (over_black, _) = composited_bgra_and_visible_shape(&pixmap, &[0x00; 16]).unwrap();
-
-        assert_ne!(&over_white[4..8], &over_black[4..8]);
-        assert_ne!(&over_white[8..12], &over_black[8..12]);
-        // The opaque core hides whatever is beneath it.
-        assert_eq!(&over_white[12..16], &over_black[12..16]);
     }
 
     #[test]

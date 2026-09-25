@@ -12,13 +12,21 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 RUN_ALL = REPO_ROOT / "libs/cua-driver/tests/runners/macos-lume/run-all.sh"
+SEED_TCC = REPO_ROOT / "libs/cua-driver/tests/runners/macos-lume/seed-tcc.sh"
+SEED_TCC_GUEST = REPO_ROOT / "libs/cua-driver/tests/runners/macos-lume/seed-tcc-guest.sh"
+HARNESS_GUIDE = REPO_ROOT / "libs/cua-driver/docs/test-harnesses-guide.md"
+PUBLIC_LUME_TEST_GUIDE = (
+    REPO_ROOT / "docs/content/docs/how-to-guides/driver/run-tests-in-macos-lume-vm.mdx"
+)
 RUN_RUST_E2E = REPO_ROOT / "scripts/ci/macos/run-rust-e2e.sh"
 ELECTRON_BUILD = REPO_ROOT / "libs/cua-driver/tests/fixtures/apps/cross-platform/electron/build.sh"
 ELECTRON_LOCK = (
@@ -76,7 +84,7 @@ def _fields(output: str) -> dict[str, str]:
 
 @pytest.mark.parametrize(
     "script",
-    [RUN_ALL, RUN_RUST_E2E, ELECTRON_BUILD, TAURI_BUILD],
+    [RUN_ALL, RUN_RUST_E2E, SEED_TCC, SEED_TCC_GUEST, ELECTRON_BUILD, TAURI_BUILD],
     ids=lambda path: f"{path.parent.name}/{path.name}",
 )
 def test_runner_scripts_have_valid_bash_syntax(script: Path) -> None:
@@ -181,6 +189,230 @@ def test_no_permission_mode_check_pipes_into_grep(script: Path) -> None:
 
 
 # --------------------------------------------------------------------------
+# SIP-off TCC seed helper
+# --------------------------------------------------------------------------
+
+
+def test_tcc_guest_seed_is_vm_and_sip_gated() -> None:
+    text = SEED_TCC_GUEST.read_text(encoding="utf-8")
+    assert re.search(r'\[\[ "\$\{MODEL\}" == VirtualMac\* \]\] \|\| fail', text)
+    assert "csrutil status" in text
+    assert 'fail "system TCC.db is SIP-protected' in text
+
+
+def test_tcc_guest_seed_refuses_non_virtualmac_before_tcc_access() -> None:
+    completed = subprocess.run(
+        ["bash", str(SEED_TCC_GUEST)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 2
+    assert "seed-tcc:" in completed.stderr
+    assert "sqlite3" not in completed.stderr
+
+
+def _guest_seed_assignment(name: str) -> str:
+    text = SEED_TCC_GUEST.read_text(encoding="utf-8")
+    match = re.search(rf'^{name}="(?P<body>.*?)"', text, re.DOTALL | re.MULTILINE)
+    assert match is not None
+    return match.group("body")
+
+
+def test_tcc_guest_seed_grants_both_driver_permissions() -> None:
+    text = SEED_TCC_GUEST.read_text(encoding="utf-8")
+    sql_body = _guest_seed_assignment("SQL")
+    assert re.search(
+        r"\('kTCCServiceAccessibility','\$\{CLIENT_SQL\}',\$\{CLIENT_TYPE\},2,2,1,",
+        sql_body,
+    )
+    assert re.search(
+        r"\('kTCCServiceScreenCapture','\$\{CLIENT_SQL\}',\$\{CLIENT_TYPE\},2,2,1,",
+        sql_body,
+    )
+    assert "auth_value" in sql_body
+    assert "csreq" in sql_body
+    assert "allowed" not in sql_body
+    assert "auth_value=2" in text
+    assert "com.trycua.driver.local" in text
+
+
+def test_tcc_guest_seed_sql_executes_against_modern_tcc_schema(tmp_path: Path) -> None:
+    sql_body = _guest_seed_assignment("SQL")
+    verify_sql = _guest_seed_assignment("VERIFY_SQL")
+    client = "com.trycua.driver.local"
+    client_type = "0"
+    csreq_hex = "01020304"
+    substitutions = {
+        "${CLIENT_SQL}": client,
+        "${CLIENT_TYPE}": client_type,
+        "${CSREQ_HEX}": csreq_hex,
+    }
+    for old, new in substitutions.items():
+        sql_body = sql_body.replace(old, new)
+        verify_sql = verify_sql.replace(old, new)
+
+    db = tmp_path / "TCC.db"
+    with sqlite3.connect(db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE access(
+              service TEXT NOT NULL,
+              client TEXT NOT NULL,
+              client_type INTEGER NOT NULL,
+              auth_value INTEGER,
+              auth_reason INTEGER,
+              auth_version INTEGER,
+              csreq BLOB,
+              flags INTEGER,
+              indirect_object_identifier_type INTEGER,
+              indirect_object_identifier TEXT DEFAULT 'UNUSED',
+              indirect_object_code_identity BLOB,
+              last_modified INTEGER DEFAULT 0
+            );
+            """
+        )
+        conn.executescript(sql_body)
+        row_count = conn.execute(verify_sql).fetchone()[0]
+        rows = conn.execute(
+            """
+            SELECT service, client, client_type, auth_value, auth_reason,
+                   auth_version, hex(csreq), indirect_object_identifier
+              FROM access
+             ORDER BY service
+            """
+        ).fetchall()
+
+    assert row_count == 2
+    assert rows == [
+        (
+            "kTCCServiceAccessibility",
+            client,
+            0,
+            2,
+            2,
+            1,
+            csreq_hex.upper(),
+            "UNUSED",
+        ),
+        (
+            "kTCCServiceScreenCapture",
+            client,
+            0,
+            2,
+            2,
+            1,
+            csreq_hex.upper(),
+            "UNUSED",
+        ),
+    ]
+
+
+def test_tcc_guest_seed_requires_certificate_backed_requirement_by_default() -> None:
+    text = SEED_TCC_GUEST.read_text(encoding="utf-8")
+    assert '[[ "${ALLOW_ADHOC}" != 1 ]]' in text
+    assert "^Signature=adhoc$" in text
+    assert 'certificate (leaf|root) = H"[[:xdigit:]]{40}"' in text
+    assert "is not signed with a certificate-backed identity" in text
+
+
+def test_tcc_host_seed_accepts_multiple_vms() -> None:
+    text = SEED_TCC.read_text(encoding="utf-8")
+    assert 'VMS+=("$1")' in text
+    assert 'for vm in "${VMS[@]}"; do' in text
+    assert "seed-tcc-guest.sh" in text
+    assert "CUA_TCC_READ_SUDO_PASSWORD=1" in text
+
+
+@pytest.mark.parametrize(
+    "document",
+    [HARNESS_GUIDE, PUBLIC_LUME_TEST_GUIDE],
+    ids=lambda path: path.name,
+)
+def test_harness_guides_route_automated_tcc_through_guarded_helper(document: Path) -> None:
+    text = document.read_text(encoding="utf-8")
+    assert "tests/runners/macos-lume/seed-tcc.sh" in text
+    assert "VirtualMac" in text
+    assert "SIP" in text
+    assert "certificate" in text
+    assert "TCC.db" in text
+    assert "rows alone" in text or "helper exit alone" in text
+
+
+def test_tcc_host_seed_runs_the_guest_helper_once_per_vm(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_lume = fake_bin / "lume"
+    fake_scp = fake_bin / "scp"
+    fake_ssh = fake_bin / "ssh"
+    log = tmp_path / "transport.log"
+    _write_executable(
+        fake_lume,
+        """printf 'lume %s\n' "$*" >> "$CUA_TEST_TRANSPORT_LOG"
+if [ "$1" = "get" ]; then
+  case "$2" in
+    worker-a) ip="192.0.2.10" ;;
+    worker-b) ip="192.0.2.11" ;;
+    *) exit 2 ;;
+  esac
+  printf '[{"name":"%s","status":"running","sshAvailable":true,"ipAddress":"%s"}]\n' "$2" "$ip"
+fi
+""",
+    )
+    _write_executable(
+        fake_scp,
+        """printf 'scp askpass=%s pass=%s %s\n' "${SSH_ASKPASS_REQUIRE:-}" "${CUA_TCC_SSH_PASSWORD:-}" "$*" >> "$CUA_TEST_TRANSPORT_LOG"
+""",
+    )
+    _write_executable(
+        fake_ssh,
+        """stdin="$(cat || true)"
+printf 'ssh askpass=%s pass=%s stdin=%s %s\n' "${SSH_ASKPASS_REQUIRE:-}" "${CUA_TCC_SSH_PASSWORD:-}" "$stdin" "$*" >> "$CUA_TEST_TRANSPORT_LOG"
+""",
+    )
+
+    completed = subprocess.run(
+        [
+            "bash",
+            str(SEED_TCC),
+            "--timeout",
+            "5",
+            "worker-a",
+            "worker-b",
+        ],
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "CUA_TEST_TRANSPORT_LOG": str(log),
+            "CUA_TCC_SUDO_PASSWORD": "fixture-password",
+            "LUME_SSH_USER": "lume",
+            "LUME_STORAGE": "",
+        },
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    calls = log.read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 10
+    assert calls[0] == "lume get worker-a --format json"
+    assert calls[1].startswith("scp askpass=force pass=lume -o StrictHostKeyChecking=no ")
+    assert "seed-tcc-guest.sh" in calls[1]
+    assert calls[1].endswith(" lume@192.0.2.10:/tmp/cua-driver-seed-tcc-guest.sh")
+    assert calls[2].endswith(" lume@192.0.2.10 chmod 700 /tmp/cua-driver-seed-tcc-guest.sh")
+    assert "stdin=fixture-password" in calls[3]
+    assert "CUA_TCC_READ_SUDO_PASSWORD=1 /tmp/cua-driver-seed-tcc-guest.sh" in calls[3]
+    assert calls[4].endswith(" lume@192.0.2.10 /bin/rm -f /tmp/cua-driver-seed-tcc-guest.sh")
+    assert calls[5] == "lume get worker-b --format json"
+    assert calls[6].endswith(" lume@192.0.2.11:/tmp/cua-driver-seed-tcc-guest.sh")
+    assert calls[7].endswith(" lume@192.0.2.11 chmod 700 /tmp/cua-driver-seed-tcc-guest.sh")
+    assert "stdin=fixture-password" in calls[8]
+    assert "CUA_TCC_READ_SUDO_PASSWORD=1 /tmp/cua-driver-seed-tcc-guest.sh" in calls[8]
+    assert calls[9].endswith(" lume@192.0.2.11 /bin/rm -f /tmp/cua-driver-seed-tcc-guest.sh")
+
+
+# --------------------------------------------------------------------------
 # Build namespace selection
 # --------------------------------------------------------------------------
 
@@ -273,6 +505,68 @@ def test_previous_artifact_run_is_preserved_without_mixing_results(tmp_path: Pat
     )
 
 
+def test_screen_capture_approval_is_written_reloaded_and_verified(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    calls = tmp_path / "calls.txt"
+    approvals = tmp_path / "preferences/ScreenCaptureApprovals.plist"
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    _write_executable(
+        fake_bin / "defaults",
+        """printf 'defaults %s\n' "$*" >> "$CUA_TEST_CALLS"
+if [ "$1" = "read" ]; then
+  printf '{\n    kScreenCaptureApprovalLastAlerted = "3024-01-01 00:00:00 +0000";\n    kScreenCaptureApprovalLastUsed = "3024-01-01 00:00:00 +0000";\n}\n'
+fi
+""",
+    )
+    _write_executable(
+        fake_bin / "killall",
+        """printf 'killall %s\n' "$*" >> "$CUA_TEST_CALLS"
+""",
+    )
+    completed = _run(
+        RUN_ALL,
+        'ARTIFACT_DIR="$TEST_ARTIFACT_DIR"\n'
+        'SCREEN_CAPTURE_APPROVALS="$TEST_APPROVALS"\n'
+        "setup_screen_capture_approval\n",
+        env={
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "CUA_TEST_CALLS": str(calls),
+            "TEST_APPROVALS": str(approvals),
+            "TEST_ARTIFACT_DIR": str(artifact_dir),
+        },
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert approvals.parent.is_dir()
+    recorded = calls.read_text(encoding="utf-8").splitlines()
+    assert recorded == [
+        f"defaults write {approvals} com.trycua.driver.local -dict "
+        "kScreenCaptureApprovalLastAlerted -date 3024-01-01 00:00:00 +0000 "
+        "kScreenCaptureApprovalLastUsed -date 3024-01-01 00:00:00 +0000",
+        "killall -HUP replayd",
+        f"defaults read {approvals} com.trycua.driver.local",
+    ]
+    evidence = (artifact_dir / "screen-capture-approval.txt").read_text(encoding="utf-8")
+    assert "kScreenCaptureApprovalLastAlerted" in evidence
+    assert "kScreenCaptureApprovalLastUsed" in evidence
+
+
+def test_screen_capture_approval_precedes_capture_capability_probe() -> None:
+    text = RUN_ALL.read_text(encoding="utf-8")
+    main = text.split('if [[ "${CUA_E2E_RUNNER_LIB_ONLY:-0}" == 1 ]]', 1)[1]
+    approval = main.index("setup_screen_capture_approval")
+    assert approval < main.index('"${INSTALLED_BIN}" permissions status --json')
+    assert approval < main.index('if [[ "${RETRY_ONLY}" == 1 ]]')
+    assert approval < main.index("run_full_matrix")
+
+
+def test_lume_runner_gates_persistent_guest_setup_to_virtualmac() -> None:
+    text = RUN_ALL.read_text(encoding="utf-8")
+    assert 'MODEL="$(/usr/sbin/sysctl -n hw.model 2>/dev/null || true)"' in text
+    assert '[[ "${MODEL}" != VirtualMac* ]]' in text
+    assert "requires a VirtualMac guest" in text
+
+
 def test_artifact_history_is_never_overwritten(tmp_path: Path) -> None:
     artifact_dir = tmp_path / "macos"
     history_root = tmp_path / "macos-history"
@@ -332,7 +626,6 @@ REPORT_OPTIONS = (
     'printf "harness=%s\\n" "$RETRY_HARNESS"\n'
     'printf "attempts=%s\\n" "$RETRY_ATTEMPTS"\n'
     'printf "only=%s\\n" "$RETRY_ONLY"\n'
-    'printf "standalone=%s\\n" "$RUN_STANDALONE_BROWSER"\n'
     'printf "nobuild=%s\\n" "$NO_BUILD"\n'
     'printf "lane=%s\\n" "$RETRY_INTERNAL_LANE"\n'
 )
@@ -349,7 +642,6 @@ def test_default_invocation_runs_the_full_matrix() -> None:
     assert fields["status"] == "0"
     assert fields["cell"] == ""
     assert fields["only"] == "0"
-    assert fields["standalone"] == "0"
     assert fields["nobuild"] == "0"
 
 
@@ -443,10 +735,7 @@ def test_native_swiftui_selector_matches_exactly_one_owned_cell() -> None:
         pytest.param(["--retry-cell", "cell", "--retry-harness", "Electron!"], id="bad-harness"),
         pytest.param(["--retry-cell"], id="missing-cell-value"),
         pytest.param(["--retry-cell", "--retry-only"], id="flag-as-cell-value"),
-        pytest.param(
-            ["--retry-cell", "cell", "--retry-only", "--standalone-browser"],
-            id="retry-only-with-standalone-browser",
-        ),
+        pytest.param(["--standalone-browser"], id="removed-standalone-browser-flag"),
         pytest.param(["--unknown"], id="unknown-argument"),
     ],
 )
@@ -568,6 +857,237 @@ def test_required_keychains_unlock_login_without_retaining_password(
         f"unlock-keychain -p fixture-password {signing_keychain}",
         f"unlock-keychain -p fixture-password {login_keychain}",
     ]
+
+
+def test_required_keychains_accept_already_unlocked_noninteractive_keychains(
+    tmp_path: Path,
+) -> None:
+    signing_keychain = tmp_path / "signing.keychain-db"
+    login_keychain = tmp_path / "login.keychain-db"
+    signing_keychain.touch()
+    login_keychain.touch()
+    fake_security = tmp_path / "bin/security"
+    fake_codesign = tmp_path / "bin/codesign"
+    security_log = tmp_path / "security.log"
+    codesign_log = tmp_path / "codesign.log"
+    _write_executable(
+        fake_security,
+        """printf '%s\n' "$*" >> "$CUA_TEST_SECURITY_LOG"
+command="$1"
+shift
+if [ "$command" = find-generic-password ]; then
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = -s ]; then
+            printf '%s' "$2"
+            exit 0
+        fi
+        shift
+    done
+    exit 1
+fi
+""",
+    )
+    _write_executable(
+        fake_codesign,
+        """printf '%s\n' "$*" >> "$CUA_TEST_CODESIGN_LOG"
+""",
+    )
+    completed = _run(
+        RUN_ALL,
+        "unlock_required_keychains\n",
+        env={
+            "PATH": f"{fake_codesign.parent}:{os.environ['PATH']}",
+            "CUA_E2E_SIGNING_KEYCHAIN": str(signing_keychain),
+            "CUA_E2E_LOGIN_KEYCHAIN": str(login_keychain),
+            "CUA_E2E_SIGNING_KEYCHAIN_PASSWORD": "",
+            "CUA_TEST_SECURITY_LOG": str(security_log),
+            "CUA_TEST_CODESIGN_LOG": str(codesign_log),
+        },
+    )
+    assert completed.returncode == 0, completed.stderr
+    codesign_calls = codesign_log.read_text(encoding="utf-8").splitlines()
+    assert len(codesign_calls) == 2
+    assert codesign_calls[0].startswith(
+        "--force --timestamp=none --sign CuaDriver Local Signing "
+        f"(cua-driver-rs) --keychain {signing_keychain} "
+    )
+    probe_binary = codesign_calls[0].rsplit(" ", 1)[1]
+    assert codesign_calls[1] == f"--verify --strict {probe_binary}"
+    security_calls = security_log.read_text(encoding="utf-8").splitlines()
+    assert len(security_calls) == 3
+    assert security_calls[0].startswith("add-generic-password -a cua-driver-keychain-probe -s ")
+    service = security_calls[0].split(" -s ", 1)[1].split(" -w ", 1)[0]
+    assert security_calls[0].endswith(f" -w {service} {login_keychain}")
+    assert security_calls[1] == (
+        f"find-generic-password -a cua-driver-keychain-probe -s {service} "
+        f"-w {login_keychain}"
+    )
+    assert security_calls[2] == (
+        f"delete-generic-password -a cua-driver-keychain-probe -s {service} "
+        f"{login_keychain}"
+    )
+
+
+def test_required_keychains_fail_when_noninteractive_keychain_is_locked(
+    tmp_path: Path,
+) -> None:
+    signing_keychain = tmp_path / "signing.keychain-db"
+    login_keychain = tmp_path / "login.keychain-db"
+    signing_keychain.touch()
+    login_keychain.touch()
+    fake_codesign = tmp_path / "bin/codesign"
+    probe_tmp = tmp_path / "probe-tmp"
+    probe_tmp.mkdir()
+    log = tmp_path / "codesign.log"
+    _write_executable(
+        fake_codesign,
+        """printf '%s\n' "$*" >> "$CUA_TEST_SECURITY_LOG"
+exit 1
+""",
+    )
+    completed = _run(
+        RUN_ALL,
+        "unlock_required_keychains\n",
+        env={
+            "PATH": f"{fake_codesign.parent}:{os.environ['PATH']}",
+            "CUA_E2E_SIGNING_KEYCHAIN": str(signing_keychain),
+            "CUA_E2E_LOGIN_KEYCHAIN": str(login_keychain),
+            "CUA_E2E_SIGNING_KEYCHAIN_PASSWORD": "",
+            "CUA_TEST_SECURITY_LOG": str(log),
+            "TMPDIR": str(probe_tmp),
+        },
+    )
+    assert completed.returncode == 2
+    assert "did not permit the bounded signing and verification probe" in completed.stderr
+    assert log.read_text(encoding="utf-8").splitlines()[0].startswith(
+        "--force --timestamp=none --sign"
+    )
+    assert list(probe_tmp.iterdir()) == []
+
+
+def test_login_keychain_probe_deletes_item_after_failed_read(tmp_path: Path) -> None:
+    login_keychain = tmp_path / "login.keychain-db"
+    login_keychain.touch()
+    fake_security = tmp_path / "bin/security"
+    log = tmp_path / "security.log"
+    _write_executable(
+        fake_security,
+        """printf '%s\n' "$*" >> "$CUA_TEST_SECURITY_LOG"
+if [ "$1" = find-generic-password ]; then
+    exit 1
+fi
+""",
+    )
+    completed = _run(
+        RUN_ALL,
+        'probe_login_keychain "$CUA_E2E_LOGIN_KEYCHAIN"\n',
+        env={
+            "PATH": f"{fake_security.parent}:{os.environ['PATH']}",
+            "CUA_E2E_LOGIN_KEYCHAIN": str(login_keychain),
+            "CUA_TEST_SECURITY_LOG": str(log),
+        },
+    )
+    assert completed.returncode == 1
+    calls = log.read_text(encoding="utf-8").splitlines()
+    assert [call.split(" ", 1)[0] for call in calls] == [
+        "add-generic-password",
+        "find-generic-password",
+        "delete-generic-password",
+    ]
+
+
+def test_login_keychain_probe_reports_repeated_cleanup_failure(tmp_path: Path) -> None:
+    login_keychain = tmp_path / "login.keychain-db"
+    login_keychain.touch()
+    fake_security = tmp_path / "bin/security"
+    log = tmp_path / "security.log"
+    _write_executable(
+        fake_security,
+        """printf '%s\n' "$*" >> "$CUA_TEST_SECURITY_LOG"
+if [ "$1" = find-generic-password ]; then
+    exit 3
+fi
+if [ "$1" = delete-generic-password ]; then
+    exit 7
+fi
+""",
+    )
+    completed = _run(
+        RUN_ALL,
+        'probe_login_keychain "$CUA_E2E_LOGIN_KEYCHAIN"\n',
+        env={
+            "PATH": f"{fake_security.parent}:{os.environ['PATH']}",
+            "CUA_E2E_LOGIN_KEYCHAIN": str(login_keychain),
+            "CUA_TEST_SECURITY_LOG": str(log),
+        },
+    )
+    assert completed.returncode == 7
+    calls = log.read_text(encoding="utf-8").splitlines()
+    assert [call.split(" ", 1)[0] for call in calls] == [
+        "add-generic-password",
+        "find-generic-password",
+        "delete-generic-password",
+        "delete-generic-password",
+    ]
+    assert "cleanup failed; retrying the bounded delete once" in completed.stderr
+    assert "cleanup failed after two bounded delete attempts" in completed.stderr
+    assert "temporary item cua-driver-keychain-probe-" in completed.stderr
+
+
+def test_bounded_command_kills_the_entire_subprocess_group(tmp_path: Path) -> None:
+    hanging_command = tmp_path / "bin/hanging-command"
+    child_pid_path = tmp_path / "child.pid"
+    _write_executable(
+        hanging_command,
+        """trap '' TERM
+sleep 30 &
+child_pid=$!
+printf '%s\n' "$child_pid" > "$CUA_TEST_CHILD_PID"
+wait "$child_pid"
+""",
+    )
+    started = time.monotonic()
+    completed = _run(
+        RUN_ALL,
+        "KEYCHAIN_COMMAND_TIMEOUT_SECONDS=0.2\n"
+        "KEYCHAIN_COMMAND_KILL_GRACE_SECONDS=0.1\n"
+        'run_bounded_command "$CUA_TEST_HANGING_COMMAND"\n',
+        env={
+            "CUA_TEST_HANGING_COMMAND": str(hanging_command),
+            "CUA_TEST_CHILD_PID": str(child_pid_path),
+        },
+    )
+    elapsed = time.monotonic() - started
+    assert completed.returncode == 124
+    assert elapsed < 2
+    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+    for _ in range(20):
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f"timed-out child process {child_pid} is still alive")
+
+
+def test_bounded_command_requires_python_and_uses_process_group_kills() -> None:
+    text = RUN_ALL.read_text(encoding="utf-8")
+    function = text.split("run_bounded_command() {", 1)[1].split("\n}\n", 1)[0]
+    assert "command -v python3" in function
+    assert "subprocess.Popen(sys.argv[3:], start_new_session=True)" in function
+    assert function.count("os.killpg(process.pid") == 2
+    assert "osascript python3 security xcrun" in text
+
+
+def test_required_keychains_keep_terminal_prompt_fallback() -> None:
+    text = RUN_ALL.read_text(encoding="utf-8")
+    function = text.split("prepare_keychain() {", 1)[1].split("\n}\n", 1)[0]
+    assert '[[ -z "${keychain_password}" && -t 0 ]]' in function
+    assert 'read -r -s -p "${label} password: "' in function
+    assert "run_bounded_command security unlock-keychain -p" in function
+    assert 'probe_signing_keychain "${keychain}"' in function
+    assert 'probe_login_keychain "${keychain}"' in function
 
 
 # --------------------------------------------------------------------------
@@ -1267,14 +1787,45 @@ def test_a_green_run_writes_an_empty_failure_record(tmp_path: Path) -> None:
     assert record["report_failed"] is False
 
 
+def test_namespaced_lane_writes_a_complete_artifact_safe_log(tmp_path: Path) -> None:
+    selector = "snapshot_publication::harness_appkit_pending_snapshot_cannot_retarget_token"
+    completed = _run(
+        RUN_RUST_E2E,
+        'ARTIFACT_DIR="$TEST_ARTIFACT_DIR"\nRUST_ROOT="$TEST_ARTIFACT_DIR"\n'
+        'run_test "appkit-$TEST_SELECTOR" bash -c '
+        '\'printf "%s\\n" "$@"; printf "stderr\\n" >&2\' -- --exact "$TEST_SELECTOR"\n',
+        env={"TEST_ARTIFACT_DIR": str(tmp_path), "TEST_SELECTOR": selector},
+    )
+    assert completed.returncode == 0, completed.stderr
+    log = tmp_path / (
+        "appkit-snapshot_publication__harness_appkit_pending_snapshot_cannot_retarget_token.log"
+    )
+    assert list(tmp_path.iterdir()) == [log]
+    assert log.read_text() == f"--exact\n{selector}\nstderr\n"
+
+
+@pytest.mark.parametrize("character", list('":<>|*?\r\n/\\'))
+def test_lane_log_replaces_nonportable_characters(tmp_path: Path, character: str) -> None:
+    completed = _run(
+        RUN_RUST_E2E,
+        'ARTIFACT_DIR="$TEST_ARTIFACT_DIR"\nRUST_ROOT="$TEST_ARTIFACT_DIR"\n'
+        'run_test "$TEST_LABEL" printf "%s\\n" evidence\n',
+        env={"TEST_ARTIFACT_DIR": str(tmp_path), "TEST_LABEL": f"left{character}right"},
+    )
+    assert completed.returncode == 0, completed.stderr
+    log = tmp_path / "left_right.log"
+    assert list(tmp_path.iterdir()) == [log]
+    assert log.read_text() == "evidence\n"
+
+
 def test_lane_bookkeeping_records_only_failing_lanes(tmp_path: Path) -> None:
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
     completed = _run(
         RUN_RUST_E2E,
         'ARTIFACT_DIR="$TEST_ARTIFACT_DIR"\nRUST_ROOT="$TEST_ARTIFACT_DIR"\n'
-        "run_test green true\n"
-        "run_test red false\n"
+        "run_test green-09.v1 true\n"
+        "run_test red::lane false\n"
         'printf "count=%s\\n" "$FAILURE_COUNT"\n'
         'printf "lanes=%s\\n" "${FAILED_LANES[*]}"\n',
         env={"TEST_ARTIFACT_DIR": str(artifact_dir)},
@@ -1282,6 +1833,6 @@ def test_lane_bookkeeping_records_only_failing_lanes(tmp_path: Path) -> None:
     assert completed.returncode == 0, completed.stderr
     fields = _fields(completed.stdout)
     assert fields["count"] == "1"
-    assert fields["lanes"] == "red"
-    assert (artifact_dir / "green.log").exists()
-    assert (artifact_dir / "red.log").exists()
+    assert fields["lanes"] == "red::lane"
+    assert (artifact_dir / "green-09.v1.log").exists()
+    assert (artifact_dir / "red__lane.log").exists()
