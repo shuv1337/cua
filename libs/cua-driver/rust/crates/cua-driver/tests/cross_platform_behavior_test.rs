@@ -499,15 +499,39 @@ fn window_origin(fixture: &Fixture, _state: &ToolResponse) -> (f64, f64) {
 }
 
 fn screenshot_scale(state: &ToolResponse) -> (f64, f64) {
-    screenshot_scale_for_platform(state.structured(), cfg!(target_os = "linux"))
+    screenshot_scale_for_platform(
+        state.structured(),
+        cfg!(target_os = "linux"),
+        std::env::var("CUA_E2E_COMPOSITOR").as_deref() == Ok("hyprland"),
+    )
 }
 
-fn screenshot_scale_for_platform(state: &serde_json::Value, linux: bool) -> (f64, f64) {
+fn screenshot_scale_for_platform(
+    state: &serde_json::Value,
+    linux: bool,
+    hyprland: bool,
+) -> (f64, f64) {
     let window_role = if linux { "frame" } else { "AXWindow" };
     let capture = (
         state["screenshot_width"].as_f64().unwrap_or(0.0),
         state["screenshot_height"].as_f64().unwrap_or(0.0),
     );
+    // Hyprland's per-window export is normalized to compositor logical size.
+    // Chromium's AT-SPI top-level frame can report a different width from
+    // that window even when its child control coordinates are screen-correct.
+    // The delivered preview is a uniform resize of the captured window, so
+    // use the capture's original width rather than the AX frame to ground PX.
+    if linux && hyprland {
+        if let Some(original_width) = state["screenshot_original_width"].as_f64() {
+            if original_width > 0.0 && capture.0 > 0.0 {
+                let scale = capture.0 / original_width;
+                return (scale, scale);
+            }
+        }
+        if capture.0 > 0.0 {
+            return (1.0, 1.0);
+        }
+    }
     let window = state["elements"]
         .as_array()
         .and_then(|elements| {
@@ -556,11 +580,11 @@ fn linux_frame_geometry_drives_resized_screenshot_scale() {
         }]
     });
 
-    let linux_scale = screenshot_scale_for_platform(&state, true);
+    let linux_scale = screenshot_scale_for_platform(&state, true, false);
     assert!((linux_scale.0 - 1568.0 / 1896.0).abs() < f64::EPSILON);
     assert!((linux_scale.1 - 852.0 / 1030.0).abs() < f64::EPSILON);
 
-    let ax_scale = screenshot_scale_for_platform(&state, false);
+    let ax_scale = screenshot_scale_for_platform(&state, false, false);
     assert!((ax_scale.0 - 1568.0 / 1000.0).abs() < f64::EPSILON);
     assert!((ax_scale.1 - 852.0 / 500.0).abs() < f64::EPSILON);
 }
@@ -575,13 +599,27 @@ fn resized_screenshot_coordinates_use_capture_scale() {
             "frame": {"x": 12, "y": 38, "w": 1896, "h": 1030}
         }]
     });
-    let scale = screenshot_scale_for_platform(&state, true);
+    let scale = screenshot_scale_for_platform(&state, true, false);
     let point = screenshot_local_point((949.0, 398.0), (12.0, 38.0), scale);
 
     assert!((point.0 - 774.903).abs() < 0.001);
     assert!((point.1 - 297.786).abs() < 0.001);
     assert!(point.0 < 1568.0);
     assert!(point.1 < 852.0);
+}
+
+#[test]
+fn hyprland_preview_scale_uses_capture_geometry_not_ax_frame() {
+    let state = serde_json::json!({
+        "screenshot_width": 1454,
+        "screenshot_height": 790,
+        "screenshot_original_width": 2518,
+        "elements": [{"role": "frame", "frame": {"x": 21, "y": 21, "w": 2121, "h": 1152}}]
+    });
+    let scale = screenshot_scale_for_platform(&state, true, true);
+    let (x, y) = screenshot_local_point((1267.0, 433.5), (21.0, 21.0), scale);
+    assert!((x * 2518.0 / 1454.0 - 1246.0).abs() < 0.001);
+    assert!((y * 2518.0 / 1454.0 - 412.5).abs() < 0.001);
 }
 
 fn require_element(snapshot: &ToolResponse, id: &str) -> u64 {

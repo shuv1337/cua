@@ -1024,10 +1024,12 @@ fn row_expects_refusal(row: CatalogRow) -> bool {
     if row.delivery != Delivery::Background {
         return false;
     }
-    // X11 promotes a plain left click on an accessible GTK control to the
-    // focus-free AT-SPI action bridge. Native Wayland still exercises the
-    // typed refusal because compositor-attested pixel geometry is unavailable.
-    if DisplayServer::current() == DisplayServer::X11
+    // A plain left click on an accessible GTK control can use the focus-free
+    // AT-SPI action bridge on X11 or an attested native Hyprland window.
+    // Test it at the real target rather than expecting a refusal at (0,0).
+    if (DisplayServer::current() == DisplayServer::X11
+        || (DisplayServer::current() == DisplayServer::Wayland
+            && platform_linux::wayland::hyprland_input::enabled()))
         && matches!(
             row.operation,
             Operation::PxClick {

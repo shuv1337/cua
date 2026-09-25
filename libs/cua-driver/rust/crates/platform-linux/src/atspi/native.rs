@@ -6022,13 +6022,20 @@ async fn element_bounds_for_visited(
     .map(|(idx, node)| async move {
         let proxies = call(node.acc.proxies()).await?.ok()?;
         let comp = call(proxies.component()).await?.ok()?;
-        // A trustworthy Screen answer wins over the Window reconstruction
-        // (see `screen_extents_trusted`); web content keeps its document
-        // origin path.
+        // GTK's Wayland Screen extents may actually be window-local, even
+        // when Window extents use a different internal origin. Rebase those
+        // Screen coordinates onto Hyprland's authoritative compositor origin,
+        // including for windows parked on another workspace. On X11 the
+        // trusted Screen extents are already absolute.
         if coord == CoordType::Window && !node.in_web_doc {
             if let Some(Ok(raw)) = call(comp.get_extents(CoordType::Screen)).await {
                 if screen_extents_trusted(raw, display) {
-                    return project_screen_extents(raw, (0, 0), None).map(|bounds| (idx, bounds));
+                    let screen_offset = screen_extent_origin(
+                        crate::wayland::hyprland::is_session(),
+                        (offset_x, offset_y),
+                    );
+                    return project_screen_extents(raw, screen_offset, None)
+                        .map(|bounds| (idx, bounds));
                 }
             }
         }
@@ -6058,6 +6065,14 @@ async fn element_bounds_for_visited(
             .collect(),
         complete,
     )
+}
+
+fn screen_extent_origin(hyprland: bool, compositor_origin: (i32, i32)) -> (i32, i32) {
+    if hyprland {
+        compositor_origin
+    } else {
+        (0, 0)
+    }
 }
 
 #[cfg(test)]
@@ -6101,7 +6116,23 @@ mod walk_bounds_tests {
 
 #[cfg(test)]
 mod screen_extents_tests {
-    use super::screen_extents_trusted;
+    use super::{project_screen_extents, screen_extent_origin, screen_extents_trusted};
+
+    #[test]
+    fn hyprland_rebases_local_screen_extents_on_compositor_origin() {
+        assert_eq!(screen_extent_origin(true, (1286, 21)), (1286, 21));
+        assert_eq!(screen_extent_origin(false, (1286, 21)), (0, 0));
+        // This GTK3 button lives on a window moved to another workspace;
+        // its raw AT-SPI Screen extents still start near the origin.
+        assert_eq!(
+            project_screen_extents(
+                (12, 226, 1229, 34),
+                screen_extent_origin(true, (1286, 21)),
+                None
+            ),
+            Some((1298, 247, 1229, 34))
+        );
+    }
 
     #[test]
     fn trusts_plausible_on_screen_extents() {

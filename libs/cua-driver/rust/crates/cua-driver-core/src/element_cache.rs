@@ -204,6 +204,7 @@ fn screenshot_context_refusal(pid: Option<i32>, window_id: Option<u64>) -> ToolR
     )
     .with_structured(serde_json::json!({
         "code": "screenshot_context_missing",
+        "effect": "refused",
         "pid": pid,
         "window_id": window_id,
     }))
@@ -215,6 +216,7 @@ fn zoom_context_refusal(pid: i32, window_id: Option<u64>) -> ToolResult {
     )
     .with_structured(serde_json::json!({
         "code": "zoom_context_missing",
+        "effect": "refused",
         "pid": pid,
         "window_id": window_id,
     }))
@@ -937,6 +939,10 @@ mod tests {
             refusal.structured_content.as_ref().unwrap()["code"],
             "screenshot_context_missing"
         );
+        assert_eq!(
+            refusal.structured_content.as_ref().unwrap()["effect"],
+            "refused"
+        );
     }
 
     #[test]
@@ -1244,14 +1250,16 @@ mod tests {
             context
         );
         assert_eq!(context.zoom_to_window(3.0, 4.0), (106.0, 58.0));
+        let refusal = zooms
+            .resolve(&cache, 10, Some(20), Some("client-b"))
+            .unwrap_err();
         assert_eq!(
-            zooms
-                .resolve(&cache, 10, Some(20), Some("client-b"))
-                .unwrap_err()
-                .structured_content
-                .as_ref()
-                .unwrap()["code"],
+            refusal.structured_content.as_ref().unwrap()["code"],
             "zoom_context_missing"
+        );
+        assert_eq!(
+            refusal.structured_content.as_ref().unwrap()["effect"],
+            "refused"
         );
         assert_eq!(
             zooms
