@@ -564,6 +564,10 @@ fn screenshot_local_point(
     )
 }
 
+fn screenshot_contains_point((x, y): (f64, f64), (width, height): (f64, f64)) -> bool {
+    x >= 0.0 && x < width && y >= 0.0 && y < height
+}
+
 #[test]
 fn linux_frame_geometry_drives_resized_screenshot_scale() {
     let state = serde_json::json!({
@@ -620,6 +624,19 @@ fn hyprland_preview_scale_uses_capture_geometry_not_ax_frame() {
     let (x, y) = screenshot_local_point((1267.0, 433.5), (21.0, 21.0), scale);
     assert!((x * 2518.0 / 1454.0 - 1246.0).abs() < 0.001);
     assert!((y * 2518.0 / 1454.0 - 412.5).abs() < 0.001);
+}
+
+#[test]
+fn hyprland_tiled_window_requires_fresh_ax_bounds_before_pixel_targeting() {
+    // The compositor has already resized to 1254 logical pixels, but Electron
+    // can briefly retain the previous 2519-pixel renderer layout in AT-SPI.
+    let capture = (1026.0, 1120.0);
+    let scale = (1026.0 / 1254.0, 1026.0 / 1254.0);
+    let origin = (21.0, 21.0);
+    let stale = screenshot_local_point((1598.0, 150.5), origin, scale);
+    let fresh = screenshot_local_point((965.0, 150.5), origin, scale);
+    assert!(!screenshot_contains_point(stale, capture));
+    assert!(screenshot_contains_point(fresh, capture));
 }
 
 fn require_element(snapshot: &ToolResponse, id: &str) -> u64 {
@@ -808,13 +825,12 @@ fn scroll_oracle_rejects_missing_or_invalid_geometry() {
 }
 
 fn action_target_args(
-    fixture: &Fixture,
+    fixture: &mut Fixture,
     state: &ToolResponse,
     id: &str,
     addressing: &str,
     delivery: &str,
 ) -> serde_json::Value {
-    let index = require_element(state, id);
     let mut args = serde_json::json!({
         "pid": fixture.pid as i64,
         "window_id": fixture.wid,
@@ -822,46 +838,62 @@ fn action_target_args(
     });
     let object = args.as_object_mut().expect("action arguments object");
     if addressing == "ax" {
+        let index = require_element(state, id);
         object.insert("element_index".to_owned(), serde_json::json!(index));
         object.insert(
             "snapshot_id".to_owned(),
             serde_json::json!(state.snapshot_id()),
         );
     } else {
-        let origin = window_origin(fixture, state);
-        let scale = screenshot_scale(state);
-        let screen_point = element_center(state, index);
-        let (local_x, local_y) = screenshot_local_point(screen_point, origin, scale);
-        let width = state.structured()["screenshot_width"].as_f64();
-        let height = state.structured()["screenshot_height"].as_f64();
-        if width.is_none() || height.is_none() {
-            // Native Wayland may intentionally omit a per-window crop size.
-            // Background pixel rows are typed refusals in that environment;
-            // use inert coordinates so the driver can publish that refusal
-            // without requiring an unverifiable screenshot oracle.
-            if delivery == "background"
-                && cua_driver_testkit::e2e::DisplayServer::current()
-                    == cua_driver_testkit::e2e::DisplayServer::Wayland
-            {
-                object.insert("x".to_owned(), serde_json::json!(0.0));
-                object.insert("y".to_owned(), serde_json::json!(0.0));
-                return args;
+        // Hyprland can tile a background Electron window after the sentinel
+        // appears. Its exported buffer already has the new dimensions while
+        // Chromium's AX tree can still describe the old, wider renderer.
+        // Re-observe until the target is actually inside a fresh capture; do
+        // not aim at stale pixels or turn an expected refusal into a fake hit.
+        let hyprland = std::env::var("CUA_E2E_COMPOSITOR").as_deref() == Ok("hyprland");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut refreshed = None;
+        loop {
+            let current = refreshed.as_ref().unwrap_or(state);
+            let origin = window_origin(fixture, current);
+            let scale = screenshot_scale(current);
+            let screen_point = element_center(current, require_element(current, id));
+            let (local_x, local_y) = screenshot_local_point(screen_point, origin, scale);
+            let width = current.structured()["screenshot_width"].as_f64();
+            let height = current.structured()["screenshot_height"].as_f64();
+            if width.is_none() || height.is_none() {
+                // Native Wayland may intentionally omit a per-window crop
+                // size. Background pixel rows are typed refusals there.
+                if delivery == "background"
+                    && cua_driver_testkit::e2e::DisplayServer::current()
+                        == cua_driver_testkit::e2e::DisplayServer::Wayland
+                {
+                    object.insert("x".to_owned(), serde_json::json!(0.0));
+                    object.insert("y".to_owned(), serde_json::json!(0.0));
+                    return args;
+                }
+                panic!("PX action requires screenshot dimensions for {delivery} delivery");
             }
-            panic!("PX action requires screenshot dimensions for {delivery} delivery");
+            let (width, height) = (width.unwrap(), height.unwrap());
+            eprintln!(
+                "[shared-px] {} target={id} screen=({:.1},{:.1}) origin=({:.1},{:.1}) scale=({:.3},{:.3}) local=({local_x:.1},{local_y:.1}) capture=({width:.1}x{height:.1})",
+                fixture.name, screen_point.0, screen_point.1, origin.0, origin.1, scale.0, scale.1
+            );
+            if screenshot_contains_point((local_x, local_y), (width, height)) {
+                object.insert("window_id".to_owned(), serde_json::json!(fixture.wid));
+                object.insert("x".to_owned(), serde_json::json!(local_x));
+                object.insert("y".to_owned(), serde_json::json!(local_y));
+                break;
+            }
+            if !hyprland || Instant::now() >= deadline {
+                panic!(
+                    "{}: PX target {id:?} center ({local_x:.1}, {local_y:.1}) is outside the captured window ({width:.1}x{height:.1}); fix the harness layout",
+                    fixture.name
+                );
+            }
+            thread::sleep(Duration::from_millis(100));
+            refreshed = Some(snapshot(fixture));
         }
-        let width = width.unwrap();
-        let height = height.unwrap();
-        eprintln!(
-            "[shared-px] {} target={id} screen=({:.1},{:.1}) origin=({:.1},{:.1}) scale=({:.3},{:.3}) local=({local_x:.1},{local_y:.1}) capture=({width:.1}x{height:.1})",
-            fixture.name, screen_point.0, screen_point.1, origin.0, origin.1, scale.0, scale.1
-        );
-        assert!(
-            local_x >= 0.0 && local_x < width && local_y >= 0.0 && local_y < height,
-            "{}: PX target {id:?} center ({local_x:.1}, {local_y:.1}) is outside the captured window ({width:.1}x{height:.1}); fix the harness layout",
-            fixture.name
-        );
-        object.insert("x".to_owned(), serde_json::json!(local_x));
-        object.insert("y".to_owned(), serde_json::json!(local_y));
     }
     args
 }
