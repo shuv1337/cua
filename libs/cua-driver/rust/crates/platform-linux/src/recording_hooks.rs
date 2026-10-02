@@ -1,5 +1,371 @@
 //! Application-state snapshots used by trajectory recording on Linux.
 
+#[cfg(target_os = "linux")]
+use cua_driver_core::recording_frame::{
+    RecordingFrame, RecordingTurnContext, RecordingUnavailable, RecordingWindow,
+    SharedRecordingTurn,
+};
+
+/// Pins geometry before any image/point query. Pixel markers come from the
+/// action worker's explicit post-conversion handoff, not another scale lookup.
+#[cfg(target_os = "linux")]
+pub fn hyprland_turn_context(
+    args: &serde_json::Value,
+    window_id: Option<u64>,
+    pid: Option<i64>,
+    binding: cua_driver_core::capture_runtime::CaptureBinding,
+    binding_current: impl Fn() -> bool + Send + Sync + 'static,
+) -> Result<SharedRecordingTurn, RecordingUnavailable> {
+    use cua_driver_core::tool_args::ArgsExt;
+    let plan = crate::wayland::hyprland::desktop_capture_plan().map_err(|error| {
+        if error
+            .downcast_ref::<crate::wayland::hyprland::UnsupportedDisplayTransform>()
+            .is_some()
+        {
+            RecordingUnavailable::UnqualifiedFrame
+        } else {
+            RecordingUnavailable::StaleFrame
+        }
+    })?;
+    let native = plan.frame;
+    let window = match (pid, window_id) {
+        (Some(pid), Some(address)) => {
+            let pid = u32::try_from(pid).map_err(|_| RecordingUnavailable::InvalidFrame)?;
+            let window = crate::wayland::hyprland::window_for_address(address)
+                .filter(|w| w.pid == pid && w.visible)
+                .ok_or(RecordingUnavailable::StaleFrame)?;
+            Some(RecordingWindow {
+                pid,
+                window_id: address,
+                origin: (window.x, window.y),
+                dimensions: (window.width, window.height),
+            })
+        }
+        (Some(pid), None) => {
+            let pid = u32::try_from(pid).map_err(|_| RecordingUnavailable::InvalidFrame)?;
+            let windows: Vec<_> = crate::wayland::hyprland::list_windows()
+                .map_err(|_| RecordingUnavailable::StaleFrame)?
+                .into_iter()
+                .filter(|w| w.pid == pid && w.visible)
+                .collect();
+            if windows.len() == 1 {
+                let window = &windows[0];
+                Some(RecordingWindow {
+                    pid,
+                    window_id: window.address,
+                    origin: (window.x, window.y),
+                    dimensions: (window.width, window.height),
+                })
+            } else {
+                None
+            }
+        }
+        (None, None) => None,
+        _ => return Err(RecordingUnavailable::InvalidFrame),
+    };
+    let frame = RecordingFrame {
+        binding: Some(binding),
+        identity: Some(native.identity.clone()),
+        origin: (native.x, native.y),
+        dimensions: (native.width, native.height),
+        window,
+    };
+    frame.validate()?;
+    let mut context = HyprlandRecordingTurn {
+        native,
+        composite: plan.composite,
+        frame,
+        point: Ok(None),
+        binding_current: Box::new(binding_current),
+    };
+    if args.get("capture_id").is_none() {
+        context.point = match (args.opt_f64("x"), args.opt_f64("y")) {
+            (Some(_), Some(_)) => Ok(None),
+            _ => {
+                // Element resolution uses the same pinned window bounds and
+                // frame; do not invoke the legacy point hook with a new frame.
+                Ok(element_point_for_turn(&context, args))
+            }
+        };
+    }
+    context.validate()?;
+    Ok(std::sync::Arc::new(context))
+}
+
+#[cfg(target_os = "linux")]
+struct HyprlandRecordingTurn {
+    native: crate::wayland::hyprland::DesktopFrame,
+    composite: bool,
+    frame: RecordingFrame,
+    point: Result<Option<(f64, f64)>, RecordingUnavailable>,
+    binding_current: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+#[cfg(target_os = "linux")]
+impl HyprlandRecordingTurn {
+    fn validate(&self) -> Result<(), RecordingUnavailable> {
+        if !(self.binding_current)() {
+            return Err(RecordingUnavailable::StaleFrame);
+        }
+        self.native
+            .validate_current()
+            .map_err(|_| RecordingUnavailable::StaleFrame)?;
+        if let Some(window) = &self.frame.window {
+            let live = crate::wayland::hyprland::window_for_address(window.window_id)
+                .ok_or(RecordingUnavailable::StaleFrame)?;
+            if live.pid != window.pid
+                || !live.visible
+                || (live.x, live.y) != window.origin
+                || (live.width, live.height) != window.dimensions
+            {
+                return Err(RecordingUnavailable::StaleFrame);
+            }
+        }
+        if !(self.binding_current)() {
+            return Err(RecordingUnavailable::StaleFrame);
+        }
+        Ok(())
+    }
+
+    fn window_point(&self, x: f64, y: f64) -> Result<(f64, f64), RecordingUnavailable> {
+        let window = self
+            .frame
+            .window
+            .as_ref()
+            .ok_or(RecordingUnavailable::InvalidFrame)?;
+        if x < 0.0
+            || y < 0.0
+            || x >= f64::from(window.dimensions.0)
+            || y >= f64::from(window.dimensions.1)
+        {
+            return Err(RecordingUnavailable::InvalidFrame);
+        }
+        self.frame.layout_point(
+            f64::from(window.origin.0) + x,
+            f64::from(window.origin.1) + y,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl RecordingTurnContext for HyprlandRecordingTurn {
+    fn frame(&self) -> &RecordingFrame {
+        &self.frame
+    }
+
+    fn capture(
+        &self,
+        deadline: std::time::Instant,
+    ) -> cua_driver_core::recording::ScreenshotCapture {
+        use cua_driver_core::recording::ScreenshotCapture;
+        let capture = || -> Result<Vec<u8>, RecordingUnavailable> {
+            if std::time::Instant::now() >= deadline {
+                return Err(RecordingUnavailable::BudgetExceeded);
+            }
+            self.validate()?;
+            // Uses this turn's exact plan, never a newly observed DesktopFrame.
+            let png = capture_recording_pixels(
+                &self.native,
+                self.composite,
+                deadline,
+                || single_output_recording_capture(deadline),
+                crate::wayland::hyprland::compose_desktop_capture,
+            )
+            .map_err(|error| {
+                if error.to_string().contains("timeout") || error.to_string().contains("budget") {
+                    RecordingUnavailable::BudgetExceeded
+                } else {
+                    RecordingUnavailable::CaptureFailed
+                }
+            })?;
+            if std::time::Instant::now() >= deadline {
+                return Err(RecordingUnavailable::BudgetExceeded);
+            }
+            self.validate()?;
+            self.frame.check_png(&png)?;
+            Ok(png)
+        };
+        match capture() {
+            Ok(png) => ScreenshotCapture::captured(png),
+            Err(error) => ScreenshotCapture::unavailable(error.classification()),
+        }
+    }
+
+    fn click_point(&self) -> Result<Option<(f64, f64)>, RecordingUnavailable> {
+        self.point?
+            .map(|point| self.validate_point(point))
+            .transpose()
+    }
+
+    fn validate_point(&self, point: (f64, f64)) -> Result<(f64, f64), RecordingUnavailable> {
+        self.validate()?;
+        self.native
+            .checked_layout_point(point.0, point.1)
+            .map_err(|_| RecordingUnavailable::InvalidFrame)?;
+        self.frame.image_point(point.0, point.1)
+    }
+
+    fn cursor_point(&self) -> Result<Option<(f64, f64)>, RecordingUnavailable> {
+        self.validate()?;
+        let (x, y) = crate::wayland::hyprland::cursor_position()
+            .map_err(|_| RecordingUnavailable::CaptureFailed)?;
+        let point = self.frame.layout_point(x, y)?;
+        self.validate_point(point).map(Some)
+    }
+}
+
+/// Backend selection is made from the pinned plan. Single-output recording
+/// preserves the native screencopy/ext-copy/portal/X11 cascade (no grim
+/// dependency); its actual qualified buffer is normalized to logical pixels.
+#[cfg(target_os = "linux")]
+fn capture_recording_pixels(
+    frame: &crate::wayland::hyprland::DesktopFrame,
+    composite_required: bool,
+    deadline: std::time::Instant,
+    single: impl FnOnce() -> anyhow::Result<Vec<u8>>,
+    composite: impl FnOnce(&crate::wayland::hyprland::DesktopFrame) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        std::time::Instant::now() < deadline,
+        "recording capture timeout"
+    );
+    anyhow::ensure!(
+        frame.outputs.iter().all(|output| output.native_width > 0
+            && output.native_height > 0
+            && u64::from(output.native_width) * u64::from(output.native_height)
+                <= cua_driver_core::recording_frame::MAX_RECORDING_PIXELS),
+        "recording native allocation budget exceeded"
+    );
+    let png = if !composite_required {
+        single()?
+    } else {
+        composite(frame)?
+    };
+    anyhow::ensure!(
+        std::time::Instant::now() < deadline,
+        "recording capture timeout"
+    );
+    let dimensions = cua_driver_core::image_utils::png_dimensions(&png)?;
+    let logical = (frame.width, frame.height);
+    anyhow::ensure!(
+        png.len() <= cua_driver_core::recording_frame::MAX_RECORDING_PNG_BYTES,
+        "recording capture byte budget exceeded"
+    );
+    if dimensions == logical {
+        return Ok(png);
+    }
+    let output = frame
+        .outputs
+        .first()
+        .filter(|_| frame.outputs.len() == 1)
+        .ok_or_else(|| anyhow::anyhow!("recording composite dimensions mismatch"))?;
+    anyhow::ensure!(
+        dimensions == (output.native_width, output.native_height),
+        "recording native buffer does not match pinned output mode"
+    );
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(output.native_width);
+    limits.max_image_height = Some(output.native_height);
+    limits.max_alloc = Some(cua_driver_core::recording_frame::MAX_RECORDING_PIXELS * 4);
+    anyhow::ensure!(
+        u64::from(dimensions.0) * u64::from(dimensions.1)
+            <= cua_driver_core::recording_frame::MAX_RECORDING_PIXELS,
+        "recording native allocation budget exceeded"
+    );
+    let decoder = image::codecs::png::PngDecoder::with_limits(std::io::Cursor::new(&png), limits)?;
+    let image = image::DynamicImage::from_decoder(decoder)?;
+    anyhow::ensure!(
+        std::time::Instant::now() < deadline,
+        "recording capture timeout"
+    );
+    let normalized =
+        image.resize_exact(logical.0, logical.1, image::imageops::FilterType::Lanczos3);
+    anyhow::ensure!(
+        std::time::Instant::now() < deadline,
+        "recording capture timeout"
+    );
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    normalized.write_to(&mut encoded, image::ImageFormat::Png)?;
+    anyhow::ensure!(
+        std::time::Instant::now() < deadline,
+        "recording capture timeout"
+    );
+    Ok(encoded.into_inner())
+}
+
+#[cfg(target_os = "linux")]
+fn single_output_recording_capture(deadline: std::time::Instant) -> anyhow::Result<Vec<u8>> {
+    // Preserve the baseline backend order without screenshot_display_dispatch's
+    // independent topology query/composite selection. The pinned capture plan
+    // establishes that exactly one output was present, including standby.
+    anyhow::ensure!(
+        std::time::Instant::now() < deadline,
+        "recording capture timeout"
+    );
+    if crate::wayland::shell_helper::available() {
+        return crate::wayland::shell_helper::screenshot_display()
+            .ok_or_else(|| anyhow::anyhow!("shell helper recording capture failed"));
+    }
+    if let Ok(png) = crate::wayland::screenshot_bytes() {
+        return Ok(png);
+    }
+    anyhow::ensure!(
+        std::time::Instant::now() < deadline,
+        "recording capture timeout"
+    );
+    if let Ok(png) = crate::wayland::ext_screencopy::screenshot_via_ext_copy() {
+        return Ok(png);
+    }
+    anyhow::ensure!(
+        std::time::Instant::now() < deadline,
+        "recording capture timeout"
+    );
+    if let Ok(png) = crate::wayland::portal_screenshot::screenshot_via_portal() {
+        return Ok(png);
+    }
+    anyhow::ensure!(
+        std::time::Instant::now() < deadline,
+        "recording capture timeout"
+    );
+    crate::capture::screenshot_display_bytes_x11()
+}
+
+#[cfg(target_os = "linux")]
+fn element_point_for_turn(
+    context: &HyprlandRecordingTurn,
+    args: &serde_json::Value,
+) -> Option<(f64, f64)> {
+    let window = context.frame.window.as_ref()?;
+    let store = cua_driver_core::snapshot_store::current_runtime_store::<
+        crate::atspi::snapshot::AtspiSnapshot,
+    >()?;
+    let (index, resolved_window, _) = store
+        .resolve(i32::try_from(window.pid).ok()?, args)
+        .ok()?
+        .into_parts(None);
+    if resolved_window != Some(window.window_id) {
+        return None;
+    }
+    let index = index?;
+    let pid = window.pid;
+    let address = window.window_id;
+    let bounds = move || crate::atspi::get_element_bounds_for_window(pid, address, index).ok();
+    let (x, y, w, h) = if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(bounds).join().ok().flatten()?
+    } else {
+        bounds()?
+    };
+    if w == 0 || h == 0 {
+        return None;
+    }
+    context
+        .window_point(
+            f64::from(x) - f64::from(window.origin.0) + f64::from(w) / 2.0,
+            f64::from(y) - f64::from(window.origin.1) + f64::from(h) / 2.0,
+        )
+        .ok()
+}
+
 /// Per-turn application state for trajectory recording, walked under the
 /// shared `get_window_state` budget. The walk reports the shared walk fields so
 /// the turn evidence says when the tree is partial.
@@ -72,13 +438,49 @@ fn app_state_json_for_blocking(
 }
 
 #[cfg(target_os = "linux")]
+pub fn classified_screenshot_for_recording(
+    window_id: Option<u64>,
+    pid: Option<i64>,
+) -> cua_driver_core::recording::ScreenshotCapture {
+    use cua_driver_core::recording::ScreenshotCapture;
+    screenshot_for_recording(window_id, pid)
+        .map(ScreenshotCapture::captured)
+        .unwrap_or_else(|| ScreenshotCapture::unavailable("capture_failed"))
+}
+
+#[cfg(target_os = "linux")]
 pub fn screenshot_for_recording(window_id: Option<u64>, pid: Option<i64>) -> Option<Vec<u8>> {
     if crate::wayland::is_wayland() {
         if crate::wayland::hyprland::is_session() {
             // Recording uses the same qualified logical canvas even with one
             // scaled output. Raw physical pixels cannot share logical markers.
-            let frame = crate::wayland::hyprland::desktop_frame().ok()?;
-            return crate::wayland::hyprland::compose_desktop_capture(&frame).ok();
+            match crate::wayland::hyprland::desktop_capture_plan() {
+                Ok(plan) => {
+                    let frame = plan.frame;
+                    frame.validate_current().ok()?;
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+                    let png = capture_recording_pixels(
+                        &frame,
+                        plan.composite,
+                        deadline,
+                        || single_output_recording_capture(deadline),
+                        crate::wayland::hyprland::compose_desktop_capture,
+                    )
+                    .ok()?;
+                    frame.validate_current().ok()?;
+                    return Some(png);
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::wayland::hyprland::UnsupportedDisplayTransform>()
+                        .is_some() =>
+                {
+                    // Single rotated outputs retain baseline rendered pixels.
+                    // This path has no qualified coordinate/marker authority.
+                    return crate::wayland::screenshot_display_dispatch().ok();
+                }
+                Err(_) => return None,
+            }
         }
         // Wayland surface ids are connection-scoped, so a later recording hook
         // cannot safely re-attest the action call's per-window crop. Preserve
@@ -306,6 +708,119 @@ mod tests {
         assert_eq!(select(&[20], Some(20), false), None);
         assert_eq!(select(&[], None, true), None);
         assert!(super::select_recording_window(vec![window(20, 99)], 42, Some(20), true).is_none());
+    }
+
+    #[test]
+    fn single_output_recording_needs_no_grim_and_normalizes_the_actual_pinned_buffer() {
+        use crate::wayland::hyprland::{DesktopFrame, FrameOutput};
+        use cua_driver_core::recording_frame::RecordingFrame;
+        let frame = DesktopFrame {
+            x: -8,
+            y: 0,
+            width: 8,
+            height: 6,
+            scale: 1.5,
+            outputs: vec![FrameOutput {
+                name: "one-scaled-output".into(),
+                x: -8,
+                y: 0,
+                width: 8,
+                height: 6,
+                native_width: 12,
+                native_height: 9,
+            }],
+            identity: cua_driver_core::capture_runtime::CaptureFrameIdentity::from_native_snapshot(
+                b"one-output",
+            ),
+        };
+        let png = |w, h| {
+            cua_driver_core::image_utils::encode_rgba_to_png(&vec![40; (w * h * 4) as usize], w, h)
+                .unwrap()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let captured = super::capture_recording_pixels(
+            &frame,
+            false,
+            deadline,
+            || Ok(png(12, 9)),
+            |_| panic!("single output must not invoke grim composition"),
+        )
+        .unwrap();
+        assert_eq!(
+            cua_driver_core::image_utils::png_dimensions(&captured).unwrap(),
+            (8, 6)
+        );
+        let recording = RecordingFrame {
+            binding: None,
+            identity: Some(frame.identity.clone()),
+            origin: (-8, 0),
+            dimensions: (8, 6),
+            window: None,
+        };
+        let marker = recording.layout_point(-2.0, 2.0).unwrap();
+        assert_eq!(marker, (6.0, 2.0));
+        recording.check_png(&captured).unwrap();
+        let marked = crate::capture::crosshair_png_bytes(&captured, marker.0, marker.1).unwrap();
+        let pixels = image::load_from_memory(&marked).unwrap().to_rgba8();
+        assert_ne!(pixels.get_pixel(6, 2).0, [40; 4]);
+        let error = super::capture_recording_pixels(
+            &frame,
+            false,
+            deadline,
+            || Ok(png(16, 12)),
+            |_| panic!("no composite"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "recording native buffer does not match pinned output mode"
+        );
+        let error = super::capture_recording_pixels(
+            &frame,
+            false,
+            std::time::Instant::now(),
+            || panic!("expired budget cannot capture"),
+            |_| panic!("expired budget cannot compose"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "recording capture timeout");
+        let logical = super::capture_recording_pixels(
+            &frame,
+            false,
+            deadline,
+            || Ok(png(8, 6)),
+            |_| panic!("no composite"),
+        )
+        .unwrap();
+        assert_eq!(logical, png(8, 6));
+        // A standby output still makes the plan composite even with only one
+        // powered tile. Never choose a first-output cascade by tile count.
+        let composed = super::capture_recording_pixels(
+            &frame,
+            true,
+            deadline,
+            || panic!("standby-inclusive plan requires composition"),
+            |pinned| {
+                assert!(std::ptr::eq(pinned, &frame));
+                Ok(png(8, 6))
+            },
+        )
+        .unwrap();
+        assert_eq!(composed, png(8, 6));
+        let mut oversized = frame.clone();
+        oversized.outputs[0].native_width = u32::MAX;
+        let error = super::capture_recording_pixels(
+            &oversized,
+            false,
+            deadline,
+            || panic!("allocation budget must be checked before source capture"),
+            |_| panic!("allocation budget must be checked before composition"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "recording native allocation budget exceeded"
+        );
     }
 
     #[test]

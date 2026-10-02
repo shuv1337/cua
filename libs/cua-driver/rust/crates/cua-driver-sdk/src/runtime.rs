@@ -683,8 +683,8 @@ fn configure_linux_runtime(prepare_desktop_environment: bool) {
             }
         }
     }
-    cua_driver_core::recording::set_screenshot_fn(|window_id, pid| {
-        platform_linux::recording_hooks::screenshot_for_recording(window_id, pid)
+    cua_driver_core::recording::set_classified_screenshot_fn(|window_id, pid| {
+        platform_linux::recording_hooks::classified_screenshot_for_recording(window_id, pid)
     });
     cua_driver_core::recording::set_click_marker_fn(|png_bytes, x, y| {
         platform_linux::capture::crosshair_png_bytes(png_bytes, x, y).ok()

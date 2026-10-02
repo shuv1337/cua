@@ -92,6 +92,7 @@ pub mod pointer_shape;
 pub mod policy;
 pub mod protocol;
 pub mod recording;
+pub mod recording_frame;
 pub mod recording_loader;
 pub mod recording_render;
 pub mod recording_tools;

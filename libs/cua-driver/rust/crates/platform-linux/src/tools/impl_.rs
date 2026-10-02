@@ -14746,45 +14746,35 @@ pub fn build_registry_with_provider(
     if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
         let recording_state = Arc::downgrade(&state);
         r.recording
-            .set_pixel_point_fn(move |args, window_id, pid, mut x, mut y| {
-                let state = recording_state.upgrade()?;
-                // This legacy recording hook has no consumed capture transform.
-                // Omit rather than invent a marker for capture-bound pixels.
-                if args.get("capture_id").is_some() {
-                    return None;
-                }
-                if desktop_frame_requested(args) {
-                    // Desktop pixels are already frame-relative; do not apply
-                    // a window preview/zoom multiplier or add its origin again.
-                    let frame = crate::wayland::hyprland::desktop_frame().ok()?;
-                    state
-                        .capture_service
-                        .validate_desktop_observation(
-                            &state.capture_service.binding_from_args(args).ok()?,
-                            &frame.identity,
-                        )
-                        .ok()?;
-                    frame.checked_layout_point(x, y).ok()?;
-                    frame.validate_current().ok()?;
-                    return Some((x, y));
-                }
-                if let Some(pid) = pid {
-                    let pid = u32::try_from(pid).ok()?;
-                    // Match ClickTool's screenshot and zoom conversion before
-                    // translating to the recording's full-output image.
-                    if args.bool_or("from_zoom", false) {
-                        (x, y) = state
-                            .zoom_context(args, pid, args.opt_u64("window_id"))
-                            .ok()?
-                            .zoom_to_window(x, y);
-                    } else if let Ok(ratio) =
-                        screenshot_scale(&state, args, pid, args.opt_u64("window_id"))
-                    {
-                        x *= ratio;
-                        y *= ratio;
-                    }
-                }
-                crate::recording_hooks::hyprland_pixel_recording_point(window_id, pid, x, y)
+            .set_turn_context_fn(move |args, window_id, pid| {
+                use cua_driver_core::recording_frame::RecordingUnavailable;
+                let state = recording_state
+                    .upgrade()
+                    .ok_or(RecordingUnavailable::StaleFrame)?;
+                // Lifetime is pinned before metadata or pixels, and only compared
+                // afterward. Completion never borrows a new generation's authority.
+                let binding = state
+                    .capture_service
+                    .binding_from_args(args)
+                    .map_err(|_| RecordingUnavailable::StaleFrame)?;
+                let expected = binding.clone();
+                let lifetime_state = Arc::downgrade(&state);
+                crate::recording_hooks::hyprland_turn_context(
+                    args,
+                    window_id,
+                    pid,
+                    binding,
+                    move || {
+                        lifetime_state.upgrade().is_some_and(|state| {
+                            state
+                                .capture_service
+                                .current_binding(expected.session_id())
+                                .ok()
+                                .as_ref()
+                                == Some(&expected)
+                        })
+                    },
+                )
             });
     }
     let cursor_outcome_reader = {
