@@ -50,8 +50,11 @@ virtual-pointer setup. Admission and final dispatch use that same frame; native
 metadata, not a second desktop screenshot, validates dimensions. Motion, button
 presses and repeated scroll/click/drag phases have freshness checks. After a
 possible effect, a frame failure is reported as partial/unknown, never effect-none
-or a reason to replay. Cancellation destroys/flushed the owned synthetic proxy;
-it does not create a replacement device to release into a successor compositor.
+or a reason to replay. Cancellation releases only tracked buttons on the ORIGINAL
+owned proxy, frames and boundedly acknowledges that release before destruction.
+It does not create a replacement device or move/focus a successor target. Stalled
+or lost acknowledgment is explicitly cleanup-unconfirmed/partial, not successful
+release. Owner send/reply waits and device roundtrips are bounded.
 
 Coverage is half-open powered-output coverage, not just the rectangular canvas.
 Invalid endpoints and actual interpolated drag points are refused before input.
@@ -60,8 +63,12 @@ neighbor on the same powered output rather than across a seam or gap.
 
 Desktop observations (including uncapped images) retain stale state until a new
 successful publication. Cap ratios are isolated by runtime and session generation;
-publication cannot resurrect an old generation after retirement. Window screenshot
-and zoom contexts likewise retain a stale frame after an observed mismatch.
+publication cannot resurrect an old generation after retirement. Publication
+binding and per-target sequence are pinned BEFORE pixels; reversed completion
+refuses the predecessor. Frame identity, cap ratio and exact source ID publish
+together. Window screenshots/zoom use CLIENT-local lifetime/dimension identity,
+  not aggregate rotation or another output's DPMS; an observed stale context stays
+  stale until refreshed.
 
 All eight native desktop-to-window consumers use exact PID/full compositor
 address and logical client bounds, with frame-to-layout translation once. They
@@ -69,30 +76,52 @@ do not query X11 or truncate an address. Logical plugin surface coordinates are
 unchanged. Existing synchronous plugin layout/mode/DPMS revocation and effect-free
 retry requirements remain unchanged.
 
-Readback brackets `cursorpos` with frame identity. Recording captures are logical
-even on a single scaled output, and markers subtract signed frame origin and
-validate coverage. Per-output `grim` subprocesses have a shared 10-second deadline,
-bounded stdout and predecode allocation/dimension limits, with kill/reap cleanup.
+Readback brackets `cursorpos` with frame identity. Recording now owns one immutable
+turn context; before/after/marker/cursor evidence refer to that same geometry and
+binding. Consumed DESKTOP admission hands off its original binding/affine result
+before coordinates are discarded. Client-local admissions do not pretend their
+digest is global recording authority; unresolved action-guard reconciliation omits
+markers. Per-output `grim` shares the received phase deadline, bounded native-mode
+stdout/decode limits and aggregate adapter buffer-budget preflight, with kill/reap
+cleanup. Decode/resize/encode check deadlines between phases; image-library CPU
+phases are non-preemptible and the budget is not an OS RSS limit.
 
 ## Remaining blockers and limitations
 
-1. **Polling is not an event epoch or atomic compositor transaction.** An unseen
-   A→B→A transition between observations is not detected. There remains a
-   metadata-query→native-send race. Generic desktop authority does not yet inherit
-   the plugin's stronger synchronous event boundary. Do not claim ABA revocation.
+1. **Observation is not atomic native dispatch.** Desktop identity now includes a
+   same-incarnation bounded socket2 reader generation/event epoch, drained through
+   an unpredictable ordered custom-event marker, PLUS the existing loaded
+   production v3 plugin lane `(epoch, desktop_generation)` status. Hyprland v0.56.2
+   socket2 alone lacks layout/mode/DPMS events: without that production plugin
+   authority the desktop returns `topology_epoch_unavailable`. Unseen transitions
+   represented by plugin signals now change retained identity even after geometry
+   returns. Metadata-query→generic-pointer-send is still non-atomic; socket2 does
+   not invent missing events, and this is not synchronous held-device cancellation.
+   Monitor/client/plugin-status replies now retain the exact IPC peer PID,
+   process start time and socket inode/device from the query that produced them;
+   qualification and pointer connection creation reject a successor peer rather
+   than rebinding old metadata to a freshly queried compositor. Desktop and local
+   client barriers share the same incarnation key. Drag translation uses one
+   client observation for both endpoints, with local lifetime checks bracketing
+   that translation; this is still not the later plugin grant guard.
 2. **Window-local/plugin dispatch guard is not end-to-end.** Native desktop
    translation and screenshot/zoom admission check qualified identity, but those
    guards are not yet carried through every later window-action overlay wait and
    plugin retry. A moved client with the same dimensions also needs pinned surface
    origin/revision for desktop-derived coordinates. This is a readiness blocker.
-3. **Recording hooks do not share one immutable per-turn capture object.** Each
-   screenshot and marker is individually fenced and normalized, but topology can
-   differ between their separate calls. Capture-ID markers are deliberately omitted
-   because this legacy hook lacks the consumed affine transform. Full recording
-   frame/marker binding remains a readiness blocker.
+3. **Recording action handoff is not yet complete.** The separately authored
+   immutable turn implementation is integrated and shares the actual composition
+   deadline. Desktop consumed admission is wired; unbound/capped/zoom points and
+   exact client/root/revision reconciliation still require dispatch-owner wiring.
+   Missing/unprovable handoff is classified unavailable, never guessed/retried.
 4. Held generic virtual pointers use a 100-ms idle poll, with bounded metadata
    query latency up to its IPC deadline, not synchronous event cancellation.
-   Destruction/flush on the original device still needs native cleanup evidence.
+   Original-device release-before-destroy has owner order/dropped/stalled-peer
+   unit coverage, but still needs native primary-seat button-state evidence.
+   Dropped command replies clean up on that original owner; unresolved receive
+   cancellation remains observed even when response send wins the timeout race.
+   The primary-seat owner refuses concurrent generic holds and quarantines after
+   unconfirmed cleanup rather than producing replacement pointer effects.
 5. macOS/Windows/X11 keep legacy unbound capture metadata. Shared signatures remain
    compatible, but their native builds/desktop qualification were not performed.
    macOS overlay remains main-screen scoped. Fractional artwork fidelity and seam

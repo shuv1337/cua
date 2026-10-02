@@ -14,6 +14,7 @@ pub mod ext_toplevel;
 pub mod hyprland;
 pub mod hyprland_capture;
 mod hyprland_compatibility;
+mod hyprland_events;
 pub mod hyprland_input;
 pub mod kwin_helper;
 pub mod overlay;
@@ -1346,14 +1347,25 @@ pub struct VptrSession {
     pub origin_y: i32,
     pub(super) frame: Option<hyprland::DesktopFrame>,
     effect_started: bool,
+    held_buttons: std::collections::HashSet<u32>,
+    owns_pointer: bool,
 }
 
 impl VptrSession {
+    fn sync(&mut self) -> anyhow::Result<()> {
+        if let Err(error) = bounded_roundtrip(&self.conn, &mut self.queue, &mut self.state) {
+            if self.effect_started {
+                self.cleanup_owned()?;
+                anyhow::bail!("held_pointer_partial_unknown: acknowledgment failed after input; owned cleanup acknowledged; do not replay: {error}");
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
     fn validate_frame(&mut self) -> anyhow::Result<()> {
         if let Some(frame) = &self.frame {
             if frame.validate_current().is_err() {
-                self.vptr.destroy();
-                let _ = self.conn.flush();
+                self.cleanup_owned()?;
                 if self.effect_started {
                     anyhow::bail!(
                         "desktop_frame_changed_after_input: partial/unknown effect; do not replay"
@@ -1390,6 +1402,99 @@ impl VptrSession {
             y,
         )
     }
+}
+
+impl Drop for VptrSession {
+    fn drop(&mut self) {
+        // Errors in intermediate phases must not strand an owned primary-seat
+        // button. Never reconnect or activate a replacement target here.
+        let _ = self.cleanup_owned();
+    }
+}
+
+impl
+    Dispatch<
+        wayland_client::protocol::wl_callback::WlCallback,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    > for State
+{
+    fn event(
+        _: &mut Self,
+        _: &wayland_client::protocol::wl_callback::WlCallback,
+        _: wayland_client::protocol::wl_callback::Event,
+        done: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        done.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// No worker is detached on timeout: this owner stops reading/sending and the
+/// caller tears down its original connection. Sync acknowledges protocol
+/// processing, not an application's semantic effect.
+fn bounded_roundtrip(
+    conn: &Connection,
+    queue: &mut wayland_client::EventQueue<State>,
+    state: &mut State,
+) -> anyhow::Result<()> {
+    use std::os::fd::{AsFd, AsRawFd};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let done = Arc::new(AtomicBool::new(false));
+    conn.display().sync(&queue.handle(), done.clone());
+    while !done.load(Ordering::Acquire) {
+        if Instant::now() >= deadline {
+            anyhow::bail!("Wayland acknowledgment deadline exceeded");
+        }
+        queue.dispatch_pending(state)?;
+        if done.load(Ordering::Acquire) {
+            break;
+        }
+        let writable = match conn.flush() {
+            Ok(()) => false,
+            Err(wayland_client::backend::WaylandError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                true
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let Some(read) = queue.prepare_read() else {
+            continue;
+        };
+        let mut poll = libc::pollfd {
+            fd: conn.as_fd().as_raw_fd(),
+            events: libc::POLLIN | if writable { libc::POLLOUT } else { 0 },
+            revents: 0,
+        };
+        let timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(i32::MAX as u128) as i32;
+        let result = unsafe { libc::poll(&mut poll, 1, timeout) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+        if result == 0 {
+            anyhow::bail!("Wayland acknowledgment deadline exceeded");
+        }
+        if poll.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            anyhow::bail!("Wayland acknowledgment peer disconnected");
+        }
+        if poll.revents & libc::POLLIN != 0 {
+            read.read()?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn pointer_abs(
@@ -1461,9 +1566,45 @@ impl DesktopInputSpace {
         );
         Ok((layout_x, layout_y))
     }
+
+    /// Screen-space accessibility bounds are layout-relative, not screenshot
+    /// pixels. Convert with this exact action snapshot before desktop dispatch.
+    pub fn from_layout(&self, x: i32, y: i32) -> (i32, i32) {
+        self.frame().map_or((x, y), |frame| frame.from_layout(x, y))
+    }
 }
 
 impl VptrSession {
+    fn button(&mut self, button: u32, state: ButtonState) {
+        if state == ButtonState::Pressed {
+            self.held_buttons.insert(button);
+        } else {
+            self.held_buttons.remove(&button);
+        }
+        self.vptr.button(event_time_ms(), button, state);
+    }
+
+    fn cleanup_owned(&mut self) -> anyhow::Result<()> {
+        if !self.owns_pointer {
+            return Ok(());
+        }
+        self.owns_pointer = false;
+        let ack = release_before_destroy(
+            self.held_buttons.drain(),
+            |button| {
+                self.vptr
+                    .button(event_time_ms(), button, ButtonState::Released)
+            },
+            || {
+                self.vptr.frame();
+                bounded_roundtrip(&self.conn, &mut self.queue, &mut self.state)
+            },
+            || self.vptr.destroy(),
+        );
+        let flush = self.conn.flush();
+        ack.and_then(|_| flush.map_err(Into::into)).map_err(|error| anyhow::anyhow!("cleanup_unconfirmed: partial/unknown effect; owned connection terminated: {error}"))
+    }
+
     /// Puts the pointer at output pixel `(px, py)` so the compositor picks
     /// the surface under it. A `motion_absolute` to where the pointer already
     /// is carries no motion, and Hyprland re-picks pointer focus only on
@@ -1482,13 +1623,29 @@ impl VptrSession {
         self.effect_started = true;
         self.vptr.motion_absolute(event_time_ms(), ax, ay, w, h);
         self.vptr.frame();
-        self.queue.roundtrip(&mut self.state)?;
+        self.sync()?;
         self.validate_frame()?;
         self.vptr.motion_absolute(event_time_ms(), px, py, w, h);
         self.vptr.frame();
-        self.queue.roundtrip(&mut self.state)?;
+        self.sync()?;
         Ok(())
     }
+}
+
+fn release_before_destroy(
+    buttons: impl IntoIterator<Item = u32>,
+    mut release: impl FnMut(u32),
+    acknowledge: impl FnOnce() -> anyhow::Result<()>,
+    destroy: impl FnOnce(),
+) -> anyhow::Result<()> {
+    for button in buttons {
+        release(button);
+    }
+    let result = acknowledge();
+    // Failure still terminates this device; it is explicitly NOT confirmed
+    // cleanup. Never spawn a replacement connection to finish the release.
+    destroy();
+    result
 }
 
 fn output_approach_point(
@@ -1585,8 +1742,35 @@ fn open_vptr_session_in(
     activate_window_id: Option<u64>,
     snapshot: Option<&hyprland::DesktopSnapshot>,
 ) -> anyhow::Result<VptrSession> {
+    open_vptr_session_cancellable_in(activate_window_id, snapshot, None)
+}
+
+fn open_vptr_session_cancellable_in(
+    activate_window_id: Option<u64>,
+    snapshot: Option<&hyprland::DesktopSnapshot>,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<VptrSession> {
+    let check_cancelled = || -> anyhow::Result<()> {
+        if cancelled.is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire)) {
+            anyhow::bail!("cancelled_before_input");
+        }
+        Ok(())
+    };
+    check_cancelled()?;
     let observed = if snapshot.is_none() && hyprland::is_session() {
-        Some(hyprland::desktop_snapshot()?)
+        match hyprland::desktop_snapshot() {
+            Ok(snapshot) => Some(snapshot),
+            Err(error)
+                if activate_window_id.is_some()
+                    && error
+                        .downcast_ref::<hyprland::UnsupportedDisplayTransform>()
+                        .is_some()
+                    && hyprland::single_rotated_window_pointer_legacy()? =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        }
     } else {
         None
     };
@@ -1594,15 +1778,24 @@ fn open_vptr_session_in(
     if let Some(snapshot) = snapshot {
         snapshot.frame.validate_current()?;
     }
-    let conn = Connection::connect_to_env()?;
+    let conn = if hyprland::is_session() {
+        let conn = hyprland::wayland_connection()?;
+        hyprland::verify_capture_peer(&conn)?;
+        conn
+    } else {
+        Connection::connect_to_env()?
+    };
+    if let Some(snapshot) = snapshot {
+        snapshot.frame.verify_action_connection(&conn)?;
+    }
     let mut queue = conn.new_event_queue::<State>();
     let qh = queue.handle();
     conn.display().get_registry(&qh, ());
 
     let mut state = State::default();
-    queue.roundtrip(&mut state)?;
+    bounded_roundtrip(&conn, &mut queue, &mut state)?;
     for _ in 0..4 {
-        queue.roundtrip(&mut state)?;
+        bounded_roundtrip(&conn, &mut queue, &mut state)?;
     }
 
     // Evaluate the virtual-pointer / NO_VPTR_MARKER path FIRST: on compositors
@@ -1648,10 +1841,25 @@ fn open_vptr_session_in(
     if let Some(id) = activate_window_id {
         let handle = matching_handle(&state, id)
             .ok_or_else(|| anyhow::anyhow!("no native Wayland toplevel for window_id {id}"))?;
+        check_cancelled()?;
         handle.activate(&seat);
-        queue.roundtrip(&mut state)?;
+        bounded_roundtrip(&conn, &mut queue, &mut state)?;
+        if let Some(snapshot) = snapshot {
+            snapshot.frame.validate_current().map_err(|error| {
+                anyhow::anyhow!(
+                    "desktop_frame_changed_after_input: activation partial/unknown effect; {error}"
+                )
+            })?;
+        }
     }
 
+    check_cancelled().map_err(|error| {
+        if activate_window_id.is_some() {
+            anyhow::anyhow!("cancelled_after_input: activation partial/unknown; {error}")
+        } else {
+            error
+        }
+    })?;
     let vptr = mgr.create_virtual_pointer(Some(&seat), &qh, ());
     let (origin_x, origin_y, output_w, output_h) = match snapshot {
         Some(snapshot) => {
@@ -1671,6 +1879,8 @@ fn open_vptr_session_in(
         origin_y,
         frame: snapshot.map(|snapshot| snapshot.frame.clone()),
         effect_started: activate_window_id.is_some(),
+        held_buttons: Default::default(),
+        owns_pointer: true,
     })
 }
 
@@ -1942,24 +2152,22 @@ fn click_vptr(
             sess.validate_frame()?;
             sess.vptr.motion_absolute(event_time_ms(), px, py, w, h);
             sess.vptr.frame();
-            sess.queue.roundtrip(&mut sess.state)?;
+            sess.sync()?;
         }
         std::thread::sleep(std::time::Duration::from_millis(15));
         sess.validate_frame()?;
-        sess.vptr.button(event_time_ms(), btn, ButtonState::Pressed);
+        sess.button(btn, ButtonState::Pressed);
         sess.vptr.frame();
-        sess.queue.roundtrip(&mut sess.state)?;
+        sess.sync()?;
         std::thread::sleep(std::time::Duration::from_millis(20));
-        sess.vptr
-            .button(event_time_ms(), btn, ButtonState::Released);
+        sess.button(btn, ButtonState::Released);
         sess.vptr.frame();
-        sess.queue.roundtrip(&mut sess.state)?;
+        sess.sync()?;
     }
     // Keep the synthetic-cursor registry in sync with the warp we just
     // performed so a subsequent `get_cursor_position` reflects reality.
     record_synth_cursor(sess.origin_x + px as i32, sess.origin_y + py as i32);
-    sess.vptr.destroy();
-    sess.queue.roundtrip(&mut sess.state)?;
+    sess.cleanup_owned()?;
     Ok(())
 }
 
@@ -2140,10 +2348,9 @@ fn scroll_vptr(
         sess.vptr.axis_source(AxisSource::Wheel);
         sess.vptr.axis_discrete(event_time_ms(), axis, value, sign);
         sess.vptr.frame();
-        sess.queue.roundtrip(&mut sess.state)?;
+        sess.sync()?;
     }
-    sess.vptr.destroy();
-    sess.queue.roundtrip(&mut sess.state)?;
+    sess.cleanup_owned()?;
     Ok(())
 }
 
@@ -2212,10 +2419,9 @@ fn move_cursor_absolute_vptr(
     sess.effect_started = true;
     sess.vptr.motion_absolute(event_time_ms(), px, py, w, h);
     sess.vptr.frame();
-    sess.queue.roundtrip(&mut sess.state)?;
+    sess.sync()?;
     record_synth_cursor(sess.origin_x + px as i32, sess.origin_y + py as i32);
-    sess.vptr.destroy();
-    sess.queue.roundtrip(&mut sess.state)?;
+    sess.cleanup_owned()?;
     Ok(())
 }
 
@@ -2328,12 +2534,12 @@ fn drag_vptr(
     sess.effect_started = true;
     sess.vptr.motion_absolute(event_time_ms(), fx, fy, w, h);
     sess.vptr.frame();
-    sess.queue.roundtrip(&mut sess.state)?;
+    sess.sync()?;
     std::thread::sleep(std::time::Duration::from_millis(15));
     sess.validate_frame()?;
-    sess.vptr.button(event_time_ms(), btn, ButtonState::Pressed);
+    sess.button(btn, ButtonState::Pressed);
     sess.vptr.frame();
-    sess.queue.roundtrip(&mut sess.state)?;
+    sess.sync()?;
     for s in 1..=n {
         sess.validate_frame()?;
         let t = s as f64 / n as f64;
@@ -2342,23 +2548,21 @@ fn drag_vptr(
         let (cx, cy) = clamp_xy(ix, iy);
         sess.vptr.motion_absolute(event_time_ms(), cx, cy, w, h);
         sess.vptr.frame();
-        sess.queue.roundtrip(&mut sess.state)?;
+        sess.sync()?;
         std::thread::sleep(std::time::Duration::from_millis(8));
     }
     let (tx, ty) = clamp_xy(to_x, to_y);
     sess.validate_frame()?;
     sess.vptr.motion_absolute(event_time_ms(), tx, ty, w, h);
     sess.vptr.frame();
-    sess.queue.roundtrip(&mut sess.state)?;
-    sess.vptr
-        .button(event_time_ms(), btn, ButtonState::Released);
+    sess.sync()?;
+    sess.button(btn, ButtonState::Released);
     sess.vptr.frame();
     // Sync the synthetic-cursor registry with the drag endpoint so a
     // subsequent `get_cursor_position` reports where we left the pointer.
     record_synth_cursor(origin_x + tx as i32, origin_y + ty as i32);
-    sess.queue.roundtrip(&mut sess.state)?;
-    sess.vptr.destroy();
-    sess.queue.roundtrip(&mut sess.state)?;
+    sess.sync()?;
+    sess.cleanup_owned()?;
     Ok(())
 }
 
@@ -3977,6 +4181,71 @@ mod output_transform_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn positive_layout_checkbox_is_not_translated_twice_under_negative_union_origin() {
+        let space = super::DesktopInputSpace {
+            snapshot: Some(super::hyprland::DesktopSnapshot {
+                frame: super::hyprland::DesktopFrame {
+                    peer: None,
+                    x: -2560,
+                    y: -100,
+                    width: 5120,
+                    height: 1440,
+                    scale: 1.5,
+                    outputs: Vec::new(),
+                    identity:
+                        cua_driver_core::capture_runtime::CaptureFrameIdentity::from_native_snapshot(
+                            b"negative-checkbox-frame",
+                        ),
+                },
+                pointer: Some((-2560, -100, 5120, 1440)),
+            }),
+        };
+        let frame_point = space.from_layout(100, 100);
+        assert_eq!(frame_point, (2660, 200));
+        assert_eq!(space.to_layout(frame_point.0, frame_point.1), (100, 100));
+    }
+    #[test]
+    fn owned_buttons_release_then_ack_then_destroy_even_on_ack_failure() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = super::release_before_destroy(
+            [272, 273],
+            |button| events.borrow_mut().push(format!("release:{button}")),
+            || {
+                events.borrow_mut().push("ack".into());
+                anyhow::bail!("dropped peer")
+            },
+            || events.borrow_mut().push("destroy".into()),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            *events.borrow(),
+            ["release:272", "release:273", "ack", "destroy"]
+        );
+    }
+
+    #[test]
+    fn roundtrip_dropped_peer_is_bounded_without_a_detached_worker() {
+        let (socket, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let conn = wayland_client::Connection::from_socket(socket).unwrap();
+        let mut queue = conn.new_event_queue::<super::State>();
+        drop(peer);
+        let start = std::time::Instant::now();
+        assert!(super::bounded_roundtrip(&conn, &mut queue, &mut super::State::default()).is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn roundtrip_stalled_peer_expires_in_the_original_owner() {
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let conn = wayland_client::Connection::from_socket(socket).unwrap();
+        let mut queue = conn.new_event_queue::<super::State>();
+        let start = std::time::Instant::now();
+        let error =
+            super::bounded_roundtrip(&conn, &mut queue, &mut super::State::default()).unwrap_err();
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+    }
     /// The pointer always moves before a desktop click or scroll, even when
     /// it already sits on the target pixel (corners and 1-pixel outputs too).
     #[test]

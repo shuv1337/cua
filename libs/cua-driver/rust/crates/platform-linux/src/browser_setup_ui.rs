@@ -620,11 +620,9 @@ fn set_remote_debugging(
                             .checked_add(i32::try_from(height / 2)?)
                             .ok_or_else(|| anyhow::anyhow!("checkbox center y overflowed"))?;
                         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-                            // AT-SPI screen bounds are layout coordinates, as in
-                            // browser_consent_ui's click_focused path, not
-                            // desktop-frame points, so no frame conversion applies.
-                            let space = crate::wayland::DesktopInputSpace::default();
-                            crate::wayland::click_desktop(&space, center_x, center_y, 1, 1)?;
+                            let space = crate::wayland::DesktopInputSpace::current()?;
+                            let (frame_x, frame_y) = space.from_layout(center_x, center_y);
+                            crate::wayland::click_desktop(&space, frame_x, frame_y, 1, 1)?;
                         } else {
                             crate::input::send_click_xtest_desktop(center_x, center_y, 1, 1)?;
                         }

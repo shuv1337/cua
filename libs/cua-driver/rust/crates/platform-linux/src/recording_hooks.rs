@@ -169,7 +169,7 @@ impl RecordingTurnContext for HyprlandRecordingTurn {
                 self.composite,
                 deadline,
                 || single_output_recording_capture(deadline),
-                crate::wayland::hyprland::compose_desktop_capture,
+                |frame| crate::wayland::hyprland::compose_desktop_capture_until(frame, deadline),
             )
             .map_err(|error| {
                 if error.to_string().contains("timeout") || error.to_string().contains("budget") {
@@ -464,7 +464,9 @@ pub fn screenshot_for_recording(window_id: Option<u64>, pid: Option<i64>) -> Opt
                         plan.composite,
                         deadline,
                         || single_output_recording_capture(deadline),
-                        crate::wayland::hyprland::compose_desktop_capture,
+                        |frame| {
+                            crate::wayland::hyprland::compose_desktop_capture_until(frame, deadline)
+                        },
                     )
                     .ok()?;
                     frame.validate_current().ok()?;
@@ -715,6 +717,7 @@ mod tests {
         use crate::wayland::hyprland::{DesktopFrame, FrameOutput};
         use cua_driver_core::recording_frame::RecordingFrame;
         let frame = DesktopFrame {
+            peer: None,
             x: -8,
             y: 0,
             width: 8,

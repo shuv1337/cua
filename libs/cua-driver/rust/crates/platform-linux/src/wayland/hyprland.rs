@@ -168,6 +168,53 @@ pub struct DesktopFrame {
     pub scale: f64,
     pub outputs: Vec<FrameOutput>,
     pub identity: cua_driver_core::capture_runtime::CaptureFrameIdentity,
+    pub(crate) peer: Option<CompositorPeer>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompositorPeer {
+    pid: libc::pid_t,
+    start_time: String,
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl CompositorPeer {
+    fn from_ipc(ipc: &UnixStream) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let path = ipc_path()?;
+        let metadata = std::fs::metadata(&path)?;
+        let pid = peer_pid(ipc.as_raw_fd())?;
+        Ok(Self {
+            pid,
+            start_time: process_start_time(pid)?,
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    fn verify_connection(&self, conn: &wayland_client::Connection) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(&self.path)?;
+        if peer_pid(conn.backend().poll_fd().as_raw_fd())? != self.pid
+            || process_start_time(self.pid)? != self.start_time
+            || metadata.dev() != self.device
+            || metadata.ino() != self.inode
+        {
+            bail!(cua_driver_core::capture_runtime::CaptureActionError::NativeActionFrameMismatch);
+        }
+        Ok(())
+    }
+}
+
+fn process_start_time(pid: libc::pid_t) -> Result<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    stat.rsplit_once(')')
+        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+        .map(str::to_owned)
+        .context("compositor lifetime unavailable")
 }
 
 impl DesktopFrame {
@@ -191,33 +238,32 @@ impl DesktopFrame {
         Ok(point)
     }
 
-    fn bind_compositor(mut self) -> Result<Self> {
-        use std::os::unix::fs::MetadataExt;
-        let path = ipc_path()?;
-        let socket = std::fs::metadata(&path)?;
-        let ipc = ipc_connection()?;
-        let pid = peer_pid(ipc.as_raw_fd())?;
+    fn bind_compositor(mut self, peer: CompositorPeer) -> Result<Self> {
         let wayland = wayland_connection()?;
-        if peer_pid(wayland.backend().poll_fd().as_raw_fd())? != pid {
-            bail!("Hyprland capture frame compositor identity changed");
-        }
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-        let start_time = stat
-            .rsplit_once(')')
-            .and_then(|(_, fields)| fields.split_whitespace().nth(19))
-            .context("Hyprland compositor lifetime unavailable")?;
+        peer.verify_connection(&wayland)?;
+        let incarnation = format!("{peer:?}");
+        let events = super::hyprland_events::barrier(&incarnation, &peer.path, peer.pid)?;
+        // v0.56.2 socket2 omits layout/mode/DPMS signals. The already-loaded
+        // production v3 plugin exports its monotonic event generations via
+        // existing status; socket2 alone cannot certify those ABA transitions.
+        let plugin_epoch = topology_plugin_epoch(&peer)?;
         self.identity =
             cua_driver_core::capture_runtime::CaptureFrameIdentity::from_native_snapshot(
                 format!(
-                    "{:?}:{:?}:{}:{}:{pid}:{start_time}",
-                    self.identity,
-                    path,
-                    socket.dev(),
-                    socket.ino()
+                    "{:?}:{incarnation}:{events:?}:{plugin_epoch:?}",
+                    self.identity
                 )
                 .as_bytes(),
             );
+        self.peer = Some(peer);
         Ok(self)
+    }
+
+    pub(crate) fn verify_action_connection(&self, conn: &wayland_client::Connection) -> Result<()> {
+        self.peer
+            .as_ref()
+            .context("qualified action frame has no original compositor peer")?
+            .verify_connection(conn)
     }
 
     /// A final freshness check is not an atomic compositor transaction. Refuse
@@ -281,9 +327,116 @@ pub struct Window {
     pub focus_order: i64,
 }
 
+/// Client-local pixels are independent of monitor rotation, origin and DPMS
+/// on another output. This binds exact client lifetime, process/compositor
+/// incarnation and current logical dimensions, not the aggregate desktop.
+#[derive(Clone, Debug)]
+pub struct LocalWindowFrame {
+    pub identity: cua_driver_core::capture_runtime::CaptureFrameIdentity,
+    pub width: u32,
+    pub height: u32,
+    pid: u32,
+    address: u64,
+}
+
+impl LocalWindowFrame {
+    pub fn validate_current(&self) -> Result<()> {
+        if local_window_frame(self.pid, self.address)?.identity != self.identity {
+            bail!(cua_driver_core::capture_runtime::CaptureActionError::NativeActionFrameMismatch);
+        }
+        Ok(())
+    }
+}
+
+pub fn local_window_frame(pid: u32, address: u64) -> Result<LocalWindowFrame> {
+    let ipc = ipc_connection()?;
+    let peer = CompositorPeer::from_ipc(&ipc)?;
+    let conn = wayland_connection()?;
+    peer.verify_connection(&conn)?;
+    let incarnation = format!("{peer:?}");
+    let before =
+        super::hyprland_events::window_barrier(&incarnation, &peer.path, peer.pid, address)?;
+    let (windows, observed) = list_windows_with_peer()?;
+    if observed != peer {
+        bail!("native client observation belongs to a successor compositor");
+    }
+    let window = windows
+        .into_iter()
+        .find(|window| window.address == address)
+        .filter(|window| window.pid == pid)
+        .context("native client identity unavailable")?;
+    let process_stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let process_start = process_stat
+        .rsplit_once(')')
+        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+        .context("client process lifetime unavailable")?;
+    let after =
+        super::hyprland_events::window_barrier(&incarnation, &peer.path, peer.pid, address)?;
+    if before != after {
+        bail!("native client lifetime changed during observation");
+    }
+    Ok(LocalWindowFrame {
+        identity: cua_driver_core::capture_runtime::CaptureFrameIdentity::from_native_snapshot(
+            format!(
+                "client:{incarnation}:{pid}:{process_start}:{address}:{before:?}:{}:{}",
+                window.width, window.height
+            )
+            .as_bytes(),
+        ),
+        width: window.width,
+        height: window.height,
+        pid,
+        address,
+    })
+}
+
 pub fn is_session() -> bool {
     !super::is_inject_mode()
         && std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some_and(|s| !s.is_empty())
+}
+
+fn topology_plugin_epoch(peer: &CompositorPeer) -> Result<Vec<(u64, String, u64)>> {
+    let (status, observed): (serde_json::Value, _) = query_with_peer("j/cua:status").context("topology_epoch_unavailable: loaded production v3 plugin required for Hyprland layout/DPMS ABA")?;
+    if &observed != peer {
+        bail!("topology_epoch_unavailable: plugin status belongs to a successor compositor");
+    }
+    topology_plugin_epoch_from_status(&status)
+        .context("topology_epoch_unavailable: incomplete production plugin event authority")
+}
+
+fn topology_plugin_epoch_from_status(
+    status: &serde_json::Value,
+) -> Result<Vec<(u64, String, u64)>> {
+    let input = &status["input"];
+    if input["protocol"] != 3 || input["test_only"] != false || input["transport_ready"] != true {
+        bail!("topology_epoch_unavailable: production v3 event authority unavailable");
+    }
+    let lanes = input["lanes"]
+        .as_array()
+        .context("missing topology authority lanes")?;
+    if lanes.len() != 2 {
+        bail!("invalid topology authority lane count");
+    }
+    let mut epochs = Vec::new();
+    for lane in lanes {
+        let id = lane["lane"]
+            .as_u64()
+            .context("invalid authority lane identity")?;
+        let epoch = lane["epoch"]
+            .as_str()
+            .filter(|epoch| !epoch.is_empty())
+            .context("missing authority incarnation")?;
+        let generation = lane["desktop_generation"]
+            .as_u64()
+            .filter(|generation| *generation > 0 && *generation < u64::MAX)
+            .context("invalid authority generation")?;
+        epochs.push((id, epoch.to_owned(), generation));
+    }
+    epochs.sort();
+    if epochs[0].0 != 0 || epochs[1].0 != 1 {
+        bail!("invalid topology authority lane identities");
+    }
+    Ok(epochs)
 }
 
 fn ipc_path() -> Result<PathBuf> {
@@ -327,7 +480,7 @@ pub(super) fn peer_pid(fd: RawFd) -> Result<libc::pid_t> {
 }
 
 fn ipc_connection() -> Result<UnixStream> {
-    ipc_connection_with_timeout(QUERY_TIMEOUT)
+    ipc_connection_with_timeout(remaining_budget(QUERY_TIMEOUT)?)
 }
 
 fn ipc_connection_with_timeout(timeout: Duration) -> Result<UnixStream> {
@@ -340,7 +493,7 @@ fn ipc_connection_with_timeout(timeout: Duration) -> Result<UnixStream> {
 /// WAYLAND_SOCKET descriptors are deliberately unsupported here: this adapter
 /// opens independent, attested connections for each observation.
 pub(super) fn wayland_connection() -> Result<wayland_client::Connection> {
-    wayland_connection_with_timeout(QUERY_TIMEOUT)
+    wayland_connection_with_timeout(remaining_budget(QUERY_TIMEOUT)?)
 }
 
 fn wayland_connection_with_timeout(timeout: Duration) -> Result<wayland_client::Connection> {
@@ -377,8 +530,12 @@ pub(super) fn verify_capture_peer(connection: &wayland_client::Connection) -> Re
 }
 
 fn query<T: serde::de::DeserializeOwned>(command: &str) -> Result<T> {
+    query_with_peer(command).map(|(value, _)| value)
+}
+
+fn query_with_peer<T: serde::de::DeserializeOwned>(command: &str) -> Result<(T, CompositorPeer)> {
     let mut expected_peer = None;
-    query_with(
+    let value = query_with(
         command,
         QUERY_TIMEOUT,
         QUERY_TOTAL_TIMEOUT,
@@ -388,25 +545,61 @@ fn query<T: serde::de::DeserializeOwned>(command: &str) -> Result<T> {
             // A stale inherited instance signature must not supply geometry for
             // a different nested desktop. Re-attest both sockets on every try.
             let wayland = wayland_connection_with_timeout(query_time_remaining(deadline)?)?;
-            let peer = peer_pid(ipc.as_raw_fd())?;
-            if peer != peer_pid(wayland.backend().poll_fd().as_raw_fd())? {
-                bail!("Hyprland IPC and WAYLAND_DISPLAY name different compositor processes");
-            }
-            if expected_peer.is_some_and(|expected| expected != peer) {
+            let peer = CompositorPeer::from_ipc(&ipc)?;
+            peer.verify_connection(&wayland)?;
+            if expected_peer
+                .as_ref()
+                .is_some_and(|expected| expected != &peer)
+            {
                 bail!("Hyprland compositor changed during observation retry");
             }
             expected_peer = Some(peer);
             Ok(ipc)
         },
-    )
+    )?;
+    Ok((
+        value,
+        expected_peer.context("compositor observation has no attested peer")?,
+    ))
 }
 
 fn query_time_remaining(deadline: Instant) -> Result<Duration> {
+    let deadline = CAPTURE_DEADLINE.with(|capture| {
+        capture
+            .get()
+            .map_or(deadline, |capture| capture.min(deadline))
+    });
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(io::Error::new(io::ErrorKind::TimedOut, "Hyprland IPC query timed out").into());
     }
     Ok(remaining)
+}
+
+thread_local! {
+    static CAPTURE_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn remaining_budget(maximum: Duration) -> Result<Duration> {
+    query_time_remaining(Instant::now() + maximum)
+}
+
+pub(super) fn with_observation_deadline<T>(
+    deadline: Instant,
+    work: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let effective = CAPTURE_DEADLINE
+        .with(|capture| capture.get().map_or(deadline, |outer| outer.min(deadline)));
+    let old = CAPTURE_DEADLINE.with(|capture| capture.replace(Some(effective)));
+    let _deadline = CaptureDeadlineGuard(old);
+    work()
+}
+
+struct CaptureDeadlineGuard(Option<Instant>);
+impl Drop for CaptureDeadlineGuard {
+    fn drop(&mut self) {
+        CAPTURE_DEADLINE.with(|capture| capture.set(self.0));
+    }
 }
 
 fn is_query_timeout(error: &anyhow::Error) -> bool {
@@ -432,7 +625,7 @@ fn query_with<T: serde::de::DeserializeOwned>(
     // dispatch commands. JSON output does not imply a read-only operation.
     let read_only = matches!(
         command,
-        "j/monitors" | "j/clients" | "j/activewindow" | "j/cursorpos"
+        "j/monitors" | "j/clients" | "j/activewindow" | "j/cursorpos" | "j/cua:status"
     );
     for attempt in 1..=QUERY_MAX_ATTEMPTS {
         query_time_remaining(deadline)?;
@@ -490,6 +683,24 @@ fn read_reply(stream: &mut UnixStream, command: &[u8], timeout: Duration) -> Res
         reply.extend_from_slice(&chunk[..count]);
     }
     Ok(reply)
+}
+
+// v0.56.2 dispatch event posts an ordered `custom>>...` socket2 event.
+// It changes no desktop/input state; missing markers fail closed.
+pub(super) fn event_marker(marker: &str, peer: libc::pid_t) -> Result<()> {
+    let mut ipc = ipc_connection_with_timeout(remaining_budget(Duration::from_secs(1))?)?;
+    if peer_pid(ipc.as_raw_fd())? != peer {
+        bail!("Hyprland event marker compositor changed");
+    }
+    let reply = read_reply(
+        &mut ipc,
+        format!("dispatch event {marker}").as_bytes(),
+        remaining_budget(Duration::from_secs(1))?,
+    )?;
+    if reply != b"ok" {
+        bail!("Hyprland event barrier marker refused");
+    }
+    Ok(())
 }
 
 fn windows_from_clients(clients: Vec<Client>, active: &HashSet<i64>) -> Result<Vec<Window>> {
@@ -555,8 +766,9 @@ fn screen_size_from_monitors(monitors: Vec<DisplayMonitor>) -> Result<(u32, u32,
 /// desktop-frame (logical) pixels; positions are `None` for monitors outside
 /// the frame (standby). Mirrors are omitted: they repeat another output.
 pub fn screen_report() -> Result<(DesktopFrame, serde_json::Value)> {
-    let (frame, report) = screen_report_from_monitors(query("j/monitors")?)?;
-    Ok((frame.bind_compositor()?, report))
+    let (monitors, peer) = query_with_peer("j/monitors")?;
+    let (frame, report) = screen_report_from_monitors(monitors)?;
+    Ok((frame.bind_compositor(peer)?, report))
 }
 
 fn screen_report_from_monitors(
@@ -601,9 +813,23 @@ pub struct DesktopSnapshot {
 }
 
 pub fn desktop_snapshot() -> Result<DesktopSnapshot> {
-    let mut snapshot = desktop_snapshot_from_monitors(query("j/monitors")?)?;
-    snapshot.frame = snapshot.frame.bind_compositor()?;
+    let (monitors, peer) = query_with_peer("j/monitors")?;
+    let before = desktop_frame_from_monitors(monitors)?.bind_compositor(peer)?;
+    let (monitors, peer) = query_with_peer("j/monitors")?;
+    let mut snapshot = desktop_snapshot_from_monitors(monitors)?;
+    snapshot.frame = snapshot.frame.bind_compositor(peer)?;
+    if before.identity != snapshot.frame.identity {
+        bail!(cua_driver_core::capture_runtime::CaptureActionError::NativeActionFrameMismatch);
+    }
     Ok(snapshot)
+}
+
+/// Preserve the pre-aggregate single-output window-local adapter when its
+/// output is rotated. This does NOT authorize desktop-derived coordinates or
+/// qualify an aggregate transform: its pointer frame remains explicitly legacy.
+pub(super) fn single_rotated_window_pointer_legacy() -> Result<bool> {
+    let monitors: Vec<DisplayMonitor> = query("j/monitors")?;
+    Ok(monitors.len() == 1 && monitors[0].powered() && monitors[0].transform != 0)
 }
 
 fn desktop_snapshot_from_monitors(monitors: Vec<DisplayMonitor>) -> Result<DesktopSnapshot> {
@@ -615,7 +841,7 @@ fn desktop_snapshot_from_monitors(monitors: Vec<DisplayMonitor>) -> Result<Deskt
 
 /// Current desktop frame spanning every powered output.
 pub fn desktop_frame() -> Result<DesktopFrame> {
-    desktop_frame_from_monitors(query("j/monitors")?)?.bind_compositor()
+    Ok(desktop_snapshot()?.frame)
 }
 
 fn desktop_frame_from_monitors(mut monitors: Vec<DisplayMonitor>) -> Result<DesktopFrame> {
@@ -701,6 +927,7 @@ fn desktop_frame_from_monitors(mut monitors: Vec<DisplayMonitor>) -> Result<Desk
         scale,
         outputs,
         identity,
+        peer: None,
     })
 }
 
@@ -811,8 +1038,8 @@ fn pointer_space_from_monitors(
 /// output: if the monitor query fails, the capture fails too, rather than
 /// copying one output of what may be a multi-monitor desktop.
 pub fn composite_desktop_capture() -> Option<Result<Vec<u8>>> {
-    let monitors: Vec<DisplayMonitor> = match query("j/monitors") {
-        Ok(monitors) => monitors,
+    let (monitors, peer): (Vec<DisplayMonitor>, _) = match query_with_peer("j/monitors") {
+        Ok(observation) => observation,
         Err(error) => return Some(Err(error)),
     };
     // One output: use the generic capture. It needs no desktop frame, so
@@ -823,7 +1050,7 @@ pub fn composite_desktop_capture() -> Option<Result<Vec<u8>>> {
     }
     Some(
         desktop_frame_from_monitors(monitors)
-            .and_then(DesktopFrame::bind_compositor)
+            .and_then(|frame| frame.bind_compositor(peer))
             .and_then(|frame| compose_desktop_capture(&frame)),
     )
 }
@@ -836,8 +1063,13 @@ pub struct DesktopCapturePlan {
 }
 
 pub fn desktop_capture_plan() -> Result<DesktopCapturePlan> {
-    let mut plan = desktop_capture_plan_from_monitors(query("j/monitors")?)?;
-    plan.frame = plan.frame.bind_compositor()?;
+    let before = desktop_frame()?;
+    let (monitors, peer) = query_with_peer("j/monitors")?;
+    let mut plan = desktop_capture_plan_from_monitors(monitors)?;
+    plan.frame = plan.frame.bind_compositor(peer)?;
+    if before.identity != plan.frame.identity {
+        bail!(cua_driver_core::capture_runtime::CaptureActionError::NativeActionFrameMismatch);
+    }
     Ok(plan)
 }
 
@@ -851,15 +1083,28 @@ fn desktop_capture_plan_from_monitors(monitors: Vec<DisplayMonitor>) -> Result<D
 
 /// Compose `frame` from per-output captures (see [`composite_desktop_capture`]).
 pub fn compose_desktop_capture(frame: &DesktopFrame) -> Result<Vec<u8>> {
+    compose_desktop_capture_until(frame, Instant::now() + Duration::from_secs(10))
+}
+
+pub fn compose_desktop_capture_until(frame: &DesktopFrame, deadline: Instant) -> Result<Vec<u8>> {
+    let old = CAPTURE_DEADLINE.with(|capture| capture.replace(Some(deadline)));
+    let _deadline = CaptureDeadlineGuard(old);
+    capture_memory_budget(frame)?;
     frame.validate_current()?;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    capture_deadline(deadline)?;
     let canvas = compose_frame(frame, |output| {
-        let png = capture_output_png(&output.name, deadline)?;
+        capture_deadline(deadline)?;
+        let png = capture_output_png(
+            &output.name,
+            deadline,
+            u64::from(output.native_width) * u64::from(output.native_height) * 5 + 65536,
+        )?;
         use image::ImageDecoder;
         let mut limits = image::Limits::default();
         limits.max_image_width = Some(output.native_width);
         limits.max_image_height = Some(output.native_height);
-        limits.max_alloc = Some(MAX_LOGICAL_PIXELS * 4);
+        limits.max_alloc =
+            Some(u64::from(output.native_width) * u64::from(output.native_height) * 4);
         let decoder =
             image::codecs::png::PngDecoder::with_limits(std::io::Cursor::new(&png), limits)?;
         if decoder.dimensions() != (output.native_width, output.native_height) {
@@ -868,15 +1113,64 @@ pub fn compose_desktop_capture(frame: &DesktopFrame) -> Result<Vec<u8>> {
                 output.name
             );
         }
-        Ok(image::DynamicImage::from_decoder(decoder)?.to_rgba8())
+        let decoded = image::DynamicImage::from_decoder(decoder)?.to_rgba8();
+        capture_deadline(deadline)?;
+        Ok(decoded)
     })?;
+    capture_deadline(deadline)?;
     let mut encoded = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(canvas).write_to(&mut encoded, image::ImageFormat::Png)?;
+    capture_deadline(deadline)?;
     frame.validate_current()?;
+    capture_deadline(deadline)?;
     Ok(encoded.into_inner())
 }
 
-fn capture_output_png(name: &str, deadline: Instant) -> Result<Vec<u8>> {
+fn capture_deadline(deadline: Instant) -> Result<()> {
+    if Instant::now() >= deadline {
+        bail!("desktop_capture_timeout: whole composition deadline exceeded");
+    }
+    Ok(())
+}
+
+fn capture_memory_budget(frame: &DesktopFrame) -> Result<()> {
+    let canvas = u64::from(frame.width) * u64::from(frame.height);
+    let native = frame
+        .outputs
+        .iter()
+        .map(|output| u64::from(output.native_width) * u64::from(output.native_height))
+        .max()
+        .unwrap_or(0);
+    let logical = frame
+        .outputs
+        .iter()
+        .map(|output| u64::from(output.width) * u64::from(output.height))
+        .max()
+        .unwrap_or(0);
+    // Sequential capture: account conservatively for Vec growth, simultaneous
+    // decoder/color-conversion buffers and Lanczos intermediate buffers, not
+    // merely the nominal final allocations. This is an adapter buffer budget,
+    // not an OS-level RSS cap or preemption of a running image-library phase.
+    let bytes = canvas
+        .checked_mul(14)
+        .and_then(|bytes| {
+            native
+                .checked_mul(26)
+                .and_then(|scratch| bytes.checked_add(scratch))
+        })
+        .and_then(|bytes| {
+            logical
+                .checked_mul(8)
+                .and_then(|scratch| bytes.checked_add(scratch))
+        })
+        .context("desktop_capture_limit: aggregate budget overflow")?;
+    if bytes > 384 * 1024 * 1024 {
+        bail!("desktop_capture_limit: aggregate memory budget exceeds 384 MiB");
+    }
+    Ok(())
+}
+
+fn capture_output_png(name: &str, deadline: Instant, max_bytes: u64) -> Result<Vec<u8>> {
     // The PNG is decoded right away, so skip compression.
     let mut child = std::process::Command::new("grim")
         .args(["-t", "png", "-l", "0", "-o", name, "-"])
@@ -901,7 +1195,7 @@ fn capture_output_png(name: &str, deadline: Instant) -> Result<Vec<u8>> {
             match stdout.read(&mut chunk) {
                 Ok(0) => eof = true,
                 Ok(count) => {
-                    if png.len() + count > (MAX_LOGICAL_PIXELS * 5) as usize {
+                    if png.len() as u64 + count as u64 > max_bytes {
                         bail!("desktop_capture_limit: output PNG exceeds byte limit");
                     }
                     png.extend_from_slice(&chunk[..count]);
@@ -977,10 +1271,12 @@ pub fn single_output_transform() -> Result<u32> {
 }
 
 pub fn list_windows() -> Result<Vec<Window>> {
-    let monitors: Vec<Monitor> = query("j/monitors")?;
-    // Windows on an output in DPMS standby are not visible while another
-    // output is on. With every output in standby the display is only idle,
-    // so its workspaces stay on screen.
+    list_windows_with_peer().map(|(windows, _)| windows)
+}
+
+fn list_windows_with_peer() -> Result<(Vec<Window>, CompositorPeer)> {
+    let (monitors, peer): (Vec<Monitor>, _) = query_with_peer("j/monitors")?;
+    // Preserve the current upstream all-standby observation/wake policy.
     let any_powered = monitors.iter().any(|m| m.dpms_status);
     let active = monitors
         .into_iter()
@@ -988,7 +1284,11 @@ pub fn list_windows() -> Result<Vec<Window>> {
         .flat_map(|m| [m.active_workspace.id, m.special_workspace.id])
         .filter(|id| *id != 0)
         .collect();
-    windows_from_clients(query("j/clients")?, &active)
+    let (clients, observed) = query_with_peer("j/clients")?;
+    if observed != peer {
+        bail!("native client list belongs to a successor compositor");
+    }
+    Ok((windows_from_clients(clients, &active)?, peer))
 }
 
 #[derive(Deserialize)]
@@ -1044,13 +1344,55 @@ pub fn desktop_to_window_local_in(
     x: f64,
     y: f64,
 ) -> Result<(f64, f64)> {
-    let window = window_for_address(address).context("native window identity unavailable")?;
-    let local = desktop_point_in_window(frame, &window, pid, address, x, y)?;
-    if window_for_address(address).as_ref() != Some(&window) {
+    let [local] = desktop_points_to_window_local_in(frame, pid, address, [(x, y)])?;
+    Ok(local)
+}
+
+/// All endpoints use one client observation, never independently re-derived
+/// origins. This brackets translation only; it is not a plugin grant or an
+/// authorization that survives later overlay waits/native dispatch.
+pub fn desktop_points_to_window_local_in<const N: usize>(
+    frame: &DesktopFrame,
+    pid: u32,
+    address: u64,
+    points: [(f64, f64); N],
+) -> Result<[(f64, f64); N]> {
+    let lifetime = local_window_frame(pid, address)?;
+    let (windows, peer) = list_windows_with_peer()?;
+    if frame.peer.as_ref() != Some(&peer) {
+        bail!("native window belongs to a different desktop compositor");
+    }
+    let window = windows
+        .into_iter()
+        .find(|window| window.address == address)
+        .context("native window identity unavailable")?;
+    let mut local = [(0.0, 0.0); N];
+    for (result, (x, y)) in local.iter_mut().zip(points) {
+        *result = desktop_point_in_window(frame, &window, pid, address, x, y)?;
+    }
+    let (windows, observed) = list_windows_with_peer()?;
+    if peer != observed
+        || !windows
+            .into_iter()
+            .any(|current| same_window_placement(&window, &current))
+    {
         bail!("native window geometry changed during desktop translation");
     }
+    lifetime.validate_current()?;
     frame.validate_current()?;
     Ok(local)
+}
+
+fn same_window_placement(original: &Window, current: &Window) -> bool {
+    current.pid == original.pid
+        && current.address == original.address
+        && current.x == original.x
+        && current.y == original.y
+        && current.width == original.width
+        && current.height == original.height
+        && current.visible == original.visible
+        && current.hidden == original.hidden
+        && current.workspace == original.workspace
 }
 
 fn desktop_point_in_window(
@@ -1061,7 +1403,7 @@ fn desktop_point_in_window(
     x: f64,
     y: f64,
 ) -> Result<(f64, f64)> {
-    if window.pid != pid || window.address != address || window.hidden {
+    if window.pid != pid || window.address != address || !window.visible {
         bail!("native window identity mismatch");
     }
     let (x, y) = frame.checked_layout_point(x, y)?;
@@ -1177,6 +1519,67 @@ pub fn capture(address: u64, pid: Option<u32>) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn translation_placement_ignores_titles_but_refuses_same_size_moved_client() {
+        let original = window(0x100000010, 42);
+        let mut current = original.clone();
+        current.title = "background title update".into();
+        current.focus_order += 1;
+        assert!(same_window_placement(&original, &current));
+        current.x += 1;
+        assert!(!same_window_placement(&original, &current));
+        current = original.clone();
+        current.address = 0x10;
+        assert!(!same_window_placement(&original, &current));
+        current = original.clone();
+        current.visible = false;
+        assert!(!same_window_placement(&original, &current));
+    }
+
+    #[test]
+    fn compositor_peer_identity_includes_lifetime_and_socket_incarnation() {
+        let original = CompositorPeer {
+            pid: 42,
+            start_time: "123".into(),
+            path: "/fixture/.socket.sock".into(),
+            device: 1,
+            inode: 2,
+        };
+        let mut current = original.clone();
+        current.start_time = "124".into();
+        assert_ne!(original, current);
+        current = original.clone();
+        current.inode += 1;
+        assert_ne!(original, current);
+        current = original.clone();
+        current.pid += 1;
+        assert_ne!(original, current);
+    }
+    #[test]
+    fn existing_plugin_status_epoch_is_monotonic_even_when_monitor_geometry_returns() {
+        let mut status = serde_json::json!({"input": {"protocol":3,"test_only":false,"transport_ready":true,"lanes":[
+            {"lane":0,"epoch":"original-0","desktop_generation":3},
+            {"lane":1,"epoch":"original-1","desktop_generation":3}
+        ]}});
+        let before = super::topology_plugin_epoch_from_status(&status).unwrap();
+        status["input"]["lanes"][0]["desktop_generation"] = serde_json::json!(5);
+        assert_ne!(
+            before,
+            super::topology_plugin_epoch_from_status(&status).unwrap()
+        );
+        status["input"]["lanes"][0]["epoch"] = serde_json::json!("successor-0");
+        status["input"]["lanes"][0]["desktop_generation"] = serde_json::json!(3);
+        assert_ne!(
+            before,
+            super::topology_plugin_epoch_from_status(&status).unwrap()
+        );
+        status["input"]["transport_ready"] = serde_json::json!(false);
+        assert!(super::topology_plugin_epoch_from_status(&status).is_err());
+        assert!(super::topology_plugin_epoch_from_status(
+            &serde_json::json!({"input":{"protocol":3}})
+        )
+        .is_err());
+    }
     use super::*;
 
     fn window(address: u64, pid: u32) -> Window {

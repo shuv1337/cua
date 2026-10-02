@@ -2040,7 +2040,7 @@ impl ToolRegistry {
             args = public_args.clone();
             namespace_runtime_args(&mut args, context, evidence);
         }
-        let recording_args = recording_args_for(resolved_name, &public_args);
+        let mut recording_args = recording_args_for(resolved_name, &public_args);
         if has_adapter("desktop_input")
             && (!runtime_proves_driver_owned || context.capability_manifest().is_some())
         {
@@ -2258,6 +2258,12 @@ impl ToolRegistry {
                     | "end_session"
             );
         let private_consent_turn = is_existing_profile_prepare(resolved_name, &args);
+        let desktop_binding = self.capture_service.binding_from_args(&args).ok();
+        if let Some(binding) = &desktop_binding {
+            let generation = serde_json::json!(binding.session_generation());
+            args["_action_capture_generation"] = generation.clone();
+            recording_args["_action_capture_generation"] = generation;
+        }
         let _desktop_action = if requires_desktop_coordination(
             resolved_name,
             &args,
@@ -2312,11 +2318,15 @@ impl ToolRegistry {
 
         // Desktop pixels read off a capped get_desktop_state image are mapped
         // back to the uncapped capture before any platform interprets them.
-        let desktop_binding = self.capture_service.binding_from_args(&args).ok();
-        crate::desktop_capture_scale::map_desktop_args_for_binding(
-            &mut args,
-            desktop_binding.as_ref(),
-        );
+        if !desktop_binding.as_ref().is_some_and(|binding| {
+            self.capture_service
+                .map_desktop_observation_args(binding, &mut args)
+        }) {
+            crate::desktop_capture_scale::map_desktop_args_for_binding(
+                &mut args,
+                desktop_binding.as_ref(),
+            );
+        }
         crate::tool_activity::note_tool_activity();
         let mut result = crate::recording::scope_dispatch_click_capture(
             pending_turn.as_ref(),

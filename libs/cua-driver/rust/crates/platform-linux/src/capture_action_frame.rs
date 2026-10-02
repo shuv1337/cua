@@ -8,6 +8,24 @@ fn window_target(pid: u32, window_id: u64) -> CaptureTarget {
     CaptureTarget::Window { pid, window_id }
 }
 
+/// Called before any capture work, never reconstructed after pixels arrive.
+pub fn pin_publication_binding(service: &CaptureService, args: &Value) -> anyhow::Result<Value> {
+    pin_publication_binding_for_target(service, args, CaptureTarget::PrimaryDesktop)
+}
+
+pub fn pin_publication_binding_for_target(
+    service: &CaptureService,
+    args: &Value,
+    target: CaptureTarget,
+) -> anyhow::Result<Value> {
+    let binding = service.binding_from_args(args)?;
+    let sequence = service.begin_publication(&binding, target)?;
+    let mut args = args.clone();
+    args["_capture_session_generation"] = serde_json::json!(binding.session_generation());
+    args["_capture_started_sequence"] = serde_json::json!(sequence);
+    Ok(args)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn publish(
     service: &CaptureService,
@@ -19,8 +37,20 @@ fn publish(
     screenshot_to_action: ScreenshotToActionTransform,
     frame_identity: Option<CaptureFrameIdentity>,
 ) -> anyhow::Result<String> {
-    let binding = service.binding_from_args(args)?;
-    let capture_id = service.publish_in_frame(
+    let binding = if let Some(generation) = args
+        .get("_capture_session_generation")
+        .and_then(Value::as_u64)
+    {
+        service.binding(
+            args.get("_session_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("capture session unavailable"))?,
+            generation,
+        )?
+    } else {
+        service.binding_from_args(args)?
+    };
+    let capture_id = service.publish_started_in_frame(
         CapturePublication {
             png_bytes: png_bytes.to_vec(),
             target,
@@ -37,6 +67,8 @@ fn publish(
             session_generation: binding.session_generation(),
         },
         frame_identity,
+        args.get("_capture_started_sequence")
+            .and_then(Value::as_u64),
     )?;
     Ok(capture_id.to_string())
 }
@@ -154,23 +186,30 @@ fn admit(
     screenshot_x: f64,
     screenshot_y: f64,
 ) -> anyhow::Result<(f64, f64)> {
+    // This function runs in the invocation future. Any future worker handoff
+    // must carry this handle and binding explicitly; neither may be reacquired
+    // after observation/consumption under a successor session generation.
+    let recording_sink = cua_driver_core::recording::recording_admission_sink();
+    let source_binding = service.binding_from_args(args)?;
     if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
-        let frame = crate::wayland::hyprland::desktop_frame()?;
-        let dimensions = match &target {
+        let (dimensions, identity, desktop_frame) = match &target {
             CaptureTarget::Window { pid, window_id } => {
-                let window = crate::wayland::hyprland::window_for_address(*window_id)
-                    .filter(|window| window.pid == *pid)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("native window identity changed after capture")
-                    })?;
-                (window.width, window.height)
+                let frame = crate::wayland::hyprland::local_window_frame(*pid, *window_id)?;
+                ((frame.width, frame.height), frame.identity, None)
             }
-            CaptureTarget::PrimaryDesktop => (frame.width, frame.height),
+            CaptureTarget::PrimaryDesktop => {
+                let frame = crate::wayland::hyprland::desktop_frame()?;
+                (
+                    (frame.width, frame.height),
+                    frame.identity.clone(),
+                    Some(frame),
+                )
+            }
         };
-        let admission = service.admit_action_in_frame(
+        let admission = service.admit_action_checked(
             CaptureActionRequest {
                 capture_id: service.parse_capture_id(capture_id)?,
-                binding: service.binding_from_args(args)?,
+                binding: source_binding.clone(),
                 target,
                 current_native_action_dimensions: NativeActionDimensions::new(
                     dimensions.0,
@@ -179,23 +218,40 @@ fn admit(
                 screenshot_x,
                 screenshot_y,
             },
-            Some(&frame.identity),
+            Some(&identity),
+            |x, y| {
+                desktop_frame
+                    .as_ref()
+                    .is_none_or(|frame| frame.checked_layout_point(x, y).is_ok())
+            },
         )?;
-        frame.validate_current()?;
+        if admission.target == CaptureTarget::PrimaryDesktop {
+            if let Some(sink) = &recording_sink {
+                sink.retain(&source_binding, &admission);
+            }
+        }
+        // Client-local identity is not global recording authority. Until an
+        // exact origin/root/revision guard is retained across dispatch, leave
+        // this marker explicitly unavailable rather than poisoning the sink
+        // with a local digest and attempting a later repair.
         return Ok((admission.action_x, admission.action_y));
     }
     let current_native_action_dimensions = live_action_dimensions(&target)?;
-    admit_with_live_dimensions(
-        service,
-        args,
-        capture_id,
+    let admission = service.admit_action(CaptureActionRequest {
+        capture_id: service.parse_capture_id(capture_id)?,
+        binding: source_binding.clone(),
         target,
         current_native_action_dimensions,
         screenshot_x,
         screenshot_y,
-    )
+    })?;
+    if let Some(sink) = &recording_sink {
+        sink.retain(&source_binding, &admission);
+    }
+    Ok((admission.action_x, admission.action_y))
 }
 
+#[cfg(test)]
 fn admit_with_live_dimensions(
     service: &CaptureService,
     args: &Value,
@@ -323,17 +379,23 @@ pub fn admit_desktop_click_in(
     let Some(frame) = space.frame() else {
         return admit_desktop_click(service, args, capture_id, screenshot_x, screenshot_y);
     };
+    let recording_sink = cua_driver_core::recording::recording_admission_sink();
+    let source_binding = service.binding_from_args(args)?;
     frame.validate_current()?;
     let request = CaptureActionRequest {
         capture_id: service.parse_capture_id(capture_id)?,
-        binding: service.binding_from_args(args)?,
+        binding: source_binding.clone(),
         target: CaptureTarget::PrimaryDesktop,
         current_native_action_dimensions: NativeActionDimensions::new(frame.width, frame.height)?,
         screenshot_x,
         screenshot_y,
     };
-    let admission = service.admit_action_in_frame(request, Some(&frame.identity))?;
-    frame.checked_layout_point(admission.action_x, admission.action_y)?;
+    let admission = service.admit_action_checked(request, Some(&frame.identity), |x, y| {
+        frame.checked_layout_point(x, y).is_ok()
+    })?;
+    if let Some(sink) = &recording_sink {
+        sink.retain(&source_binding, &admission);
+    }
     Ok((admission.action_x, admission.action_y))
 }
 
@@ -343,6 +405,67 @@ pub fn retire_runtime(service: &CaptureService) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn actual_publication_adapter_cannot_rebind_a_paused_capture_after_retirement() {
+        let service = std::sync::Arc::new(CaptureService::default());
+        let call = args("paused-native-adapter");
+        let pinned = pin_publication_binding(&service, &call).unwrap();
+        let (resume, wait) = std::sync::mpsc::channel();
+        let worker_service = service.clone();
+        let worker = std::thread::spawn(move || {
+            wait.recv().unwrap();
+            publish_desktop_in_frame(
+                &worker_service,
+                &pinned,
+                &png(4, 3, 0x42),
+                (4, 3),
+                (8, 6),
+                Some(CaptureFrameIdentity::from_native_snapshot(b"A")),
+            )
+        });
+        service.retire_session(&service.binding_from_args(&call).unwrap());
+        resume.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn reverse_adapter_completion_preserves_one_publication_identity_and_ratio() {
+        let service = CaptureService::default();
+        let call = args("reverse-native-adapter");
+        let old = pin_publication_binding(&service, &call).unwrap();
+        let new = pin_publication_binding(&service, &call).unwrap();
+        let identity = CaptureFrameIdentity::from_native_snapshot(b"new");
+        publish_desktop_in_frame(
+            &service,
+            &new,
+            &png(4, 3, 0x42),
+            (4, 3),
+            (8, 6),
+            Some(identity.clone()),
+        )
+        .unwrap();
+        assert!(publish_desktop_in_frame(
+            &service,
+            &old,
+            &png(2, 2, 0x42),
+            (2, 2),
+            (8, 6),
+            Some(CaptureFrameIdentity::from_native_snapshot(b"old"))
+        )
+        .is_err());
+        let binding = service.binding_from_args(&call).unwrap();
+        let mut point = serde_json::json!({"scope":"desktop", "x":1.0, "y":1.0});
+        assert!(service.map_desktop_observation_args(&binding, &mut point));
+        assert_eq!(point["x"], 2.0);
+        assert_eq!(point["y"], 2.0);
+        service
+            .validate_desktop_observation_source(
+                &binding,
+                &identity,
+                point["_native_desktop_observation"].as_str(),
+            )
+            .unwrap();
+    }
     use super::*;
     use cua_driver_core::capture_runtime::admission_error_code;
     use sha2::{Digest, Sha256};

@@ -851,6 +851,15 @@ impl CaptureRegistry {
         request: CaptureActionRequest,
         current_frame_identity: Option<&CaptureFrameIdentity>,
     ) -> Result<CaptureActionAdmission, CaptureActionError> {
+        self.admit_action_checked(request, current_frame_identity, |_, _| true)
+    }
+
+    fn admit_action_checked(
+        &self,
+        request: CaptureActionRequest,
+        current_frame_identity: Option<&CaptureFrameIdentity>,
+        point_allowed: impl FnOnce(f64, f64) -> bool,
+    ) -> Result<CaptureActionAdmission, CaptureActionError> {
         let now = self.clock.now();
         let mut inner = self
             .inner
@@ -898,7 +907,7 @@ impl CaptureRegistry {
         let (action_x, action_y) = capture
             .screenshot_to_action
             .apply(request.screenshot_x, request.screenshot_y);
-        if !action_x.is_finite() || !action_y.is_finite() {
+        if !action_x.is_finite() || !action_y.is_finite() || !point_allowed(action_x, action_y) {
             return Err(CaptureActionError::InvalidMappedPoint);
         }
         let admission = CaptureActionAdmission {
@@ -1116,13 +1125,25 @@ impl CaptureRegistry {
 
 static NEXT_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+// Lifetime, native identity, persistent stale bit, exact source ID, X/Y ratio.
+type DesktopObservation = (
+    CaptureBinding,
+    CaptureFrameIdentity,
+    bool,
+    CaptureId,
+    (f64, f64),
+);
+
 /// Runtime-owned facade for immutable capture publication, perception reads,
 /// and one-shot action admission.
 pub struct CaptureService {
     runtime_generation: u64,
+    runtime_retired: std::sync::atomic::AtomicBool,
     registry: CaptureRegistry,
     session_generations: Mutex<HashMap<Arc<str>, u64>>,
-    desktop_observations: Mutex<HashMap<Arc<str>, (CaptureBinding, CaptureFrameIdentity, bool)>>,
+    desktop_observations: Mutex<HashMap<Arc<str>, DesktopObservation>>,
+    publication_sequences: Mutex<HashMap<(CaptureBinding, CaptureTarget), u64>>,
+    next_publication_sequence: AtomicU64,
 }
 
 impl CaptureService {
@@ -1141,9 +1162,12 @@ impl CaptureService {
             .map_err(|_| CaptureStoreError::IdExhausted)?;
         Ok(Self {
             runtime_generation,
+            runtime_retired: std::sync::atomic::AtomicBool::new(false),
             registry: CaptureRegistry::with_clock(config, clock)?,
             session_generations: Mutex::new(HashMap::new()),
             desktop_observations: Mutex::new(HashMap::new()),
+            publication_sequences: Mutex::new(HashMap::new()),
+            next_publication_sequence: AtomicU64::new(1),
         })
     }
 
@@ -1188,7 +1212,14 @@ impl CaptureService {
             .and_then(serde_json::Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .ok_or(CaptureStoreError::InvalidBinding)?;
-        self.current_binding(Arc::<str>::from(session_id))
+        if let Some(generation) = args
+            .get("_action_capture_generation")
+            .and_then(serde_json::Value::as_u64)
+        {
+            self.binding(Arc::<str>::from(session_id), generation)
+        } else {
+            self.current_binding(Arc::<str>::from(session_id))
+        }
     }
 
     pub fn publish(&self, publication: CapturePublication) -> Result<CaptureId, CaptureStoreError> {
@@ -1200,6 +1231,47 @@ impl CaptureService {
         publication: CapturePublication,
         frame_identity: Option<CaptureFrameIdentity>,
     ) -> Result<CaptureId, CaptureStoreError> {
+        self.publish_started_in_frame(publication, frame_identity, None)
+    }
+
+    /// Pin ordering before pixel acquisition. A slower predecessor cannot
+    /// publish over a newer started capture, even when completion is reversed.
+    pub fn begin_publication(
+        &self,
+        binding: &CaptureBinding,
+        target: CaptureTarget,
+    ) -> Result<u64, CaptureStoreError> {
+        let generations = self
+            .session_generations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if self.runtime_retired.load(Ordering::Acquire)
+            || binding.runtime_generation != self.runtime_generation
+            || generations
+                .get(binding.session_id())
+                .is_some_and(|generation| *generation != binding.session_generation())
+        {
+            return Err(CaptureStoreError::InvalidBinding);
+        }
+        let sequence = self
+            .next_publication_sequence
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |sequence| {
+                sequence.checked_add(1)
+            })
+            .map_err(|_| CaptureStoreError::IdExhausted)?;
+        self.publication_sequences
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert((binding.clone(), target), sequence);
+        Ok(sequence)
+    }
+
+    pub fn publish_started_in_frame(
+        &self,
+        publication: CapturePublication,
+        frame_identity: Option<CaptureFrameIdentity>,
+        started_sequence: Option<u64>,
+    ) -> Result<CaptureId, CaptureStoreError> {
         let binding = self.binding(publication.session_id, publication.session_generation)?;
         // Hold the generation lock through publication/observation update so a
         // late capture cannot resurrect an observation after session retirement.
@@ -1207,15 +1279,36 @@ impl CaptureService {
             .session_generations
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        if frame_identity.is_some()
-            && generations.get(binding.session_id()).copied().unwrap_or(1)
-                != binding.session_generation()
+        if self.runtime_retired.load(Ordering::Acquire) {
+            return Err(CaptureStoreError::InvalidBinding);
+        }
+        if generations
+            .get(binding.session_id())
+            .is_some_and(|generation| *generation != binding.session_generation())
         {
             return Err(CaptureStoreError::InvalidBinding);
+        }
+        if let Some(sequence) = started_sequence {
+            if self
+                .publication_sequences
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&(binding.clone(), publication.target.clone()))
+                .copied()
+                != Some(sequence)
+            {
+                return Err(CaptureStoreError::InvalidBinding);
+            }
         }
         let desktop_identity = (publication.target == CaptureTarget::PrimaryDesktop)
             .then(|| frame_identity.clone())
             .flatten();
+        let desktop_scale = (
+            f64::from(publication.native_action_dimensions.width)
+                / f64::from(publication.encoded_dimensions.width),
+            f64::from(publication.native_action_dimensions.height)
+                / f64::from(publication.encoded_dimensions.height),
+        );
         let id = self.registry.store_in_frame(
             CaptureRegistration {
                 png_bytes: publication.png_bytes,
@@ -1231,7 +1324,10 @@ impl CaptureService {
             self.desktop_observations
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .insert(binding.session_id.clone(), (binding, identity, false));
+                .insert(
+                    binding.session_id.clone(),
+                    (binding, identity, false, id, desktop_scale),
+                );
         }
         Ok(id)
     }
@@ -1244,14 +1340,39 @@ impl CaptureService {
         binding: &CaptureBinding,
         current: &CaptureFrameIdentity,
     ) -> Result<(), CaptureActionError> {
+        self.validate_desktop_observation_source(binding, current, None)
+    }
+
+    pub fn validate_desktop_observation_source(
+        &self,
+        binding: &CaptureBinding,
+        current: &CaptureFrameIdentity,
+        source: Option<&str>,
+    ) -> Result<(), CaptureActionError> {
+        let generations = self
+            .session_generations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if self.runtime_retired.load(Ordering::Acquire)
+            || binding.runtime_generation != self.runtime_generation
+            || generations
+                .get(binding.session_id())
+                .is_some_and(|generation| *generation != binding.session_generation())
+        {
+            return Err(CaptureLookupError::GenerationMismatch.into());
+        }
         let mut observations = self
             .desktop_observations
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let Some((observed_binding, identity, stale)) = observations.get_mut(binding.session_id())
+        let Some((observed_binding, identity, stale, id, _)) =
+            observations.get_mut(binding.session_id())
         else {
             return Ok(());
         };
+        if source.is_some_and(|source| source != id.to_string()) {
+            return Err(CaptureActionError::NativeActionFrameMismatch);
+        }
         if observed_binding != binding || identity != current {
             *stale = true;
         }
@@ -1259,6 +1380,44 @@ impl CaptureService {
             return Err(CaptureActionError::NativeActionFrameMismatch);
         }
         Ok(())
+    }
+
+    /// Map from the same immutable publication that supplied frame identity.
+    /// The private source marker is revalidated by the platform after waits;
+    /// a concurrent refresh cannot combine predecessor ratios and new pixels.
+    pub fn map_desktop_observation_args(
+        &self,
+        binding: &CaptureBinding,
+        args: &mut serde_json::Value,
+    ) -> bool {
+        let desktop = args.get("scope").and_then(serde_json::Value::as_str) == Some("desktop")
+            || args
+                .get("coordinate_frame")
+                .and_then(serde_json::Value::as_str)
+                == Some("desktop");
+        if !desktop || args.get("capture_id").is_some() {
+            return false;
+        }
+        let observations = self
+            .desktop_observations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let Some((observed_binding, _, _, id, (fx, fy))) = observations.get(binding.session_id())
+        else {
+            return false;
+        };
+        if observed_binding != binding {
+            return false;
+        }
+        for (keys, factor) in [(["x", "from_x", "to_x"], fx), (["y", "from_y", "to_y"], fy)] {
+            for key in keys {
+                if let Some(value) = args.get(key).and_then(serde_json::Value::as_f64) {
+                    args[key] = serde_json::json!(value * factor);
+                }
+            }
+        }
+        args["_native_desktop_observation"] = serde_json::json!(id.to_string());
+        true
     }
 
     pub fn parse_capture_id(&self, value: &str) -> Result<CaptureId, CaptureIdParseError> {
@@ -1285,8 +1444,33 @@ impl CaptureService {
         request: CaptureActionRequest,
         current_frame_identity: Option<&CaptureFrameIdentity>,
     ) -> Result<CaptureActionAdmission, CaptureActionError> {
+        self.admit_action_checked(request, current_frame_identity, |_, _| true)
+    }
+
+    /// Platform coverage is checked after applying the stored affine transform
+    /// and before one-shot consumption, under the same retirement/admission lock.
+    pub fn admit_action_checked(
+        &self,
+        request: CaptureActionRequest,
+        current_frame_identity: Option<&CaptureFrameIdentity>,
+        point_allowed: impl FnOnce(f64, f64) -> bool,
+    ) -> Result<CaptureActionAdmission, CaptureActionError> {
+        // Same lock order as publication and retirement: lifetime admission
+        // and one-shot consumption linearize before or after retirement.
+        let generations = self
+            .session_generations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if self.runtime_retired.load(Ordering::Acquire)
+            || request.binding.runtime_generation != self.runtime_generation
+            || generations
+                .get(request.binding.session_id())
+                .is_some_and(|generation| *generation != request.binding.session_generation())
+        {
+            return Err(CaptureLookupError::GenerationMismatch.into());
+        }
         self.registry
-            .admit_action_in_frame(request, current_frame_identity)
+            .admit_action_checked(request, current_frame_identity, point_allowed)
     }
 
     /// Predict, without consuming anything, whether a capture-bound action
@@ -1317,12 +1501,12 @@ impl CaptureService {
     }
 
     pub fn retire_session(&self, binding: &CaptureBinding) -> usize {
+        let mut generations = self
+            .session_generations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let removed = self.registry.retire_session(binding);
         if binding.runtime_generation == self.runtime_generation {
-            let mut generations = self
-                .session_generations
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let generation = generations
                 .entry(binding.session_id.clone())
                 .or_insert(binding.session_generation);
@@ -1362,6 +1546,7 @@ impl CaptureService {
             .session_generations
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        self.runtime_retired.store(true, Ordering::Release);
         for generation in generations.values_mut() {
             *generation = generation.saturating_add(1).max(1);
         }
@@ -1519,6 +1704,62 @@ mod tests {
                 .unwrap_err(),
             CaptureActionError::Lookup(CaptureLookupError::Unknown)
         );
+    }
+
+    #[test]
+    fn admission_and_retirement_share_one_lifetime_linearization_lock() {
+        for _ in 0..32 {
+            let service = Arc::new(CaptureService::default());
+            let owner = service.current_binding("retire-race").unwrap();
+            let frame = CaptureFrameIdentity::from_native_snapshot(b"A");
+            let id = service
+                .publish_in_frame(
+                    CapturePublication {
+                        png_bytes: png(2, 2, 1),
+                        target: CaptureTarget::PrimaryDesktop,
+                        encoded_dimensions: EncodedScreenshotDimensions::new(2, 2).unwrap(),
+                        native_action_dimensions: NativeActionDimensions::new(2, 2).unwrap(),
+                        screenshot_to_action: ScreenshotToActionTransform::identity(),
+                        session_id: owner.session_id.clone(),
+                        session_generation: owner.session_generation,
+                    },
+                    Some(frame.clone()),
+                )
+                .unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let worker_service = service.clone();
+            let worker_owner = owner.clone();
+            let worker_frame = frame.clone();
+            let worker_barrier = barrier.clone();
+            let worker = std::thread::spawn(move || {
+                worker_barrier.wait();
+                worker_service.admit_action_in_frame(
+                    action_request(id, worker_owner, CaptureTarget::PrimaryDesktop, (2, 2)),
+                    Some(&worker_frame),
+                )
+            });
+            barrier.wait();
+            service.retire_session(&owner);
+            let result = worker.join().unwrap();
+            assert!(
+                result.is_ok()
+                    || matches!(
+                        result,
+                        Err(CaptureActionError::Lookup(
+                            CaptureLookupError::GenerationMismatch
+                        ))
+                    )
+            );
+            assert!(matches!(
+                service.admit_action_in_frame(
+                    action_request(id, owner, CaptureTarget::PrimaryDesktop, (2, 2)),
+                    Some(&frame)
+                ),
+                Err(CaptureActionError::Lookup(
+                    CaptureLookupError::GenerationMismatch
+                ))
+            ));
+        }
     }
 
     #[test]
