@@ -4069,6 +4069,58 @@ mod input_dispatch_tests {
     }
 }
 
+fn acknowledged_semantic_write<E: std::fmt::Display>(
+    reply: Option<std::result::Result<bool, E>>,
+) -> Result<()> {
+    match reply {
+        Some(Ok(true)) => Ok(()),
+        Some(Err(error)) => Err(SemanticDispatchUnknown(format!(
+            "semantic write outcome unknown: {error}; do not replay"
+        ))
+        .into()),
+        Some(Ok(false)) => Err(SemanticDispatchUnknown(
+            "semantic write was not accepted; do not replay".into(),
+        )
+        .into()),
+        None => Err(SemanticDispatchUnknown(
+            "semantic write was not acknowledged; do not replay".into(),
+        )
+        .into()),
+    }
+}
+
+#[cfg(test)]
+mod semantic_write_ack_tests {
+    use super::*;
+
+    #[test]
+    fn only_positive_acknowledgment_allows_commit() {
+        for reply in [None, Some(Err("reply lost")), Some(Ok(false))] {
+            let error = acknowledged_semantic_write(reply).unwrap_err();
+            assert!(error.is::<SemanticDispatchUnknown>());
+        }
+        assert!(acknowledged_semantic_write::<&str>(Some(Ok(true))).is_ok());
+    }
+
+    #[test]
+    fn uncertain_write_stops_before_commit_or_another_mutation() {
+        for reply in [
+            None,
+            Some(Err("exporter mutated then disconnected")),
+            Some(Ok(false)),
+        ] {
+            let mut commits = 0;
+            let mut write = || -> Result<()> {
+                acknowledged_semantic_write(reply)?;
+                commits += 1;
+                Ok(())
+            };
+            assert!(write().unwrap_err().is::<SemanticDispatchUnknown>());
+            assert_eq!(commits, 0);
+        }
+    }
+}
+
 /// Open a cached accessible and prove it is still alive (one role read).
 async fn live_accessible<'a>(
     conn: &'a AccessibilityConnection,
@@ -5886,6 +5938,7 @@ async fn set_value_on(
     has_value: bool,
     value: &str,
     label: &str,
+    started: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
     let proxies = acc
         .proxies()
@@ -5894,33 +5947,28 @@ async fn set_value_on(
     if let Ok(et) = proxies.editable_text().await {
         // Replace whole contents (parity with the Windows/macOS set_value,
         // which overwrite rather than insert at the caret).
-        if et.set_text_contents(value).await.unwrap_or(false) {
-            commit_editable_write(&proxies).await;
-            return Ok(());
-        }
-        // Some toolkits reject SetTextContents but accept an insert at the
-        // caret offset; clear-then-insert as a fallback.
-        let off = match proxies.text().await {
-            Ok(tp) => tp.caret_offset().await.unwrap_or(0),
-            Err(_) => 0,
-        };
-        let len = value.chars().count() as i32;
-        if et.insert_text(off, value, len).await.unwrap_or(false) {
-            commit_editable_write(&proxies).await;
-            return Ok(());
-        }
+        // A method error is not proof that the exporter did not mutate. Do not
+        // turn an unacknowledged replacement into an insertion or a Value write,
+        // including for callers using the older cached-ref API.
+        started.store(true, std::sync::atomic::Ordering::Release);
+        acknowledged_semantic_write(call(et.set_text_contents(value)).await)?;
+        commit_editable_write(&proxies).await;
+        return Ok(());
     }
     if has_value {
         let v: f64 = value
             .parse()
             .map_err(|_| anyhow!("value '{value}' is not numeric for a Value element"))?;
-        proxies
+        let vp = proxies
             .value()
             .await
-            .map_err(|e| anyhow!("Value unavailable: {e}"))?
-            .set_current_value(v)
-            .await
-            .map_err(|e| anyhow!("setCurrentValue failed: {e}"))?;
+            .map_err(|e| anyhow!("Value unavailable: {e}"))?;
+        started.store(true, std::sync::atomic::Ordering::Release);
+        acknowledged_semantic_write(
+            call(vp.set_current_value(v))
+                .await
+                .map(|r| r.map(|()| true)),
+        )?;
         return Ok(());
     }
     Err(anyhow!(
@@ -5929,6 +5977,7 @@ async fn set_value_on(
 }
 
 pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
+    let started = std::sync::atomic::AtomicBool::new(false);
     bounded_for(
         INDEX_RESOLVE_BUDGET,
         async {
@@ -5945,10 +5994,17 @@ pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
                 target.has_value,
                 value,
                 &format!("element {idx}"),
+                &started,
             )
             .await
         },
         || {
+            if started.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(SemanticDispatchUnknown(
+                    "set_value timed out after dispatch; do not replay".into(),
+                )
+                .into());
+            }
             Err(anyhow!(
                 "set_value timed out for pid {pid} (app unresponsive to AT-SPI)"
             ))
@@ -5992,10 +6048,7 @@ fn set_value_source(
                     let et = proxies.editable_text().await?;
                     live_semantic_source(conn, object_ref, source).await?;
                     started.store(true, std::sync::atomic::Ordering::Release);
-                    match call(et.set_text_contents(value)).await {
-                        Some(Ok(true)) => {},
-                        _ => return Err(SemanticDispatchUnknown("observed EditableText write was not acknowledged as accepted; no insert/value replay".into()).into()),
-                    }
+                    acknowledged_semantic_write(call(et.set_text_contents(value)).await)?;
                     // Commit is a second semantic effect, on the same original
                     // object only. Reconcile again after method discovery.
                     if let Some(Ok(ap)) = call(proxies.action()).await {
@@ -6028,13 +6081,11 @@ fn set_value_source(
                     let vp = proxies.value().await?;
                     live_semantic_source(conn, object_ref, source).await?;
                     started.store(true, std::sync::atomic::Ordering::Release);
-                    return match call(vp.set_current_value(value)).await {
-                        Some(Ok(())) => Ok(()),
-                        _ => Err(SemanticDispatchUnknown(
-                            "observed Value write outcome unknown; no replay".into(),
-                        )
-                        .into()),
-                    };
+                    return acknowledged_semantic_write(
+                        call(vp.set_current_value(value))
+                            .await
+                            .map(|r| r.map(|()| true)),
+                    );
                 }
                 return Err(anyhow!(
                     "{NO_VALUE_ROUTE}: observed element exposes neither EditableText nor Value"
@@ -6045,6 +6096,7 @@ fn set_value_source(
                 ifaces.contains(Interface::Value),
                 value,
                 "cached element",
+                &started,
             )
             .await
         },

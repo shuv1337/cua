@@ -5138,6 +5138,38 @@ fn a_failed_focus_out_never_hides_a_write_that_was_sent() {
     assert!(attempt(Err(anyhow::anyhow!("no editable exposed"))).is_none());
 }
 
+fn semantic_click_outcome(suspected_noop: bool, unacknowledged: bool) -> Value {
+    let mut structured = json!({
+        "path": "ax",
+        "verified": false,
+        "effect": if unacknowledged { "unknown" } else if suspected_noop { "suspected_noop" } else { "unverifiable" },
+    });
+    if unacknowledged {
+        structured["note"] =
+            json!("No acknowledgement received for the AT-SPI action; its effect is unknown.");
+    } else if suspected_noop {
+        structured["escalation"] = non_ax_escalation();
+    }
+    structured
+}
+
+#[cfg(test)]
+#[test]
+fn unacknowledged_semantic_click_never_offers_pointer_replay() {
+    for suspected_noop in [false, true] {
+        let outcome = semantic_click_outcome(suspected_noop, true);
+        assert_eq!(outcome["effect"], "unknown");
+        assert!(outcome.get("escalation").is_none());
+    }
+    assert_eq!(
+        semantic_click_outcome(true, false)["effect"],
+        "suspected_noop"
+    );
+    assert!(semantic_click_outcome(true, false)
+        .get("escalation")
+        .is_some());
+}
+
 #[cfg(test)]
 #[test]
 fn foreground_ax_click_error_does_not_claim_delivery_or_request_replay() {
@@ -7743,19 +7775,7 @@ impl Tool for ClickTool {
                     Err(_elapsed) => return element_ax_timeout(idx),
                 };
                 if let Ok(Ok(((_action, suspected_noop, unacknowledged), guard))) = ax_result {
-                    let mut structured = json!({
-                        "path": "ax",
-                        "verified": false,
-                        "effect": if suspected_noop { "suspected_noop" } else { "unverifiable" },
-                    });
-                    if suspected_noop {
-                        structured["escalation"] = non_ax_escalation();
-                    } else if unacknowledged {
-                        structured["note"] = json!(
-                            "no acknowledgement received for the doAction call within the \
-                             AT-SPI timeout; its effect is unknown"
-                        );
-                    }
+                    let structured = semantic_click_outcome(suspected_noop, unacknowledged);
                     return attach_focus_guard(
                         ToolResult::text(format!("Clicked element [{idx}] (pid {pid})."))
                             .with_structured(structured),
