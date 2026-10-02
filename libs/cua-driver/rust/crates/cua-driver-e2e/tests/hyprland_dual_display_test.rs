@@ -239,7 +239,7 @@ fn call(driver: &mut McpDriver, tool: &str, mut args: Value) -> Value {
     response.structured().clone()
 }
 
-fn capture(driver: &mut McpDriver, dir: &Path, cap: u32) -> (Value, RgbImage) {
+fn capture(driver: &mut McpDriver, dir: &Path, cap: u32, size: &Value) -> (Value, RgbImage) {
     let path = dir.join(format!("desktop-{cap}.png"));
     let state = call(
         driver,
@@ -259,12 +259,17 @@ fn capture(driver: &mut McpDriver, dir: &Path, cap: u32) -> (Value, RgbImage) {
     assert_eq!(state["screen_width"], 5120);
     assert_eq!(state["screen_height"], 1440);
     assert_eq!(
-        state["scale_factor"], 1.0,
-        "composite capture normalization, not output DPI multiplier"
+        state["scale_factor"], size["scale_factor"],
+        "output DPI metadata must match get_screen_size; never a coordinate multiplier"
     );
+    assert_eq!(state["scale_factor"], 1.5, "prepared output DPI metadata");
     if cap != 0 {
         assert_eq!(state["screenshot_original_width"], 5120);
         assert_eq!(state["screenshot_original_height"], 1440);
+        assert_eq!(
+            state["frame_scale"], 2.0,
+            "logical screen/image mapping ratio: 5120/2560, not output DPI"
+        );
     }
     (state, pixels)
 }
@@ -786,7 +791,7 @@ fn native_dual_output_capture_and_desktop_input() {
         assert_eq!(m["scale"], 1.5);
         assert_eq!(m["powered"], true);
     }
-    let (desktop_state, full) = capture(&mut driver, dir.path(), 0);
+    let (desktop_state, full) = capture(&mut driver, dir.path(), 0, &size);
     // Independent logical per-output captures: filtering is not required to be
     // byte-identical to Driver resampling; compare interior colors and markers.
     for (output, offset) in [("DP-2", 0), ("DP-1", 2560)] {
@@ -837,7 +842,7 @@ fn native_dual_output_capture_and_desktop_input() {
     }
     click(&mut driver, &left, &right, 2559.0, 720.0, None, None);
     click(&mut driver, &right, &left, 2560.0, 720.0, None, None);
-    let (_, capped) = capture(&mut driver, dir.path(), 2560);
+    let (_, capped) = capture(&mut driver, dir.path(), 2560, &size);
     pixel_close(capped.get_pixel(1920, 500), full.get_pixel(3840, 1000));
     let left_marker = marker(&capped, 0);
     let right_marker = marker(&capped, 1);
@@ -866,7 +871,7 @@ fn native_dual_output_capture_and_desktop_input() {
         None,
     );
     // Capture-bound mapping owns the transform: no second preview compensation.
-    let (state, pixels) = capture(&mut driver, dir.path(), 2560);
+    let (state, pixels) = capture(&mut driver, dir.path(), 2560, &size);
     let id = state["capture_id"]
         .as_str()
         .expect("immutable desktop capture ID");
@@ -911,7 +916,7 @@ fn native_dual_output_capture_and_desktop_input() {
     );
     pointer(&mut driver, 3840.0, 720.0);
     // Restore uncapped session mapping before independent scroll/drag checks.
-    capture(&mut driver, dir.path(), 0);
+    capture(&mut driver, dir.path(), 0, &size);
     for f in [&left, &right] {
         let journal = events(&f.journal);
         let before = journal.len();
