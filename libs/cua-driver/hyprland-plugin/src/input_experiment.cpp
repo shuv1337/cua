@@ -222,6 +222,7 @@ struct InputExperiment::Impl {
     InputGrant grant;
     std::optional<Drag> drag;
     std::optional<Held> held;
+    bool held_cleanup_unconfirmed = false;
     std::uint32_t held_button = 0;
     std::vector<std::uint32_t> held_keys;
     xkb_context* xkb_context_ = nullptr;
@@ -574,9 +575,14 @@ struct InputExperiment::Impl {
         // The captured proxy set is the device. Never discover new resources
         // during cleanup and never release a button to a successor focus.
         if (held_button) {
-            if (!root || !root->good()) confirmed = false;
-            else if (held->client->route == InputRoute::primary_foreground) {
-                if (g_pSeatManager->m_state.pointerFocus != root) confirmed = false;
+            if (held->client->route == InputRoute::primary_foreground) {
+                // Native sendButton is void and may silently refuse (caps,
+                // current surface or pressed-set loss). Its private state is
+                // not an acknowledgement. Attempt only the retained focus,
+                // but never advertise that attempt as observed cleanup.
+                confirmed = false;
+                if (!root || !root->good()) confirmed = false;
+                else if (g_pSeatManager->m_state.pointerFocus != root) confirmed = false;
                 else for (const auto& weak : held->foreground) {
                     const auto p = weak.lock();
                     if (!p || !p->good()) { confirmed = false; continue; }
@@ -589,6 +595,7 @@ struct InputExperiment::Impl {
             }
         }
         held_button = 0;
+        if (!confirmed) held_cleanup_unconfirmed = true;
         held->phase.retire(confirmed);
     }
     bool primary_conflict(const Client& c) const {
@@ -713,6 +720,7 @@ struct InputExperiment::Impl {
                 refusal(foreground_started ? "foreground_partial_unknown" : "drag_partial_unknown") :
                 refusal(foreground_started ? "foreground_partial_unknown" : "drag_partial_unknown", failure));
         drag.reset();
+        if (held && !held->phase.retired) held->phase.reason = reason;
         cleanup_held();
         finish_foreground();
         if (retain_pointer) release_pointer_button(); else leave_pointer();
@@ -1142,7 +1150,7 @@ struct InputExperiment::Impl {
             if (f.size() != 1 || c.hello) { send(c, refusal("invalid_request")); return; }
             c.hello = true;
             if (kProduction)
-                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"source_guard_version":1,"held_phase_version":1}})", epoch));
+                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"source_guard_version":1,"held_phase_version":1,"held_foreground":true}})", epoch));
             else
                 send(c, std::format(R"({{"ok":true,"protocol":0,"epoch":"{}","challenge":"{}"}})", epoch, c.challenge));
             return;
@@ -1178,10 +1186,11 @@ struct InputExperiment::Impl {
         if (command == "APPROVE") { approve(c, f); return; }
 #endif
         if (reservation != &c) { send(c, refusal("lane_not_claimed")); return; }
-        if (kProduction && (command == "HOLD_BEGIN" || command == "HOLD_MOVE" || command == "HOLD_RELEASE")) {
+        if (kProduction && (command == "HOLD_BEGIN" || command == "HOLD_MOVE" || command == "HOLD_RELEASE" || command == "HOLD_ABORT")) {
             held_request(c, f); return;
         }
         if (command == "TARGET" || (kProduction && command == "FOREGROUND_TARGET")) {
+            if (held_cleanup_unconfirmed) { send(c, refusal("held_cleanup_unconfirmed")); return; }
             if (drag || held) { send(c, refusal("lease_busy")); return; }
             const auto route = command == "FOREGROUND_TARGET" ? InputRoute::primary_foreground : InputRoute::independent;
             if (!bind_input_route(c.route, route)) { invalidate(c); send(c, refusal("route_mismatch")); return; }
@@ -1331,13 +1340,19 @@ struct InputExperiment::Impl {
     }
     void held_request(Client& c, const std::vector<std::string>& f) {
         const auto& command = f[0];
-        const auto size = command == "HOLD_RELEASE" ? 3u : command == "HOLD_BEGIN" ? 15u : 14u;
+        const auto size = command == "HOLD_RELEASE" || command == "HOLD_ABORT" ? 3u : command == "HOLD_BEGIN" ? 15u : 14u;
         if (f.size() != size) { send(c, refusal("invalid_request")); return; }
         const auto sequence = number(f[1]);
         if (sequence <= c.sequence) { send(c, refusal("replay")); return; }
         c.sequence = sequence;
-        if (command == "HOLD_RELEASE") {
-            if (!held || !held->phase.owns(reinterpret_cast<std::uintptr_t>(&c), f[2])) {
+        if (command == "HOLD_RELEASE" || command == "HOLD_ABORT") {
+            // BEGIN's handle ACK may be lost or malformed after pressing. An
+            // abort names the original root nonce, on this same accepted owner
+            // connection only; it cannot acquire authority or a successor hold.
+            const bool owned = held && held->client == &c &&
+                (command == "HOLD_ABORT" ? held->phase.source.root == f[2] :
+                 held->phase.owns(reinterpret_cast<std::uintptr_t>(&c), f[2]));
+            if (!owned) {
                 send(c, refusal("held_owner_mismatch")); return;
             }
             const bool aborted = held->phase.retired;
@@ -1345,14 +1360,24 @@ struct InputExperiment::Impl {
             const bool confirmed = held->phase.cleanup_confirmed;
             // No coordinate/source/availability check may suppress owned cleanup.
             finish_foreground(); leave_keyboard(); retire_grant();
-            send(c, std::format(R"({{"ok":{},"code":"{}","detail":"original held device cleanup","effect":"{}","handle":"{}","sequence":{},"cleanup_confirmed":{}}})",
+            send(c, std::format(R"({{"ok":{},"code":"{}","detail":"original held device cleanup","effect":"{}","handle":"{}","source_identity":"{}","sequence":{},"cleanup_confirmed":{}}})",
                 confirmed, confirmed ? "held_released" : "held_cleanup_unconfirmed",
-                aborted || !confirmed ? "partial" : "unverifiable", held->phase.handle, sequence, confirmed));
-            held.reset(); return;
+                aborted || !confirmed ? "partial" : "unverifiable", held->phase.handle, held->phase.source.root, sequence, confirmed));
+            if (confirmed) held.reset();
+            return;
         }
         if (command == "HOLD_MOVE") {
             if (!held || !held->phase.owns(reinterpret_cast<std::uintptr_t>(&c), f[2])) {
                 send(c, refusal("held_owner_mismatch")); return;
+            }
+            if (held->phase.retired || Clock::now() >= held->phase.deadline) {
+                if (!held->phase.retired) {
+                    held->phase.reason = "lease_expired";
+                    cleanup_held(); finish_foreground(); leave_keyboard(); retire_grant();
+                }
+                send(c, std::format(R"({{"ok":false,"code":"{}","detail":"original held phase retired","effect":"partial","handle":"{}","sequence":{},"cleanup_confirmed":{}}})",
+                    held->phase.reason == "lease_expired" ? "held_lease_expired" : "held_retired",
+                    held->phase.handle, sequence, held->phase.cleanup_confirmed)); return;
             }
             if (!held_source(c, f[2]) || !packet_witness(c, f) || !available() ||
                 !input_layout_qualified(c.route, false, layout_qualified()) || primary_conflict(c) || agent_conflict(c)) {
@@ -1380,6 +1405,7 @@ struct InputExperiment::Impl {
         // BEGIN consumes one original-source reconciled finite drag grant. The
         // new opaque handle never arms TARGET or substitutes a successor device.
         if (held || drag) { send(c, refusal("lease_busy")); return; }
+        if (held_cleanup_unconfirmed) { send(c, refusal("held_cleanup_unconfirmed")); return; }
         if (c.token.empty() || f[2] != c.token || !refresh(c) || !packet_witness(c, f)) {
             send(c, refusal("stale_source")); return;
         }

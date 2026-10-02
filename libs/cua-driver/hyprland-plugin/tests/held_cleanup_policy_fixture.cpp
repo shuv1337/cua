@@ -1,0 +1,145 @@
+#include "held_phase.hpp"
+#include "foreground_route.hpp"
+#include <memory>
+#include <optional>
+#include <vector>
+#include <string>
+#include <cstdlib>
+#include <iostream>
+using namespace cua::hyprland;
+constexpr int WL_POINTER_BUTTON_STATE_RELEASED = 0;
+struct Surface { bool live = true; bool good() const { return live; } };
+struct Seat { struct { std::shared_ptr<Surface> pointerFocus; } m_state; };
+Seat seat;
+Seat* g_pSeatManager = &seat;
+struct eHIDCapabilityType { static constexpr int HID_INPUT_CAPABILITY_POINTER = 1; };
+namespace PROTO { struct Seat { int m_currentCaps = 1; } seat_value; Seat* seat = &seat_value; }
+struct Proxy {
+    bool live = true;
+    unsigned buttons = 0, frames = 0;
+    std::vector<std::string>* events;
+    std::string name;
+    bool dead = false;
+    bool good() const { return live; }
+    bool resource() const { return live; }
+    int version() const { return 5; }
+    void sendButton(unsigned, unsigned, unsigned, int) { ++buttons; events->push_back(name + ":release"); }
+    void sendButton(unsigned, unsigned, int) { ++buttons; events->push_back(name + ":release"); }
+    void sendFrame() { ++frames; events->push_back(name + ":frame"); }
+    ~Proxy() { events->push_back(name + ":destroy"); }
+};
+struct Client { InputRoute route; bool dead = false; };
+struct Drag { Client* client; };
+struct Trace { void mark(const char*, unsigned) {} };
+std::string refusal(std::string_view reason) { return std::string(reason); }
+std::string refusal(std::string_view reason, ForegroundFailure) { return std::string(reason); }
+struct Held {
+    Client* client;
+    HeldPhase phase;
+    std::weak_ptr<Surface> root;
+    unsigned button = 272;
+    std::vector<std::weak_ptr<Proxy>> foreground;
+    std::vector<std::shared_ptr<Proxy>> independent;
+};
+struct Owner {
+    bool held_cleanup_unconfirmed = false;
+    unsigned held_button = 272;
+    std::optional<Held> held;
+    std::optional<Drag> drag;
+    Client* lease = nullptr;
+    Client* reservation = nullptr;
+    std::vector<std::unique_ptr<Client>> clients;
+    std::vector<std::shared_ptr<Proxy>> pointers, keyboards, touches, seats;
+    Trace* trace = nullptr;
+    unsigned lane = 0;
+    bool foreground_started = false;
+    void send(Client&, const std::string&) {}
+    void finish_foreground() { foreground_started = false; }
+    void release_pointer_button() { check_no_fallback(); }
+    void check_no_fallback() const { if (held_button) std::abort(); }
+    void leave_pointer() {
+        check_no_fallback();
+        for (const auto& p : held->independent) p->events->push_back(p->name + ":leave");
+    }
+    void leave_keyboard() {}
+    void retire_grant() { lease = nullptr; }
+    unsigned event_ms() const { return 1; }
+    unsigned serial() const { return 2; }
+    // PRODUCTION_CLEANUP
+    // PRODUCTION_DISCONNECT_SWEEP
+};
+void check(bool condition, const char* message) { if (!condition) { std::cerr << message << '\n'; std::exit(1); } }
+int main() {
+    for (bool foreground : {false, true}) {
+        for (int fault = 0; fault < 6; ++fault) {
+            std::vector<std::string> events;
+            auto root = std::make_shared<Surface>();
+            auto successor_root = std::make_shared<Surface>();
+            auto original = std::make_shared<Proxy>(true, 0, 0, &events, "original");
+            auto successor = std::make_shared<Proxy>(true, 0, 0, &events, "successor");
+            Client client{foreground ? InputRoute::primary_foreground : InputRoute::independent};
+            Owner owner;
+            owner.held.emplace(Held{&client, HeldPhase{reinterpret_cast<std::uintptr_t>(&client), "handle", SourceWitness{"original-root", 7, 3, {}}, HeldPhase::Clock::now()}, root, 272, {original}, {original}});
+            seat.m_state.pointerFocus = root;
+            PROTO::seat->m_currentCaps = fault == 5 ? 0 : 1;
+            if (fault == 1) root->live = false;
+            if (fault == 2) original->live = false;
+            if (fault == 3) seat.m_state.pointerFocus = successor_root;
+            if (fault == 4) { seat.m_state.pointerFocus.reset(); root.reset(); }
+            // Source validity and lease expiry do not gate coordinate-free
+            // cleanup. Only originally captured proxies may receive release.
+            owner.revoke(fault == 4 ? "source_destroyed" : fault == 2 ? "disconnected" : "lease_expired", true);
+            const bool confirmed = !foreground && fault != 2;
+            const bool attempted = confirmed || (foreground && (fault == 0 || fault == 5));
+            check(owner.held->phase.retired && owner.held->phase.cleanup_confirmed == confirmed, "wrong retirement confirmation");
+            check(owner.held_cleanup_unconfirmed == !confirmed, "unconfirmed resource cleanup did not retain durable quarantine");
+            check(original->buttons == (attempted ? 1u : 0u), "original release count");
+            check(successor->buttons == 0 && successor->frames == 0, "released successor proxy");
+            owner.cleanup_held();
+            check(original->buttons == (attempted ? 1u : 0u), "duplicate cleanup release");
+            owner.held.reset(); original.reset();
+            if (confirmed) {
+                check(events.size() >= 3 && events[0] == "original:release" && events[1] == "original:frame" && events[2] == "original:destroy", "destruction preceded owned release/frame");
+            }
+            seat.m_state.pointerFocus.reset();
+            successor.reset();
+        }
+    }
+    {
+        std::vector<std::string> events;
+        auto root = std::make_shared<Surface>();
+        auto original = std::make_shared<Proxy>(true, 0, 0, &events, "original");
+        Client client{InputRoute::independent}; Owner owner;
+        owner.held.emplace(Held{&client, HeldPhase{reinterpret_cast<std::uintptr_t>(&client), "handle", SourceWitness{"original-root",7,3,{}}, HeldPhase::Clock::now()},root,272,{}, {original}});
+        root.reset();
+        owner.revoke("source_destroyed",false);
+        owner.held.reset(); original.reset();
+        check(events == std::vector<std::string>{"original:release","original:frame","original:leave","original:destroy"}, "production revoke order did not release original before leave/destruction");
+    }
+    {
+        std::vector<std::string> events;
+        auto root=std::make_shared<Surface>();
+        auto original=std::make_shared<Proxy>(true,0,0,&events,"original");
+        Owner owner;
+        owner.clients.push_back(std::make_unique<Client>(InputRoute::independent));
+        owner.lease=owner.reservation=owner.clients.front().get();
+        owner.held.emplace(Held{owner.lease,HeldPhase{reinterpret_cast<std::uintptr_t>(owner.lease),"handle",SourceWitness{"root",7,3,{}},HeldPhase::Clock::now()},root,272,{}, {original}});
+        owner.lease->dead=true; root.reset();
+        owner.disconnect_sweep();
+        check(!owner.held && owner.clients.empty() && !owner.lease && !owner.reservation,"disconnect sweep retained dangling owner or handle");
+        check(original->buttons==1 && original->frames==1,"disconnect did not release original held resources before owner destruction");
+        original.reset();
+        check(events==std::vector<std::string>{"original:release","original:frame","original:destroy"},"disconnect ordering mismatch");
+    }
+    {
+        std::vector<std::string> events;
+        auto original=std::make_shared<Proxy>(true,0,0,&events,"original");
+        Client client{InputRoute::independent}; Owner owner;
+        owner.held_button=0; // BEGIN enter failed before any owned press
+        owner.held.emplace(Held{&client,HeldPhase{reinterpret_cast<std::uintptr_t>(&client),"handle",SourceWitness{"root",7,3,{}},HeldPhase::Clock::now()}, {},272,{}, {original}});
+        owner.revoke("client_not_bound",true);
+        check(original->buttons==0 && original->frames==0 && owner.held->phase.cleanup_confirmed,"failed BEGIN enter emitted a spurious release");
+        owner.held.reset(); original.reset();
+    }
+    std::cout << "production held cleanup resource policy passed\n";
+}

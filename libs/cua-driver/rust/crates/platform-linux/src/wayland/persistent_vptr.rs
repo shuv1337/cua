@@ -494,6 +494,8 @@ fn finish_command(
     }
 }
 
+// Carries the original absolute phase deadline alongside native button fields.
+#[allow(clippy::too_many_arguments)]
 fn handle_press(
     active: &mut HashMap<String, ActivePointer>,
     cursor_id: &str,

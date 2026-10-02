@@ -432,7 +432,15 @@ pub(crate) fn admit_desktop_click_in_frame(
 ) -> anyhow::Result<(f64, f64)> {
     let recording_sink = recording_sink();
     let source_binding = service.binding_from_args(args)?;
-    frame.validate_current()?;
+    if let Some(source) = crate::wayland::hyprland_input::current_window_source() {
+        anyhow::ensure!(
+            source.frame.identity == frame.identity,
+            "window_source_changed: admission frame differs from retained source"
+        );
+        source.validate_native()?;
+    } else {
+        frame.validate_current()?;
+    }
     let request = CaptureActionRequest {
         capture_id: service.parse_capture_id(capture_id)?,
         binding: source_binding.clone(),

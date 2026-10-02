@@ -114,6 +114,12 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "cleanup_confirmed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "delivery": {
             "additionalProperties": false,
             "properties": {
@@ -555,6 +561,12 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "cleanup_confirmed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "delivery": {
             "additionalProperties": false,
             "properties": {
@@ -2107,6 +2119,12 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "cleanup_confirmed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "delivery": {
             "additionalProperties": false,
             "properties": {
@@ -2338,6 +2356,12 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "cleanup_confirmed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "delivery": {
             "additionalProperties": false,
             "properties": {
@@ -2968,6 +2992,12 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "cleanup_confirmed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "delivery": {
             "additionalProperties": false,
             "properties": {
@@ -3711,6 +3741,12 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "cleanup_confirmed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "delivery": {
             "additionalProperties": false,
             "properties": {
@@ -3986,6 +4022,12 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "cleanup_confirmed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "delivery": {
             "additionalProperties": false,
             "properties": {
@@ -4634,6 +4676,12 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "cleanup_confirmed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "delivery": {
             "additionalProperties": false,
             "properties": {
@@ -5280,6 +5328,12 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "cleanup_confirmed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "delivery": {
             "additionalProperties": false,
             "properties": {

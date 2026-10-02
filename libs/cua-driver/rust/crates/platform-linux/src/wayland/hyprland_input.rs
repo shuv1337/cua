@@ -162,8 +162,8 @@ pub(crate) fn scroll_actions(
 }
 
 /// Cancellation belongs to one invocation, never to its session's next call.
-#[derive(Clone, Default)]
-pub(crate) struct ActionCancellation(Arc<AtomicBool>);
+#[derive(Clone, Default, Debug)]
+pub(crate) struct ActionCancellation(Arc<AtomicBool>, Option<Arc<AtomicBool>>);
 
 pub(crate) struct CancelOnDrop(ActionCancellation);
 
@@ -174,7 +174,12 @@ impl ActionCancellation {
     }
 
     fn check(&self) -> Result<()> {
-        if self.0.load(Ordering::Acquire) {
+        if self.0.load(Ordering::Acquire)
+            || self
+                .1
+                .as_ref()
+                .is_some_and(|retired| retired.load(Ordering::Acquire))
+        {
             return Err(ActionCancelled.into());
         }
         Ok(())
@@ -217,6 +222,7 @@ impl std::error::Error for LaneBusy {}
 #[derive(Debug)]
 pub struct DispatchUnknown {
     pub acknowledged_phases: u32,
+    pub cleanup_confirmed: Option<bool>,
     detail: String,
 }
 
@@ -231,6 +237,16 @@ impl std::error::Error for DispatchUnknown {}
 pub(crate) fn unknown_dispatch(error: anyhow::Error, acknowledged_phases: u32) -> anyhow::Error {
     DispatchUnknown {
         acknowledged_phases,
+        cleanup_confirmed: None,
+        detail: error.to_string(),
+    }
+    .into()
+}
+
+fn held_unknown(error: anyhow::Error, acknowledged_phases: u32, confirmed: bool) -> anyhow::Error {
+    DispatchUnknown {
+        acknowledged_phases,
+        cleanup_confirmed: Some(confirmed),
         detail: error.to_string(),
     }
     .into()
@@ -337,6 +353,7 @@ struct Client {
     foreground_supported: bool,
     source_guard_supported: bool,
     held_phase_supported: bool,
+    held_foreground_supported: bool,
     owned_cleanup: bool,
     delivery_route: Option<DeliveryRoute>,
     // Assigned by the compositor to this connection, never by the local pool.
@@ -777,6 +794,7 @@ impl Client {
             foreground_supported: false,
             source_guard_supported: false,
             held_phase_supported: false,
+            held_foreground_supported: false,
             owned_cleanup: false,
             delivery_route: None,
             lane: None,
@@ -820,6 +838,8 @@ impl Client {
             self.protocol == InputProtocol::Production && hello["source_guard_version"] == 1;
         self.held_phase_supported =
             self.protocol == InputProtocol::Production && hello["held_phase_version"] == 1;
+        self.held_foreground_supported =
+            self.held_phase_supported && hello["held_foreground"] == true;
         if self.protocol == InputProtocol::Experiment {
             self.challenge = hex_field(&hello, "challenge")?;
         } else {
@@ -1327,6 +1347,7 @@ pub(crate) struct HeldHandle {
     status: Mutex<HeldStatus>,
     gesture: Mutex<()>,
     foreground: bool,
+    retirement: ActionCancellation,
 }
 
 fn lock_phase_until<'a, T>(
@@ -1390,6 +1411,9 @@ fn begin_held_on_client(
             "window_source_guard_unavailable: loaded module lacks held_phase_version=1",
         ));
     }
+    if route == DeliveryRoute::Foreground && !client.held_foreground_supported {
+        return Err(source_refusal("held_foreground_unavailable: compositor has no pre-focus-transition owned-release guarantee; finite foreground gestures remain supported"));
+    }
     client.check_route(route)?;
     ensure!(
         client.delivery_route == Some(route),
@@ -1397,7 +1421,8 @@ fn begin_held_on_client(
     );
     ensure!((1..=3).contains(&button), "unsupported held button");
     cancellation.check()?;
-    source.validate_native().map_err(source_refusal)?;
+    super::hyprland::with_observation_deadline(deadline, || source.validate_native())
+        .map_err(source_refusal)?;
     client.cancellation = cancellation;
     let action = Action::Drag {
         from: point,
@@ -1413,7 +1438,8 @@ fn begin_held_on_client(
     validate_target_route(&target, route).map_err(source_refusal)?;
     source.reconcile(client, &target).map_err(source_refusal)?;
     source.retain_action_point(point);
-    source.validate_native().map_err(source_refusal)?;
+    super::hyprland::with_observation_deadline(deadline, || source.validate_native())
+        .map_err(source_refusal)?;
     client.sequence = client
         .sequence
         .checked_add(1)
@@ -1461,6 +1487,38 @@ fn begin_held_on_client(
     .map_err(|error| unknown_dispatch(error, 0))
 }
 
+// Independent bounded budget, original socket only. A dropped phase ACK may
+// still be queued, so consume replies until this cleanup's sequence matches.
+// This never retries input or reacquires a connection/target/resource.
+fn cleanup_held_on_client(client: &mut Client, command: &str, token: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    client.cancellation = ActionCancellation::default();
+    client.owned_cleanup = true;
+    let result = (|| -> Result<bool> {
+        client.sequence = client
+            .sequence
+            .checked_add(1)
+            .context("held cleanup sequence exhausted")?;
+        let sequence = client.sequence;
+        client.send_packet(&format!("{command} {sequence} {token}"), deadline)?;
+        loop {
+            let reply = client.receive(deadline)?;
+            if reply["sequence"].as_u64() != Some(sequence) {
+                continue;
+            }
+            return Ok(reply["ok"] == true
+                && reply["cleanup_confirmed"] == true
+                && (if command == "HOLD_ABORT" {
+                    reply["source_identity"] == token
+                } else {
+                    reply["handle"] == token
+                }));
+        }
+    })();
+    client.owned_cleanup = false;
+    result.unwrap_or(false)
+}
+
 pub(crate) fn begin_held_source(
     source: Arc<WindowSource>,
     point: (f64, f64),
@@ -1483,8 +1541,7 @@ pub(crate) fn begin_held_source(
         DeliveryRoute::Background
     };
     if route == DeliveryRoute::Background {
-        super::hyprland_compatibility::qualify(source.pid)
-            .map_err(|reason| source_refusal(reason))?;
+        super::hyprland_compatibility::qualify(source.pid).map_err(source_refusal)?;
     }
     let result = begin_held_on_client(
         client,
@@ -1499,7 +1556,10 @@ pub(crate) fn begin_held_source(
         Ok(handle) => handle,
         Err(error) => {
             if error.is::<DispatchUnknown>() {
+                let confirmed =
+                    cleanup_held_on_client(slot.as_mut().unwrap(), "HOLD_ABORT", &source.identity);
                 *slot = None;
+                return Err(held_unknown(error, 0, confirmed));
             }
             return Err(error);
         }
@@ -1512,10 +1572,14 @@ pub(crate) fn begin_held_source(
         status: Mutex::new(HeldStatus::Active),
         gesture: Mutex::new(()),
         foreground,
+        retirement: ActionCancellation::default(),
     }))
 }
 
 impl HeldHandle {
+    pub(crate) fn is_foreground(&self) -> bool {
+        self.foreground
+    }
     pub(crate) fn authorize_route(&self, foreground: bool) -> Result<()> {
         ensure!(
             self.foreground == foreground,
@@ -1554,7 +1618,7 @@ impl HeldHandle {
             let client = slot
                 .as_mut()
                 .context("original held connection lost; no reconnect")?;
-            self.source.validate_native()?;
+            super::hyprland::with_observation_deadline(deadline, || self.source.validate_native())?;
             client.cancellation = cancellation;
             client.sequence = client
                 .sequence
@@ -1566,6 +1630,22 @@ impl HeldHandle {
                 .source
                 .held_packet("HOLD_MOVE", sequence, &self.handle, point)?;
             let reply = client.request_until(&packet, deadline)?;
+            if reply["ok"] == false
+                && matches!(
+                    reply["code"].as_str(),
+                    Some("held_retired" | "held_lease_expired")
+                )
+                && reply["handle"] == self.handle
+                && reply["sequence"].as_u64() == Some(sequence)
+                && reply["cleanup_confirmed"] == true
+            {
+                *status = HeldStatus::Released(true);
+                return Err(held_unknown(
+                    anyhow::anyhow!("original held phase retired: {reply}"),
+                    1,
+                    true,
+                ));
+            }
             ensure!(
                 reply["ok"] == true
                     && reply["phase"] == "held_moved"
@@ -1576,15 +1656,28 @@ impl HeldHandle {
             Ok(())
         })();
         if let Err(error) = result {
+            if matches!(*status, HeldStatus::Released(_)) {
+                return Err(error);
+            }
             // Closing this exact channel revokes only its original lane/device.
             // There is no retry/another RELEASE after an unconfirmed wire phase.
-            *status = HeldStatus::Quarantined;
+            let confirmed = slot
+                .as_mut()
+                .is_some_and(|client| cleanup_held_on_client(client, "HOLD_RELEASE", &self.handle));
+            *status = if confirmed {
+                HeldStatus::Released(true)
+            } else {
+                HeldStatus::Quarantined
+            };
             *slot = None;
-            return Err(unknown_dispatch(error, 1));
+            return Err(held_unknown(error, 1, confirmed));
         }
         Ok(())
     }
 
+    // Explicit immutable owner/frame plus finite gesture parameters form the
+    // private phase contract; do not rediscover any of them from public labels.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn drag_to(
         &self,
         owner: &str,
@@ -1596,11 +1689,17 @@ impl HeldHandle {
         cancellation: ActionCancellation,
     ) -> Result<()> {
         self.authorize(owner, binding)?;
+        let cancellation = ActionCancellation(cancellation.0, Some(self.retirement.0.clone()));
         let started = Instant::now();
         let deadline = started + duration + TIMEOUT;
-        let gesture = lock_phase_until(&self.gesture, &cancellation, deadline)
-            .map_err(|error| unknown_dispatch(error, 1))?;
-        let result = (|| {
+        let gesture = match lock_phase_until(&self.gesture, &cancellation, deadline) {
+            Ok(guard) => guard,
+            Err(error) => {
+                let confirmed = self.release(owner, binding).is_ok();
+                return Err(held_unknown(error, 1, confirmed));
+            }
+        };
+        let result: Result<()> = (|| {
             for i in 1..=steps {
                 let t = i as f64 / steps as f64;
                 let due = started + duration.mul_f64(t);
@@ -1623,8 +1722,14 @@ impl HeldHandle {
         })();
         drop(gesture);
         if let Err(error) = result {
-            let _cleanup = self.release(owner, binding);
-            return Err(unknown_dispatch(error, 1));
+            if error
+                .downcast_ref::<DispatchUnknown>()
+                .is_some_and(|error| error.cleanup_confirmed.is_some())
+            {
+                return Err(error);
+            }
+            let confirmed = self.release(owner, binding).is_ok();
+            return Err(held_unknown(error, 1, confirmed));
         }
         Ok(())
     }
@@ -1635,20 +1740,24 @@ impl HeldHandle {
         binding: &cua_driver_core::capture_runtime::CaptureBinding,
     ) -> Result<bool> {
         self.authorize(owner, binding)?;
+        // Publish the coordinate-free cleanup obligation before waiting for any
+        // owner locks. In-flight waits observe this token; the phase owner exits
+        // effects and services the same original-resource cleanup obligation.
+        self.retirement.0.store(true, Ordering::Release);
         let cancellation = ActionCancellation::default();
         let deadline = Instant::now() + Duration::from_secs(2);
         let _gesture = lock_phase_until(&self.gesture, &cancellation, deadline)
-            .map_err(|e| unknown_dispatch(e, 1))?;
+            .map_err(|e| held_unknown(e, 1, false))?;
         let mut status = lock_phase_until(&self.status, &cancellation, deadline)
-            .map_err(|error| unknown_dispatch(error, 1))?;
+            .map_err(|error| held_unknown(error, 1, false))?;
         if let HeldStatus::Released(aborted) = *status {
             return Ok(aborted);
         }
         if *status != HeldStatus::Active {
-            return Err(unknown_dispatch(anyhow::anyhow!("held_cleanup_unconfirmed: original device quarantined; no duplicate release/reconnect"), 1));
+            return Err(held_unknown(anyhow::anyhow!("held_cleanup_unconfirmed: original device quarantined; no duplicate release/reconnect"), 1, false));
         }
         let mut slot = lock_phase_until(&self.connection.client, &cancellation, deadline)
-            .map_err(|error| unknown_dispatch(error, 1))?;
+            .map_err(|error| held_unknown(error, 1, false))?;
         let result = (|| {
             let client = slot
                 .as_mut()
@@ -1683,7 +1792,7 @@ impl HeldHandle {
             Err(error) => {
                 *status = HeldStatus::Quarantined;
                 *slot = None;
-                Err(unknown_dispatch(error, 1))
+                Err(held_unknown(error, 1, false))
             }
         }
     }
@@ -2273,11 +2382,12 @@ pub(crate) mod tests {
         client: Mutex<Client>,
     }
 
-    fn held_fixture(capability: bool) -> (Arc<WindowSource>, socket2::Socket) {
+    pub(super) fn held_fixture(capability: bool) -> (Arc<WindowSource>, socket2::Socket) {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (mut client, peer) = production_test_client();
         client.owner = format!("held-fixture-{}", NEXT.fetch_add(1, Ordering::Relaxed));
         client.held_phase_supported = capability;
+        client.held_foreground_supported = true; // injectable matching transport, not native capability evidence
         client.delivery_route = Some(DeliveryRoute::Foreground);
         let mut source = fixture_window_source(&client);
         Arc::get_mut(&mut source).unwrap().connection = Some(Arc::new(SessionClient {
@@ -2285,8 +2395,41 @@ pub(crate) mod tests {
         }));
         (source, peer)
     }
+    pub(crate) fn held_tool_fixture(
+        service: &cua_driver_core::capture_runtime::CaptureService,
+    ) -> (Arc<WindowSource>, socket2::Socket, String) {
+        let (mut source, peer) = held_fixture(true);
+        let owner = source.owner.clone();
+        let original = Arc::get_mut(&mut source).unwrap();
+        original.binding = service.current_binding(owner.as_str()).unwrap();
+        original.frame.width = 3000;
+        original.frame.height = 100;
+        (source, peer, owner)
+    }
+    pub(crate) fn close_held_tool_fixture(source: &WindowSource) {
+        *source.connection.as_ref().unwrap().client.lock().unwrap() = None;
+    }
+    pub(crate) fn namespace_held_tool_fixture(
+        source: &mut Arc<WindowSource>,
+        service: &cua_driver_core::capture_runtime::CaptureService,
+        owner: &str,
+    ) {
+        let original = Arc::get_mut(source).unwrap();
+        original.owner = owner.to_owned();
+        original.binding = service.current_binding(owner).unwrap();
+        original
+            .connection
+            .as_ref()
+            .unwrap()
+            .client
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .owner = owner.to_owned();
+    }
 
-    fn serve_held_begin(peer: &socket2::Socket) {
+    pub(super) fn serve_held_begin(peer: &socket2::Socket) {
         assert!(read_packet(peer).starts_with("FOREGROUND_TARGET "));
         peer.send(guarded_target().to_string().as_bytes()).unwrap();
         let begin = read_packet(peer);
@@ -2524,6 +2667,11 @@ pub(crate) mod tests {
                 peer.send(guarded_target().to_string().as_bytes()).unwrap();
                 assert!(read_packet(&peer).starts_with("HOLD_BEGIN "));
                 peer.send(reply.to_string().as_bytes()).unwrap();
+                assert_eq!(
+                    read_packet(&peer),
+                    "HOLD_ABORT 2 22222222222222222222222222222222"
+                );
+                peer.send(json!({"ok":true,"cleanup_confirmed":true,"source_identity":"22222222222222222222222222222222","sequence":2,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
                 let mut bytes = [0u8; 128];
                 assert_eq!(
                     unsafe {
@@ -2541,6 +2689,13 @@ pub(crate) mod tests {
             )
             .unwrap_err();
             assert!(error.is::<DispatchUnknown>());
+            assert_eq!(
+                error
+                    .downcast_ref::<DispatchUnknown>()
+                    .unwrap()
+                    .cleanup_confirmed,
+                Some(true)
+            );
             assert!(source
                 .connection
                 .as_ref()
@@ -2551,6 +2706,326 @@ pub(crate) mod tests {
                 .is_none());
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn held_between_phase_revoke_and_failed_motion_ack_release_original_owner_without_target_replay(
+    ) {
+        for cause in [
+            "root",
+            "origin",
+            "revision",
+            "topology",
+            "client",
+            "lease_expired",
+            "malformed_ack",
+        ] {
+            let (source, peer) = held_fixture(true);
+            let server = std::thread::spawn(move || {
+                serve_held_begin(&peer);
+                let packet = read_packet(&peer);
+                assert!(packet.starts_with("HOLD_MOVE 2 55555555555555555555555555555555 7 22222222222222222222222222222222 3 2560.25 10.5 100 100 2562.25 12.5 "), "{packet}");
+                let reply = if cause == "malformed_ack" {
+                    json!({"ok":true,"phase":"wrong","sequence":2})
+                } else {
+                    json!({"ok":false,"code":"held_partial_unknown","detail":cause,"effect":"partial"})
+                };
+                peer.send(reply.to_string().as_bytes()).unwrap();
+                // Source/lease/client authority is now gone. This exact handle
+                // alone still names owned cleanup; no geometry/target needed.
+                assert_eq!(
+                    read_packet(&peer),
+                    "HOLD_RELEASE 3 55555555555555555555555555555555"
+                );
+                peer.send(json!({"ok":true,"effect":"partial","cleanup_confirmed":true,"sequence":3,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
+                let mut bytes = [0u8; 256];
+                assert_eq!(
+                    unsafe {
+                        libc::recv(peer.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len(), 0)
+                    },
+                    0,
+                    "no new BEGIN/TARGET or duplicate cleanup"
+                );
+            });
+            let handle = begin_held_source(
+                source.clone(),
+                (10.25, 10.25),
+                1,
+                true,
+                ActionCancellation::default(),
+            )
+            .unwrap();
+            let error = handle
+                .drag_to(
+                    &source.owner,
+                    &source.binding,
+                    (10.25, 10.25),
+                    (20.0, 20.0),
+                    Duration::ZERO,
+                    1,
+                    ActionCancellation::default(),
+                )
+                .unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<DispatchUnknown>()
+                    .unwrap()
+                    .cleanup_confirmed,
+                Some(true)
+            );
+            assert!(source
+                .connection
+                .as_ref()
+                .unwrap()
+                .client
+                .lock()
+                .unwrap()
+                .is_none());
+            assert!(handle.release(&source.owner, &source.binding).unwrap());
+            drop(handle);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn held_last_owner_drop_and_cancelled_queued_motion_release_only_original_handle() {
+        for cause in ["drop", "cancelled_motion"] {
+            let (source, peer) = held_fixture(true);
+            let server = std::thread::spawn(move || {
+                serve_held_begin(&peer);
+                assert_eq!(
+                    read_packet(&peer),
+                    "HOLD_RELEASE 2 55555555555555555555555555555555"
+                );
+                peer.send(json!({"ok":true,"cleanup_confirmed":true,"source_identity":"22222222222222222222222222222222","sequence":2,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
+                let mut bytes = [0u8; 128];
+                assert_eq!(
+                    unsafe {
+                        libc::recv(peer.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len(), 0)
+                    },
+                    0
+                );
+            });
+            let handle = begin_held_source(
+                source.clone(),
+                (10.25, 10.25),
+                1,
+                true,
+                ActionCancellation::default(),
+            )
+            .unwrap();
+            if cause == "cancelled_motion" {
+                let (guard, cancellation) = ActionCancellation::invocation();
+                drop(guard);
+                let error = handle
+                    .drag_to(
+                        &source.owner,
+                        &source.binding,
+                        (10.25, 10.25),
+                        (20.0, 20.0),
+                        Duration::ZERO,
+                        1,
+                        cancellation,
+                    )
+                    .unwrap_err();
+                assert_eq!(
+                    error
+                        .downcast_ref::<DispatchUnknown>()
+                        .unwrap()
+                        .cleanup_confirmed,
+                    Some(true)
+                );
+            }
+            drop(handle);
+            *source.connection.as_ref().unwrap().client.lock().unwrap() = None;
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn held_verified_retired_ack_keeps_confirmed_aborted_completion_without_extra_release() {
+        for code in ["held_lease_expired", "held_retired"] {
+            let (source, peer) = held_fixture(true);
+            let server = std::thread::spawn(move || {
+                serve_held_begin(&peer);
+                assert!(read_packet(&peer).starts_with("HOLD_MOVE 2 "));
+                peer.send(json!({"ok":false,"code":code,"detail":"original source retired","effect":"partial","handle":"55555555555555555555555555555555","sequence":2,"cleanup_confirmed":true}).to_string().as_bytes()).unwrap();
+                let mut bytes = [0u8; 128];
+                assert_eq!(
+                    unsafe {
+                        libc::recv(peer.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len(), 0)
+                    },
+                    0,
+                    "confirmed retired phase needs no extra release"
+                );
+            });
+            let handle = begin_held_source(
+                source.clone(),
+                (10.25, 10.25),
+                1,
+                true,
+                ActionCancellation::default(),
+            )
+            .unwrap();
+            let error = handle
+                .drag_to(
+                    &source.owner,
+                    &source.binding,
+                    (10.25, 10.25),
+                    (20.0, 20.0),
+                    Duration::ZERO,
+                    1,
+                    ActionCancellation::default(),
+                )
+                .unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<DispatchUnknown>()
+                    .unwrap()
+                    .cleanup_confirmed,
+                Some(true)
+            );
+            assert!(handle.release(&source.owner, &source.binding).unwrap());
+            assert!(source
+                .connection
+                .as_ref()
+                .unwrap()
+                .client
+                .lock()
+                .unwrap()
+                .is_some());
+            drop(handle);
+            close_held_tool_fixture(&source);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn held_lost_begin_ack_attempts_original_root_abort_with_independent_cleanup_budget() {
+        let (source, peer) = held_fixture(true);
+        let server = std::thread::spawn(move || {
+            assert!(read_packet(&peer).starts_with("FOREGROUND_TARGET "));
+            peer.send(guarded_target().to_string().as_bytes()).unwrap();
+            assert!(read_packet(&peer).starts_with("HOLD_BEGIN 1 "));
+            // Press may already have occurred. Withhold its ACK until cleanup
+            // arrives, then enqueue the late ACK before the abort completion.
+            assert_eq!(
+                read_packet(&peer),
+                "HOLD_ABORT 2 22222222222222222222222222222222"
+            );
+            peer.send(json!({"ok":true,"phase":"held_started","sequence":1,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
+            peer.send(json!({"ok":true,"cleanup_confirmed":true,"source_identity":"22222222222222222222222222222222","sequence":2,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
+            let mut bytes = [0u8; 128];
+            assert_eq!(
+                unsafe { libc::recv(peer.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len(), 0) },
+                0,
+                "no reacquisition after uncertain BEGIN"
+            );
+        });
+        let error = begin_held_source(
+            source.clone(),
+            (10.25, 10.25),
+            1,
+            true,
+            ActionCancellation::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<DispatchUnknown>()
+                .unwrap()
+                .cleanup_confirmed,
+            Some(true)
+        );
+        assert!(source
+            .connection
+            .as_ref()
+            .unwrap()
+            .client
+            .lock()
+            .unwrap()
+            .is_none());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn held_cleanup_obligation_survives_owner_lock_timeout_and_prevents_late_motion() {
+        type Gate = Arc<(Mutex<bool>, std::sync::Condvar)>;
+        static GATE: std::sync::OnceLock<Mutex<Option<Gate>>> = std::sync::OnceLock::new();
+        static ENTERED: AtomicBool = AtomicBool::new(false);
+        fn validate() -> Result<()> {
+            let gate = GATE.get().unwrap().lock().unwrap().clone();
+            if let Some(gate) = gate {
+                ENTERED.store(true, Ordering::Release);
+                let mut ready = gate.0.lock().unwrap();
+                while !*ready {
+                    ready = gate.1.wait(ready).unwrap();
+                }
+            }
+            Ok(())
+        }
+        let (mut source, peer) = held_fixture(true);
+        GATE.get_or_init(|| Mutex::new(None));
+        Arc::get_mut(&mut source).unwrap().native_validator = Some(validate);
+        let server = std::thread::spawn(move || {
+            serve_held_begin(&peer);
+            assert_eq!(
+                read_packet(&peer),
+                "HOLD_RELEASE 3 55555555555555555555555555555555",
+                "no late MOVE after cleanup request"
+            );
+            peer.send(json!({"ok":true,"cleanup_confirmed":true,"sequence":3,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
+            let mut bytes = [0u8; 128];
+            assert_eq!(
+                unsafe { libc::recv(peer.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len(), 0) },
+                0
+            );
+        });
+        let handle = begin_held_source(
+            source.clone(),
+            (10.25, 10.25),
+            1,
+            true,
+            ActionCancellation::default(),
+        )
+        .unwrap();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        *GATE.get().unwrap().lock().unwrap() = Some(gate.clone());
+        let worker_handle = handle.clone();
+        let worker_source = source.clone();
+        let worker = std::thread::spawn(move || {
+            worker_handle.drag_to(
+                &worker_source.owner,
+                &worker_source.binding,
+                (10.25, 10.25),
+                (20.0, 20.0),
+                Duration::ZERO,
+                1,
+                ActionCancellation::default(),
+            )
+        });
+        // Wait for the real producer to own the effect-phase locks.
+        while !ENTERED.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        let error = handle.release(&source.owner, &source.binding).unwrap_err();
+        assert!(error.is::<DispatchUnknown>());
+        assert!(handle.retirement.0.load(Ordering::Acquire));
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<DispatchUnknown>()
+                .unwrap()
+                .cleanup_confirmed,
+            Some(true)
+        );
+        assert!(handle.release(&source.owner, &source.binding).unwrap());
+        *GATE.get().unwrap().lock().unwrap() = None;
+        drop(handle);
+        *source.connection.as_ref().unwrap().client.lock().unwrap() = None;
+        server.join().unwrap();
     }
     impl GuardedToolInput {
         pub(crate) fn new() -> (Arc<Self>, socket2::Socket) {
@@ -4098,6 +4573,7 @@ pub(crate) mod tests {
                 foreground_supported: false,
                 source_guard_supported: false,
                 held_phase_supported: false,
+                held_foreground_supported: false,
                 owned_cleanup: false,
                 delivery_route: None,
                 lane: None,
@@ -4885,3 +5361,7 @@ pub(crate) mod tests {
         server.join().unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "hyprland_held_recording_tests.rs"]
+mod held_recording_tests;

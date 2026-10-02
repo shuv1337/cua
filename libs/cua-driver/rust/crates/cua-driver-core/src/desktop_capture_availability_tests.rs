@@ -47,6 +47,13 @@ impl Tool for Capture {
             result["screenshot_original_width"] = json!(5120);
             result["screenshot_original_height"] = json!(1440);
         }
+        if args["legacy"] == true {
+            result
+                .as_object_mut()
+                .unwrap()
+                .remove("action_capture_available");
+            result.as_object_mut().unwrap().remove("capture_id");
+        }
         if args["qualified"] == true {
             let binding = self.service.binding_from_args(&args).unwrap();
             let png =
@@ -264,4 +271,21 @@ async fn actual_registry_retired_visual_completion_cannot_install_cap_or_tombsto
         json!({"_session_id":binding.session_id(),"scope":"desktop","x":100.0,"y":100.0});
     crate::desktop_capture_scale::map_desktop_args_for_binding(&mut point, Some(&successor));
     assert_eq!(point["x"], 100.0);
+}
+
+#[tokio::test]
+async fn actual_registry_absent_availability_flag_preserves_legacy_provider_cap_mapping() {
+    let f = fixture();
+    let result = f
+        .registry
+        .invoke_from_trusted_adapter(
+            "get_desktop_state",
+            json!({"_session_id":"visual-availability","capped":true,"legacy":true}),
+        )
+        .await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    assert!(!f.service.desktop_observation_unavailable(&f.binding()));
+    assert_ne!(f.input().await.is_error, Some(true));
+    assert_eq!(f.point.lock().unwrap().as_ref().unwrap()["x"], 500.0);
+    assert_eq!(f.hits.load(Ordering::SeqCst), 1);
 }

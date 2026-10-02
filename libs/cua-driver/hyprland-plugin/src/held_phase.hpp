@@ -23,6 +23,7 @@ struct HeldPhase {
     SourceWitness source;
     Clock::time_point deadline;
     bool retired = false, cleanup_confirmed = false;
+    std::string reason{};
 
     bool owns(std::uintptr_t actor, const std::string& id) const {
         return owner == actor && handle == id;

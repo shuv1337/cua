@@ -629,7 +629,10 @@ fn point_in_image(png: &[u8], x: f64, y: f64) -> bool {
 
 /// Task-local state follows the invocation future and disappears on cancellation.
 /// An empty scope also masks any outer recording during a nested dispatch.
-pub(crate) async fn scope_dispatch_click_capture<F: std::future::Future>(
+/// In-process platform dispatch scope. Carries observation-only recording
+/// handoff authority; it never admits input or changes a phase deadline.
+#[doc(hidden)]
+pub async fn scope_dispatch_click_capture<F: std::future::Future>(
     pending: Option<&PendingTurn>,
     dispatch: F,
 ) -> F::Output {
@@ -1259,7 +1262,17 @@ impl RecordingSession {
                         if Instant::now() >= phase_deadline {
                             return Err(RecordingUnavailable::BudgetExceeded);
                         }
-                        let point = context.click_point();
+                        // Pixel-bound pointer phases receive their point only
+                        // from the consumed original admission/owned handle.
+                        // Do not query an independent semantic/pixel fallback.
+                        let point = if preparation_args.get("capture_id").is_some()
+                            || (preparation_args.get("x").is_some()
+                                && preparation_args.get("y").is_some())
+                        {
+                            Ok(None)
+                        } else {
+                            context.click_point()
+                        };
                         Ok((context, point))
                     },
                 )
@@ -1274,9 +1287,15 @@ impl RecordingSession {
                 Arc::new(TurnFrameScope {
                     context,
                     admitted_point: Mutex::new(None),
-                    capture_bound: matches!(tool_name, "click" | "double_click" | "right_click")
-                        && (args.get("capture_id").is_some()
-                            || (args.get("x").is_some() && args.get("y").is_some())),
+                    capture_bound: matches!(
+                        tool_name,
+                        "click"
+                            | "double_click"
+                            | "right_click"
+                            | "mouse_button_down"
+                            | "mouse_drag"
+                    ) && (args.get("capture_id").is_some()
+                        || (args.get("x").is_some() && args.get("y").is_some())),
                     capture_busy: self.image_capture_busy.clone(),
                     point_failure: Mutex::new(point_failure),
                     budget: self.frame_budget,
@@ -1289,7 +1308,10 @@ impl RecordingSession {
         } else {
             None
         };
-        let click_point = if !matches!(tool_name, "click" | "double_click" | "right_click") {
+        let click_point = if !matches!(
+            tool_name,
+            "click" | "double_click" | "right_click" | "mouse_button_down" | "mouse_drag"
+        ) {
             None
         } else if let Some(scope) = &frame_scope {
             if scope.capture_bound {
@@ -2035,7 +2057,10 @@ fn write_turn_with_after(
         };
     std::fs::create_dir_all(&turn_dir)?;
     let now = now_ms();
-    let click_family = matches!(tool_name.as_str(), "click" | "double_click" | "right_click");
+    let click_family = matches!(
+        tool_name.as_str(),
+        "click" | "double_click" | "right_click" | "mouse_button_down" | "mouse_drag"
+    );
     let action_refused = action_record
         .is_some_and(|record| record.effect == crate::action_record::ActionEffect::Refused);
     let refused_before_target_resolution = click_family

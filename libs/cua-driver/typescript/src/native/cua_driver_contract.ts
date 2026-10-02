@@ -489,6 +489,11 @@ export type ActionResult = {
     effect: ActionEffect,
     route: ActionRoute,
     delivery?: ActionDelivery,
+    /**
+     * Exact owned-resource release acknowledgement, not application-effect
+     * verification. Absent for actions without an owned cleanup phase.
+     */
+    cleanupConfirmed?: boolean,
     evidence?: Array<ActionEvidence>,
     escalation?: ActionEscalation,
     /**
@@ -541,6 +546,7 @@ const FfiConverterTypeActionResult = (() => {
                 effect: FfiConverterTypeActionEffect.read(from),
                 route: FfiConverterTypeActionRoute.read(from),
                 delivery: FfiConverterOptionalTypeActionDelivery.read(from),
+                cleanupConfirmed: FfiConverterOptionalBoolean.read(from),
                 evidence: FfiConverterOptionalSequenceTypeActionEvidence.read(from),
                 escalation: FfiConverterOptionalTypeActionEscalation.read(from),
                 summary: FfiConverterOptionalString.read(from),
@@ -553,6 +559,7 @@ const FfiConverterTypeActionResult = (() => {
             FfiConverterTypeActionEffect.write(value.effect, into);
             FfiConverterTypeActionRoute.write(value.route, into);
             FfiConverterOptionalTypeActionDelivery.write(value.delivery, into);
+            FfiConverterOptionalBoolean.write(value.cleanupConfirmed, into);
             FfiConverterOptionalSequenceTypeActionEvidence.write(value.evidence, into);
             FfiConverterOptionalTypeActionEscalation.write(value.escalation, into);
             FfiConverterOptionalString.write(value.summary, into);
@@ -564,6 +571,7 @@ const FfiConverterTypeActionResult = (() => {
             return FfiConverterTypeActionEffect.allocationSize(value.effect) +
              FfiConverterTypeActionRoute.allocationSize(value.route) +
              FfiConverterOptionalTypeActionDelivery.allocationSize(value.delivery) +
+             FfiConverterOptionalBoolean.allocationSize(value.cleanupConfirmed) +
              FfiConverterOptionalSequenceTypeActionEvidence.allocationSize(value.evidence) +
              FfiConverterOptionalTypeActionEscalation.allocationSize(value.escalation) +
              FfiConverterOptionalString.allocationSize(value.summary) +
@@ -6629,6 +6637,9 @@ const FfiConverterOptionalString = new FfiConverterOptional(FfiConverterString);
 // FfiConverter for ActionDelivery | undefined
 const FfiConverterOptionalTypeActionDelivery = new FfiConverterOptional(FfiConverterTypeActionDelivery);
 
+// FfiConverter for boolean | undefined
+const FfiConverterOptionalBoolean = new FfiConverterOptional(FfiConverterBool);
+
 // FfiConverter for Array<ActionEvidence>
 const FfiConverterSequenceTypeActionEvidence = new FfiConverterArray(FfiConverterTypeActionEvidence);
 
@@ -6679,9 +6690,6 @@ const FfiConverterOptionalUInt64 = new FfiConverterOptional(FfiConverterUInt64);
 
 // FfiConverter for Array<string> | undefined
 const FfiConverterOptionalSequenceString = new FfiConverterOptional(FfiConverterSequenceString);
-
-// FfiConverter for boolean | undefined
-const FfiConverterOptionalBoolean = new FfiConverterOptional(FfiConverterBool);
 
 // FfiConverter for CursorPointOutput | undefined
 const FfiConverterOptionalTypeCursorPointOutput = new FfiConverterOptional(FfiConverterTypeCursorPointOutput);

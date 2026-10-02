@@ -683,6 +683,10 @@ pub struct ActionResult {
     pub route: ActionRoute,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<ActionDelivery>,
+    /// Exact owned-resource release acknowledgement, not application-effect
+    /// verification. Absent for actions without an owned cleanup phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_confirmed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Vec<ActionEvidence>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -888,6 +892,7 @@ mod tests {
 
     fn confirmed_result() -> ActionResult {
         ActionResult {
+            cleanup_confirmed: None,
             effect: ActionEffect::Confirmed,
             route: ActionRoute::Accessibility,
             delivery: Some(ActionDelivery {
@@ -949,6 +954,27 @@ mod tests {
     }
 
     #[test]
+    fn owned_cleanup_ack_is_optional_and_does_not_confirm_application_effect() {
+        let mut result = confirmed_result();
+        assert!(serde_json::to_value(&result)
+            .unwrap()
+            .get("cleanup_confirmed")
+            .is_none());
+        result.cleanup_confirmed = Some(true);
+        result.evidence = None;
+        assert_eq!(
+            result.validate_invariants(),
+            Err(ActionResultValidationError::ConfirmedRequiresEvidence)
+        );
+        result.effect = ActionEffect::Unverifiable;
+        assert_eq!(result.validate_invariants(), Ok(()));
+        assert_eq!(
+            serde_json::to_value(result).unwrap()["cleanup_confirmed"],
+            true
+        );
+    }
+
+    #[test]
     fn action_result_schema_is_exact_and_closed() {
         let schema = ActionResult::output_schema();
         assert_eq!(schema["additionalProperties"], false);
@@ -958,6 +984,7 @@ mod tests {
         assert_eq!(
             properties.keys().map(String::as_str).collect::<Vec<_>>(),
             [
+                "cleanup_confirmed",
                 "delivery",
                 "effect",
                 "error",

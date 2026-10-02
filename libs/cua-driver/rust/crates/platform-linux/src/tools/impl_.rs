@@ -293,6 +293,11 @@ impl<T: Tool> Tool for NativePointerOutcomeTool<T> {
     }
     async fn invoke(&self, args: Value) -> ToolResult {
         let tool = self.0.def().name.as_str();
+        if tool == "mouse_button_down" {
+            if let Some(refusal) = press_capture_combination_refusal(&args) {
+                return refusal;
+            }
+        }
         if tool == "mouse_drag" {
             // Cross-call motion uses the press-owned handle/source. Preparing
             // a new TARGET here would revoke or reinterpret the held operation.
@@ -3121,14 +3126,6 @@ async fn desktop_to_window_local_for(
             return source.translate(x, y);
         }
         if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
-            if let Some(source) = &source {
-                anyhow::ensure!(
-                    source.pid == pid && source.address == xid,
-                    "window_source_changed: nested target differs from original source"
-                );
-                source.validate_native()?;
-                return source.translate(x, y);
-            }
             let frame = crate::wayland::hyprland::desktop_frame()?;
             if args.get("capture_id").is_none() {
                 service.validate_desktop_observation_source(
@@ -5416,6 +5413,9 @@ fn hyprland_input_result(result: anyhow::Result<Value>, foreground: bool) -> Too
                 .downcast_ref::<crate::wayland::hyprland_input::DispatchUnknown>()
                 .map(|error| error.acknowledged_phases)
                 .filter(|count| *count > 0);
+            let cleanup = error
+                .downcast_ref::<crate::wayland::hyprland_input::DispatchUnknown>()
+                .and_then(|error| error.cleanup_confirmed);
             let effect = if count.is_some() {
                 ActionEffect::Partial
             } else {
@@ -5427,6 +5427,9 @@ fn hyprland_input_result(result: anyhow::Result<Value>, foreground: bool) -> Too
             if let Some(count) = count {
                 outcome = outcome.delivered_count(count);
             }
+            if let Some(confirmed) = cleanup {
+                outcome = outcome.cleanup_confirmed(confirmed);
+            }
             let outcome = outcome
                 .build()
                 .expect("unknown delivery preserves acknowledged progress");
@@ -5435,6 +5438,9 @@ fn hyprland_input_result(result: anyhow::Result<Value>, foreground: bool) -> Too
             value["code"] = json!(unavailable);
             value["reason"] = json!("transport_or_protocol_error");
             value["detail"] = json!(error.to_string());
+            if let Some(confirmed) = cleanup {
+                value["cleanup_confirmed"] = json!(confirmed);
+            }
             ToolResult::error(format!("{unavailable}: {error}"))
                 .with_structured(value)
                 .with_action_record(outcome)
@@ -5461,6 +5467,15 @@ fn spawn_isolated_hyprland<T: Send + 'static>(
     ),
     ToolResult,
 > {
+    #[cfg(test)]
+    if TEST_HELD_TOOL.try_with(|_| ()).is_ok() {
+        let (guard, cancellation) =
+            crate::wayland::hyprland_input::ActionCancellation::invocation();
+        return Ok((
+            guard,
+            tokio::task::spawn_blocking(move || work(cancellation)),
+        ));
+    }
     use cua_driver_core::session;
     let owner = named_session_cursor_key(args)
         .ok_or_else(|| isolated_hyprland_refusal("authenticated lifecycle required"))?;
@@ -6328,6 +6343,79 @@ fn mouse_hold_json(cursor_id: &str, hold: Option<&MouseHoldState>) -> Value {
     }
 }
 
+fn held_phase_result(
+    text: &str,
+    value: Value,
+    foreground: bool,
+    aborted: bool,
+    cleanup: Option<bool>,
+) -> ToolResult {
+    use cua_driver_core::action_record::{
+        ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
+    };
+    let mut record = ActionExecutionRecord::builder(
+        if aborted {
+            ActionEffect::Partial
+        } else {
+            ActionEffect::Unverifiable
+        },
+        if foreground {
+            ActionTransport::LinuxHyprlandForegroundInput
+        } else {
+            ActionTransport::LinuxHyprlandIsolatedInput
+        },
+        if foreground {
+            RequestedDelivery::Foreground
+        } else {
+            RequestedDelivery::Background
+        },
+    )
+    .actual_delivery(if foreground {
+        ActualDelivery::Foreground
+    } else {
+        ActualDelivery::Background
+    });
+    if aborted {
+        record = record.delivered_count(1);
+    }
+    if let Some(confirmed) = cleanup {
+        record = record.cleanup_confirmed(confirmed);
+    }
+    ToolResult::text(text)
+        .with_structured(value)
+        .with_action_record(
+            record
+                .build()
+                .expect("owned held-phase acknowledgement record"),
+        )
+}
+
+#[cfg(test)]
+#[test]
+fn unacknowledged_begin_cleanup_fact_does_not_fabricate_delivered_count_or_application_confirmation(
+) {
+    let mut error = crate::wayland::hyprland_input::unknown_dispatch(
+        anyhow::anyhow!("BEGIN reply lost; press may already have happened"),
+        0,
+    );
+    error
+        .downcast_mut::<crate::wayland::hyprland_input::DispatchUnknown>()
+        .unwrap()
+        .cleanup_confirmed = Some(true);
+    let result = hyprland_input_result(Err(error), true);
+    let record = result.action_record.unwrap();
+    assert_eq!(
+        record.effect,
+        cua_driver_core::action_record::ActionEffect::Unverifiable
+    );
+    assert_eq!(record.delivered_count, None);
+    assert_eq!(record.cleanup_confirmed, Some(true));
+    assert_eq!(
+        record.public_result().unwrap().cleanup_confirmed,
+        Some(true)
+    );
+}
+
 fn held_target_mismatch(
     args: &Value,
     cursor_id: &str,
@@ -6575,6 +6663,15 @@ async fn reveal_pointer_action_target_for(
     click_pulse: bool,
     target: Option<[f64; 4]>,
 ) {
+    #[cfg(test)]
+    if let Ok(oracle) = TEST_HELD_TOOL.try_with(Arc::clone) {
+        oracle
+            .overlays
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        oracle.arrived.notify_one();
+        oracle.resume.notified().await;
+        return;
+    }
     if !sx.is_finite() || !sy.is_finite() {
         return;
     }
@@ -12906,6 +13003,386 @@ impl Tool for DragTool {
 pub struct MouseButtonDownTool {
     state: Arc<ToolState>,
 }
+#[cfg(test)]
+struct HeldToolOracle {
+    overlays: std::sync::atomic::AtomicUsize,
+    arrived: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+#[cfg(test)]
+tokio::task_local! { static TEST_HELD_TOOL: Arc<HeldToolOracle>; }
+
+#[cfg(test)]
+#[tokio::test]
+async fn actual_mouse_down_invoke_capture_ids_are_admitted_once_or_refused_before_overlay_and_press(
+) {
+    use cua_driver_core::capture_runtime::*;
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for kind in [
+        "valid",
+        "stale",
+        "foreign",
+        "consumed",
+        "malformed",
+        "overlay_stale",
+    ] {
+        for spelling in ["local", "desktop", "zoom"] {
+            let state = ToolState::new();
+            let service = &state.capture_service;
+            let (source, peer, owner) =
+                crate::wayland::hyprland_input::tests::held_tool_fixture(service);
+            let mut publication = CapturePublication {
+                png_bytes: cua_driver_core::image_utils::encode_rgba_to_png(
+                    &vec![0; 1500 * 50 * 4],
+                    1500,
+                    50,
+                )
+                .unwrap(),
+                target: CaptureTarget::PrimaryDesktop,
+                encoded_dimensions: EncodedScreenshotDimensions::new(1500, 50).unwrap(),
+                native_action_dimensions: NativeActionDimensions::new(3000, 100).unwrap(),
+                screenshot_to_action: ScreenshotToActionTransform::new(
+                    2.0, 0.0, 0.0, 2.0, 0.0, 0.0,
+                )
+                .unwrap(),
+                session_id: source.binding.session_id().into(),
+                session_generation: source.binding.session_generation(),
+            };
+            if kind == "foreign" {
+                let foreign = service.current_binding("foreign-press-owner").unwrap();
+                publication.session_id = foreign.session_id().into();
+                publication.session_generation = foreign.session_generation();
+            }
+            let id = service
+                .publish_in_frame(publication, Some(source.frame.identity.clone()))
+                .unwrap();
+            if kind == "consumed" {
+                service
+                    .admit_action_in_frame(
+                        CaptureActionRequest {
+                            capture_id: id,
+                            binding: source.binding.clone(),
+                            target: CaptureTarget::PrimaryDesktop,
+                            current_native_action_dimensions: NativeActionDimensions::new(
+                                3000, 100,
+                            )
+                            .unwrap(),
+                            screenshot_x: 1285.25,
+                            screenshot_y: 10.375,
+                        },
+                        Some(&source.frame.identity),
+                    )
+                    .unwrap();
+            }
+            if kind == "stale" {
+                service.retire_session(&source.binding);
+            }
+            let mut args = json!({"pid":source.pid,"window_id":source.address,"_session_id":owner,"_capture_session_generation":source.binding.session_generation(),"x":1285.25,"y":10.375,"delivery_mode":"foreground","capture_id":if kind=="malformed" { "malformed".into() } else {id.to_string()}});
+            if spelling != "local" {
+                args["coordinate_frame"] = json!("desktop");
+            }
+            if spelling == "zoom" {
+                args["from_zoom"] = json!(true);
+            }
+            let oracle = Arc::new(HeldToolOracle {
+                overlays: AtomicUsize::new(0),
+                arrived: tokio::sync::Notify::new(),
+                resume: tokio::sync::Notify::new(),
+            });
+            let positive = spelling == "desktop" && matches!(kind, "valid" | "overlay_stale");
+            let server = if positive {
+                Some(std::thread::spawn(move || {
+                    let mut bytes = [0u8; 2048];
+                    let mut receive = || {
+                        let n = unsafe {
+                            libc::recv(peer.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len(), 0)
+                        };
+                        assert!(n >= 0);
+                        String::from_utf8(bytes[..n as usize].to_vec()).unwrap()
+                    };
+                    assert!(receive().starts_with("FOREGROUND_TARGET "));
+                    let mut target = crate::wayland::hyprland_input::tests::guarded_target();
+                    if kind == "overlay_stale" {
+                        target["source_identity"] = json!("44444444444444444444444444444444");
+                    }
+                    peer.send(target.to_string().as_bytes()).unwrap();
+                    if kind == "valid" {
+                        assert!(
+                            receive().contains("12.5 10.25 10.25 272"),
+                            "2x admission converted exactly once"
+                        );
+                        peer.send(json!({"ok":true,"phase":"held_started","sequence":1,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
+                        assert_eq!(receive(), "HOLD_RELEASE 2 55555555555555555555555555555555");
+                        peer.send(json!({"ok":true,"cleanup_confirmed":true,"sequence":2,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
+                    }
+                    assert!(receive().is_empty(), "no successor input packet");
+                }))
+            } else {
+                // Keep the no-effect peer for inspection after Tool.invoke.
+                Some(std::thread::spawn(move || {
+                    let mut byte = [0u8; 1];
+                    let n = unsafe { libc::recv(peer.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) };
+                    assert_eq!(n, 0, "invalid admission sent an activation/input packet");
+                }))
+            };
+            let worker_source = source.clone();
+            let worker_state = state.clone();
+            let worker_oracle = oracle.clone();
+            let task = tokio::spawn(async move {
+                TEST_HELD_TOOL
+                    .scope(
+                        worker_oracle,
+                        WINDOW_ACTION_SOURCE.scope(
+                            worker_source,
+                            MouseButtonDownTool {
+                                state: worker_state,
+                            }
+                            .invoke(args),
+                        ),
+                    )
+                    .await
+            });
+            if positive {
+                oracle.arrived.notified().await;
+                oracle.resume.notify_one();
+            }
+            let result = task.await.unwrap();
+            assert_eq!(
+                result.is_error == Some(true),
+                !(positive && kind == "valid"),
+                "{kind}/{spelling}: {result:?}"
+            );
+            assert_eq!(
+                oracle.overlays.load(Ordering::SeqCst),
+                usize::from(positive)
+            );
+            if positive {
+                assert_eq!(source.admission().unwrap().capture_id, id);
+                if kind == "valid" {
+                    let holds = std::mem::take(&mut *state.mouse_hold.lock().unwrap());
+                    drop(holds);
+                }
+            }
+            crate::wayland::hyprland_input::tests::close_held_tool_fixture(&source);
+            server.unwrap().join().unwrap();
+        }
+    }
+}
+fn press_capture_combination_refusal(args: &Value) -> Option<ToolResult> {
+    if args
+        .get("capture_id")
+        .is_some_and(|value| !value.is_string())
+    {
+        return Some(
+            ToolResult::error("capture_id must be a string").with_structured(
+                json!({"code":"invalid_arguments","effect":"none","retryable":false}),
+            ),
+        );
+    }
+    (args.get("capture_id").is_some() &&
+        (!desktop_frame_requested(args) || args.bool_or("from_zoom", false)))
+        .then(|| ToolResult::error("mouse_button_down capture_id requires an explicit desktop frame and cannot be combined with from_zoom")
+            .with_structured(json!({"code":"invalid_arguments","effect":"none","retryable":false})))
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn actual_registry_mouse_drag_retains_two_x_cap_once_and_up_reports_owned_completion_classes()
+{
+    use cua_driver_core::{capture_runtime::*, tool::ToolRegistry};
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::AtomicUsize;
+    for completion in ["normal", "aborted", "dropped"] {
+        let mut registry = ToolRegistry::new();
+        let service = registry.capture_service();
+        let state = ToolState::new_with_capture_service(service.clone());
+        let (mut source, peer, public_owner) =
+            crate::wayland::hyprland_input::tests::held_tool_fixture(&service);
+        struct OwnerProbe {
+            def: ToolDef,
+            args: Arc<std::sync::Mutex<Option<Value>>>,
+        }
+        #[async_trait]
+        impl Tool for OwnerProbe {
+            fn def(&self) -> &ToolDef {
+                &self.def
+            }
+            async fn invoke(&self, args: Value) -> ToolResult {
+                *self.args.lock().unwrap() = Some(args);
+                ToolResult::text("owner observed")
+                    .with_structured(json!({"width":3000,"height":100,"scale_factor":1.5}))
+            }
+        }
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        registry.register(Box::new(OwnerProbe {
+            def: ToolDef {
+                name: "get_screen_size".into(),
+                description: "fixture ownership".into(),
+                input_schema: json!({"type":"object"}),
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            args: observed.clone(),
+        }));
+        let result = registry
+            .invoke_from_trusted_adapter("get_screen_size", json!({"_session_id":public_owner}))
+            .await;
+        assert_ne!(result.is_error, Some(true), "owner probe: {result:?}");
+        let owner = observed.lock().unwrap().as_ref().unwrap()["_session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        crate::wayland::hyprland_input::tests::namespace_held_tool_fixture(
+            &mut source,
+            &service,
+            &owner,
+        );
+        let id = service
+            .publish_in_frame(
+                CapturePublication {
+                    png_bytes: cua_driver_core::image_utils::encode_rgba_to_png(
+                        &vec![0; 1500 * 50 * 4],
+                        1500,
+                        50,
+                    )
+                    .unwrap(),
+                    target: CaptureTarget::PrimaryDesktop,
+                    encoded_dimensions: EncodedScreenshotDimensions::new(1500, 50).unwrap(),
+                    native_action_dimensions: NativeActionDimensions::new(3000, 100).unwrap(),
+                    screenshot_to_action: ScreenshotToActionTransform::new(
+                        2.0, 0.0, 0.0, 2.0, 0.0, 0.0,
+                    )
+                    .unwrap(),
+                    session_id: source.binding.session_id().into(),
+                    session_generation: source.binding.session_generation(),
+                },
+                Some(source.frame.identity.clone()),
+            )
+            .unwrap();
+        let admitted = service
+            .admit_action_in_frame(
+                CaptureActionRequest {
+                    capture_id: id,
+                    binding: source.binding.clone(),
+                    target: CaptureTarget::PrimaryDesktop,
+                    current_native_action_dimensions: NativeActionDimensions::new(3000, 100)
+                        .unwrap(),
+                    screenshot_x: 1285.25,
+                    screenshot_y: 10.375,
+                },
+                Some(&source.frame.identity),
+            )
+            .unwrap();
+        source.retain_admission(&source.binding, &admitted);
+        cua_driver_core::desktop_capture_scale::record_desktop_state_for_binding(
+            &json!({"_session_id":owner}),
+            Some(
+                &json!({"screenshot_original_width":3000,"screenshot_original_height":100,"screenshot_width":1500,"screenshot_height":50}),
+            ),
+            Some(&source.binding),
+        );
+        let server = std::thread::spawn(move || {
+            let mut bytes = [0u8; 2048];
+            let mut receive = || {
+                let n = unsafe {
+                    libc::recv(peer.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len(), 0)
+                };
+                assert!(n >= 0);
+                String::from_utf8(bytes[..n as usize].to_vec()).unwrap()
+            };
+            assert!(receive().starts_with("FOREGROUND_TARGET "));
+            peer.send(
+                crate::wayland::hyprland_input::tests::guarded_target()
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+            assert!(receive().starts_with("HOLD_BEGIN 1 "));
+            peer.send(json!({"ok":true,"phase":"held_started","sequence":1,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
+            let packet = receive();
+            assert!(
+                packet.ends_with(" 20.25 20.25"),
+                "retained 2x affine applied exactly once: {packet}"
+            );
+            peer.send(json!({"ok":true,"phase":"held_moved","sequence":2,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
+            assert_eq!(receive(), "HOLD_RELEASE 3 55555555555555555555555555555555");
+            if completion != "dropped" {
+                peer.send(json!({"ok":true,"cleanup_confirmed":true,"effect":if completion=="aborted" {"partial"} else {"unverifiable"},"sequence":3,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
+            }
+            assert!(
+                receive().is_empty(),
+                "duplicate/reentrant up must not send another release"
+            );
+        });
+        let retained = source.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            crate::wayland::hyprland_input::begin_held_source(
+                retained,
+                (10.25, 10.25),
+                1,
+                true,
+                crate::wayland::hyprland_input::ActionCancellation::default(),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        state.mouse_hold.lock().unwrap().insert(
+            owner.clone(),
+            MouseHoldState {
+                pid: source.pid,
+                xid: source.address,
+                button: 1,
+                x: 10.25,
+                y: 10.25,
+                guarded: Some(handle.clone()),
+            },
+        );
+        registry.register(Box::new(MouseDragTool {
+            state: state.clone(),
+        }));
+        registry.register(Box::new(MouseButtonUpTool {
+            state: state.clone(),
+        }));
+        let oracle = Arc::new(HeldToolOracle {
+            overlays: AtomicUsize::new(0),
+            arrived: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        oracle.resume.notify_one();
+        assert!(
+            state.mouse_hold.lock().unwrap().contains_key(&owner),
+            "fixture owner {owner:?}"
+        );
+        let result=TEST_HELD_TOOL.scope(oracle,registry.invoke_from_trusted_adapter("mouse_drag",json!({"_session_id":owner,"pid":source.pid,"window_id":source.address,"coordinate_frame":"desktop","x":1290.25,"y":15.375,"duration_ms":0,"steps":1}))).await;
+        assert_ne!(result.is_error, Some(true), "{completion}: {result:?}");
+        let result = registry
+            .invoke_from_trusted_adapter("mouse_button_up", json!({"_session_id":owner}))
+            .await;
+        assert_eq!(
+            result.is_error == Some(true),
+            completion == "dropped",
+            "{completion}: {result:?}"
+        );
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["cleanup_confirmed"],
+            completion != "dropped"
+        );
+        if completion == "aborted" {
+            assert_eq!(
+                result.structured_content.as_ref().unwrap()["effect"],
+                "partial"
+            );
+        }
+        assert_eq!(source.admission().unwrap().capture_id, id);
+        drop(handle);
+        crate::wayland::hyprland_input::tests::close_held_tool_fixture(&source);
+        server.join().unwrap();
+    }
+}
 static MDOWN_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
 #[async_trait]
@@ -12936,6 +13413,9 @@ impl Tool for MouseButtonDownTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        if let Some(refusal) = press_capture_combination_refusal(&args) {
+            return refusal;
+        }
         let cursor_id = resolve_cursor_key(&args);
         if let Some(held) = self
             .state
@@ -12965,6 +13445,9 @@ impl Tool for MouseButtonDownTool {
         let mut y = args.f64_or("y", 0.0);
         let desktop_frame = desktop_frame_requested(&args);
         let held_source = window_action_source();
+        if desktop_frame && args.get("capture_id").is_some() && held_source.is_none() {
+            return window_source_refusal("capture-bound press requires the exact retained source; no unbound persistent-pointer substitute");
+        }
         if desktop_frame {
             if let Some(source) = &held_source {
                 let id = args
@@ -13043,7 +13526,7 @@ impl Tool for MouseButtonDownTool {
                 };
             let guarded = match dispatch.await {
                 Ok(Ok(handle)) => handle,
-                Ok(Err(error)) => return isolated_hyprland_result(Err(error)),
+                Ok(Err(error)) => return hyprland_input_result(Err(error), foreground),
                 Err(error) => return isolated_hyprland_task_error(error, false),
             };
             let hold = MouseHoldState {
@@ -13067,8 +13550,13 @@ impl Tool for MouseButtonDownTool {
                 cursor_id.clone(),
                 cursor_overlay::OverlayCommand::SetPressed(true),
             );
-            return ToolResult::text("Mouse button held.")
-                .with_structured(mouse_hold_json(&cursor_id, Some(&hold)));
+            return held_phase_result(
+                "Mouse button held.",
+                mouse_hold_json(&cursor_id, Some(&hold)),
+                foreground,
+                false,
+                None,
+            );
         }
         crate::overlay::send_command_for(
             cursor_id.clone(),
@@ -13174,6 +13662,8 @@ impl Tool for MouseDragTool {
                 "cursor_id":{"type":"string","description":"Optional multi-cursor instance id. Default: 'default'."},
                 "pid":{"type":"integer","description":"Optional process ID; must match the held button's target."},
                 "window_id":{"type":"integer","description":"Optional window id; must match the held button's target."},
+                "coordinate_frame": coordinate_frame_schema(),
+                "delivery_mode": crate::input::delivery::delivery_mode_schema(),
                 "x":{"type":"number","description":"Window-local pixel X of the target window's own get_window_state screenshot (0..screenshot_width). For get_desktop_state pixels pass scope:\"desktop\" (or coordinate_frame:\"desktop\")."},
                 "y":{"type":"number","description":"Window-local pixel Y of the target window's own get_window_state screenshot (0..screenshot_height); see x."},
                 "duration_ms":{"type":"integer","minimum":0,"maximum":10000,"description":"Total drag duration. Default: 500."},
@@ -13270,7 +13760,9 @@ impl Tool for MouseDragTool {
                 };
             match dispatch.await {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => return isolated_hyprland_result(Err(error)),
+                Ok(Err(error)) => {
+                    return hyprland_input_result(Err(error), guarded.is_foreground())
+                }
                 Err(error) => return isolated_hyprland_task_error(error, true),
             }
             hold.x = to_x;
@@ -13285,8 +13777,13 @@ impl Tool for MouseDragTool {
                 .cursor_registry
                 .update_position(&cursor_id, sx, sy);
             overlay_snap_to_for(&cursor_id, sx, sy, None);
-            return ToolResult::text("Moved the held pointer.")
-                .with_structured(mouse_hold_json(&cursor_id, Some(&hold)));
+            return held_phase_result(
+                "Moved the held pointer.",
+                mouse_hold_json(&cursor_id, Some(&hold)),
+                guarded.is_foreground(),
+                false,
+                None,
+            );
         }
         if args.bool_or("from_zoom", false) {
             match self.state.zoom_context(&args, hold.pid, Some(hold.xid)) {
@@ -13506,6 +14003,7 @@ impl Tool for MouseButtonUpTool {
             if let Err(e) = guarded.authorize(&owner, &binding) {
                 return window_source_refusal(e);
             }
+            let foreground = guarded.is_foreground();
             let result =
                 tokio::task::spawn_blocking(move || guarded.release(&owner, &binding)).await;
             return match result {
@@ -13519,9 +14017,15 @@ impl Tool for MouseButtonUpTool {
                     outcome["cleanup_confirmed"] = json!(true);
                     outcome["effect"] = json!(if aborted { "partial" } else { "unverifiable" });
                     outcome["endpoint_motion"] = json!(false);
-                    ToolResult::text("Released the original held pointer.").with_structured(outcome)
+                    held_phase_result(
+                        "Released the original held pointer.",
+                        outcome,
+                        foreground,
+                        aborted,
+                        Some(true),
+                    )
                 }
-                Ok(Err(error)) => isolated_hyprland_result(Err(error)),
+                Ok(Err(error)) => hyprland_input_result(Err(error), foreground),
                 Err(error) => isolated_hyprland_task_error(error, true),
             };
         }

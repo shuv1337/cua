@@ -268,6 +268,7 @@ pub struct ActionExecutionRecord {
     pub escalation: Option<ActionEscalation>,
     pub delivered_count: Option<u32>,
     pub detail: Option<String>,
+    pub cleanup_confirmed: Option<bool>,
     pub refusal: Option<ActionRefusal>,
 }
 
@@ -288,6 +289,7 @@ impl ActionExecutionRecord {
             escalation: None,
             delivered_count: None,
             detail: None,
+            cleanup_confirmed: None,
             refusal: None,
         }
     }
@@ -345,6 +347,7 @@ impl ActionExecutionRecord {
     ) -> Result<cua_driver_contract::ActionResult, ActionRecordValidationError> {
         let projection = self.stable_projection()?;
         Ok(cua_driver_contract::ActionResult {
+            cleanup_confirmed: self.cleanup_confirmed,
             effect: match projection.effect {
                 ActionEffect::Confirmed => cua_driver_contract::ActionEffect::Confirmed,
                 ActionEffect::Partial => cua_driver_contract::ActionEffect::Partial,
@@ -1196,6 +1199,11 @@ impl ActionExecutionRecordBuilder {
 
     pub fn delivered_count(mut self, delivered_count: u32) -> Self {
         self.0.delivered_count = Some(delivered_count);
+        self
+    }
+
+    pub fn cleanup_confirmed(mut self, confirmed: bool) -> Self {
+        self.0.cleanup_confirmed = Some(confirmed);
         self
     }
 

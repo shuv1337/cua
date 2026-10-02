@@ -1412,6 +1412,52 @@ class _UniffiFfiConverterOptionalTypeActionDelivery(_UniffiConverterRustBuffer):
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
+class _UniffiFfiConverterBoolean:
+    @classmethod
+    def check_lower(cls, value):
+        return not not value
+
+    @classmethod
+    def lower(cls, value):
+        return 1 if value else 0
+
+    @staticmethod
+    def lift(value):
+        return value != 0
+
+    @classmethod
+    def read(cls, buf):
+        return cls.lift(buf.read_u8())
+
+    @classmethod
+    def write(cls, value, buf):
+        buf.write_u8(value)
+
+class _UniffiFfiConverterOptionalBoolean(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterBoolean.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterBoolean.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterBoolean.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 class _UniffiFfiConverterSequenceTypeActionEvidence(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -1537,10 +1583,11 @@ class _UniffiFfiConverterOptionalTypeActionNextCall(_UniffiConverterRustBuffer):
 
 @dataclass
 class ActionResult:
-    def __init__(self, *, effect:ActionEffect, route:ActionRoute, delivery:typing.Optional[ActionDelivery], evidence:typing.Optional[typing.List[ActionEvidence]], escalation:typing.Optional[ActionEscalation], summary:typing.Optional[str], error:typing.Optional[ActionError], hint:typing.Optional[str], next_call:typing.Optional[ActionNextCall]):
+    def __init__(self, *, effect:ActionEffect, route:ActionRoute, delivery:typing.Optional[ActionDelivery], cleanup_confirmed:typing.Optional[bool], evidence:typing.Optional[typing.List[ActionEvidence]], escalation:typing.Optional[ActionEscalation], summary:typing.Optional[str], error:typing.Optional[ActionError], hint:typing.Optional[str], next_call:typing.Optional[ActionNextCall]):
         self.effect = effect
         self.route = route
         self.delivery = delivery
+        self.cleanup_confirmed = cleanup_confirmed
         self.evidence = evidence
         self.escalation = escalation
         self.summary = summary
@@ -1552,13 +1599,15 @@ class ActionResult:
 
 
     def __str__(self):
-        return "ActionResult(effect={}, route={}, delivery={}, evidence={}, escalation={}, summary={}, error={}, hint={}, next_call={})".format(self.effect, self.route, self.delivery, self.evidence, self.escalation, self.summary, self.error, self.hint, self.next_call)
+        return "ActionResult(effect={}, route={}, delivery={}, cleanup_confirmed={}, evidence={}, escalation={}, summary={}, error={}, hint={}, next_call={})".format(self.effect, self.route, self.delivery, self.cleanup_confirmed, self.evidence, self.escalation, self.summary, self.error, self.hint, self.next_call)
     def __eq__(self, other):
         if self.effect != other.effect:
             return False
         if self.route != other.route:
             return False
         if self.delivery != other.delivery:
+            return False
+        if self.cleanup_confirmed != other.cleanup_confirmed:
             return False
         if self.evidence != other.evidence:
             return False
@@ -1581,6 +1630,7 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
             effect=_UniffiFfiConverterTypeActionEffect.read(buf),
             route=_UniffiFfiConverterTypeActionRoute.read(buf),
             delivery=_UniffiFfiConverterOptionalTypeActionDelivery.read(buf),
+            cleanup_confirmed=_UniffiFfiConverterOptionalBoolean.read(buf),
             evidence=_UniffiFfiConverterOptionalSequenceTypeActionEvidence.read(buf),
             escalation=_UniffiFfiConverterOptionalTypeActionEscalation.read(buf),
             summary=_UniffiFfiConverterOptionalString.read(buf),
@@ -1594,6 +1644,7 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
         _UniffiFfiConverterTypeActionEffect.check_lower(value.effect)
         _UniffiFfiConverterTypeActionRoute.check_lower(value.route)
         _UniffiFfiConverterOptionalTypeActionDelivery.check_lower(value.delivery)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.cleanup_confirmed)
         _UniffiFfiConverterOptionalSequenceTypeActionEvidence.check_lower(value.evidence)
         _UniffiFfiConverterOptionalTypeActionEscalation.check_lower(value.escalation)
         _UniffiFfiConverterOptionalString.check_lower(value.summary)
@@ -1606,33 +1657,13 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
         _UniffiFfiConverterTypeActionEffect.write(value.effect, buf)
         _UniffiFfiConverterTypeActionRoute.write(value.route, buf)
         _UniffiFfiConverterOptionalTypeActionDelivery.write(value.delivery, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.cleanup_confirmed, buf)
         _UniffiFfiConverterOptionalSequenceTypeActionEvidence.write(value.evidence, buf)
         _UniffiFfiConverterOptionalTypeActionEscalation.write(value.escalation, buf)
         _UniffiFfiConverterOptionalString.write(value.summary, buf)
         _UniffiFfiConverterOptionalTypeActionError.write(value.error, buf)
         _UniffiFfiConverterOptionalString.write(value.hint, buf)
         _UniffiFfiConverterOptionalTypeActionNextCall.write(value.next_call, buf)
-
-class _UniffiFfiConverterBoolean:
-    @classmethod
-    def check_lower(cls, value):
-        return not not value
-
-    @classmethod
-    def lower(cls, value):
-        return 1 if value else 0
-
-    @staticmethod
-    def lift(value):
-        return value != 0
-
-    @classmethod
-    def read(cls, buf):
-        return cls.lift(buf.read_u8())
-
-    @classmethod
-    def write(cls, value, buf):
-        buf.write_u8(value)
 
 @dataclass
 class AppInfo:
@@ -3808,31 +3839,6 @@ class _UniffiFfiConverterTypeElementSelector(_UniffiConverterRustBuffer):
     def write(value, buf):
         _UniffiFfiConverterOptionalString.write(value.role, buf)
         _UniffiFfiConverterOptionalString.write(value.label_contains, buf)
-
-class _UniffiFfiConverterOptionalBoolean(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterBoolean.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterBoolean.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterBoolean.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
 
 @dataclass
 class ElementPredicate:

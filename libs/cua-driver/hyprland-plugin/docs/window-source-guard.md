@@ -52,30 +52,37 @@ Hyprland 0.56.2: screencast/screencastv2, layers, bells and custom markers do no
 revoke topology. Monitor/config events and unknown future names still revoke;
 complete layout/mode/DPMS authority requires the plugin generation.
 
-## Remaining stateful phase seam
+## Stateful capability and cleanup limits
 
-`source_guard_version:1` is a TARGET observation extension; protocol v3 still
-offers only finite CLICK/KEY/SCROLL/DRAG/ACTIVATE one-shot grants. There is no
-held-operation handle or move phase which applies a retained root to the original
-device. `persistent_vptr` owns a separate wlroots device; that protocol cannot
-consume the plugin grant. Its foreign-toplevel activation lookup is not an exact
-compositor-root capability. A read-only SOURCE_GUARD query alone would not fix
-that delivery/activation seam and must not be advertised as such.
+The implemented private `held_phase_version:1` extension is input authority,
+not a read-only SOURCE_GUARD passed to a generic wlroots device. Its lease lasts
+five seconds from the original grant without renewal. Holds are intra-client
+(selection, canvas, sliders); titlebar/resize motion changes the retained witness
+and retires the hold. Ordinary local `persistent_vptr` and semantic availability
+remain independent of optional recording and this private grant.
 
-Minimal private extension for full stateful parity: negotiate a held-phase
-capability; BEGIN validates the original root nonce/revision/fractional geometry,
-desktop generation, owner and delivery policy before focus/press, and returns an
-opaque held-operation handle for that same lane/device. MOVE carries that handle
-and original source witness, reconciles under the compositor phase handler before
-motion and never binds a successor root. RELEASE/abort remain coordinate-free,
-release only owned buttons on the original device after invalidation, and preserve
-bounded acknowledged/partial/unknown outcomes. Disconnect/Stop/root changes and
-idle expiry must revoke that same handle/device; no reconnect or replay. Driver
-session lifetime, queued cancellation and cleanup quarantine must carry the handle
-through every phase. Existing background package qualifications remain unchanged;
-background holds must not silently become foreground injection. This extension
-is not implemented or negotiated in this candidate; this is an implementation
-gap, not a claim that stateful input is intrinsically impossible.
+`HOLD_ABORT sequence original_root_nonce` permits exact original-connection
+cleanup after a lost/malformed BEGIN handle ACK. It does not acquire a handle,
+target or device. Independent release uses the captured pointer proxies even
+after root destruction, before leave/destruction. An uncertain BEGIN/MOVE ACK
+attempts bounded coordinate-free cleanup on that original socket, then closes
+or quarantines it; EOF alone is never proof of release. Cleanup lock timeout
+publishes retirement first, and the effect owner services that release obligation
+when it exits. A verified original-handle/sequence retired reply can retain
+confirmed aborted completion; other retirement never implies confirmation.
+
+Hyprland 0.56.2's native `CWLPointerResource::sendLeave` releases pressed buttons
+on the old surface before changing focus, except during DnD. The plugin never
+sends a foreground release to successor focus. Without an observed original
+resource release ACK, a focus/root-loss outcome remains explicitly unconfirmed;
+the native void `sendButton` also cannot confirm ordinary foreground RELEASE
+when capabilities or the native pressed set disappeared. This candidate retains
+an unconfirmed cleanup quarantine even after a same-focus release attempt;
+independent protocol resources provide a direct original-resource queue fact.
+it does not infer confirmation from a disappeared surface. Active DnD is rejected
+by foreground admission, and DnD beginning during a hold is a cancellation with
+potentially unconfirmed delivery. Native focus/close/DnD qualification remains
+required; this source description is not that evidence.
 
 Any module implementing it needs a newly built artifact and disposable matching-
 version compositor qualification before home distribution. Existing trusted
