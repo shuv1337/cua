@@ -148,6 +148,99 @@ failures. This decision changes test strategy, records no new passing result,
 and does not waive the affected CI, native evidence, or release gates in
 [RFC 3550](../../../docs/rfcs/3550-hyprland-isolated-input.md).
 
+## Supplemental native dual-display acceptance
+
+`hyprland_dual_display_test` is a **manual supporting** row, not a new CI
+requirement or a replacement for any complete canonical/native Hyprland gate.
+It tests the public `primary` aggregate desktop alias; it does not introduce
+per-output `display_id` targeting. The read-only preflight requires exactly:
+
+- DP-2: 3840×2160, scale 1.5, transform 0, powered, origin (0,0).
+- DP-1: 3840×2160, scale 1.5, transform 0, powered, origin (2560,0).
+- Native Hyprland/Wayland, no `DISPLAY` fallback, and an **empty isolated desktop**
+  (no existing clients). GTK3/PyGObject, `grim`, and GNU `timeout` must already be
+  available. The candidate's native foreground plugin route must already be
+  configured/attested; the test never installs, reloads or enables it.
+  Independent compositor/capture commands have ten-second deadlines.
+
+Do not run this against the user's working desktop. Do not close their windows,
+unlock the session, reconfigure monitors, install or enable a plugin, or change
+global window rules to pass preflight. Prepare the isolated session separately
+with explicit authorization. GTK's fullscreen-on-monitor hint must place both
+disposable fixtures at the exact compositor-reported bounds; refusal to honor
+that hint is a fixture/environment failure, not permission to weaken assertions.
+
+Build only the test binary during implementation (no native input):
+
+```bash
+cd libs/cua-driver/rust
+CARGO_TARGET_DIR=/tmp/shuvcode/cua-dual-display-tests-target \
+  cargo test --locked -p cua-driver-e2e --test hyprland_dual_display_test --no-run
+CARGO_TARGET_DIR=/tmp/shuvcode/cua-dual-display-tests-target \
+  cargo test --locked -p cua-driver-e2e --test hyprland_dual_display_test
+```
+
+Later, in the already prepared isolated native session, build the Driver from
+the integrated stable candidate, record the checkout SHA and binary hash, and
+run explicitly (absolute binary path, replace the SHA/path below):
+
+```bash
+env -u DISPLAY CUA_TEST_DUAL_DISPLAY_PREPARED=1 \
+  CUA_DRIVER_RS_ENABLE_WAYLAND=1 CUA_E2E_UNRESTRICTED_GUI=1 \
+  CUA_TEST_DRIVER_BIN=/absolute/path/to/candidate/cua-driver \
+  CUA_E2E_SOURCE_SHA=FULL_40_CHARACTER_CANDIDATE_SHA \
+  cargo test --locked -p cua-driver-e2e --test hyprland_dual_display_test \
+  -- --ignored --nocapture --test-threads=1
+```
+
+The row checks 5120×1440 screen and per-output metadata, compositor-addressed
+window-bounds offsets, both composed capture halves against independently
+captured `grim -s 1 -o` logical pixels with color/position tolerances, and
+2560×720 capped pixels. Visible white fixture markers independently match each
+output's capture, and capped click coordinates are scanned from PNG pixels,
+not substituted from known geometry. The expected raw event/counter effect
+and independent compositor landing still use the prepared target's logical
+center, so incorrect screenshot mapping cannot certify itself.
+Primary-seat desktop clicks cover both centers, first/last-pixel corners, and the two
+seam-adjacent pixels. Separate GTK raw press/release journals and incremented
+click counters establish actual delivery/effects; `hyprctl cursorpos` and Driver
+live readback establish landing rather than commanded/synthetic bookkeeping.
+Scroll reaches each output; a seam-crossing drag verifies the original GTK
+surface's implicit-grab release and final primary position. Legacy capped-image
+and capture-bound clicks must each map once. Reusing a consumed capture must
+return exactly `capture_not_found`/`effect:refused` without another button event.
+Actions are never replayed to make the test pass.
+
+Window-addressed foreground click/double/right-click, scroll and drag use
+`coordinate_frame:desktop` on DP-1 with `DISPLAY` absent and real fixture event
+coordinates/counters. Window-addressed held down/up exercise both desktop-frame
+translation paths at the same press/release point using the persistent primary
+seat, not raw background plugin delivery. Desktop hover observes raw GTK motion
+and independent pointer readback. Logs pin `hyprctl version`, source-SHA claim,
+the existing testkit `OracleKind` tags, and tool elapsed times (no unagreed
+latency threshold or canonical v2 report claim).
+
+The testkit reaper terminates only the two fixture processes on success or
+failure. Private temporary fixture journals/screenshots are removed by RAII;
+this supporting row does not start a recording or publish desktop captures.
+Keep any explicitly enabled testkit artifacts private. Foreground pointer/focus
+movement is intentional and has no restoration promise; closing the disposable
+fixtures restores their occupied surfaces, not prior primary-seat state. The
+row must not run concurrently with another GUI test or human input.
+
+Limits: this row does not certify raw background exact-client plugin routing,
+overlay artwork/high-DPI fidelity, semantic cross-client drag-and-drop,
+negative/mixed/rotated layouts, held-gesture
+topology transitions or actual same-size topology changes. The existing
+qualified Inkscape/LibreOffice background proofs remain separate; GTK is not
+admitted to that production route. The hermetic swapped-output check validates
+only this row's preflight, **not** production stale-capture admission. There is
+no public topology mutation seam that can safely exercise same-size changes
+without reconfiguring the desktop; cover typed stale-frame/non-replay behavior
+at the common capture/topology owner and perform native transition proof only
+in a separately authorized disposable session. This row also does not attest
+binary/source identity merely because `CUA_E2E_SOURCE_SHA` was supplied.
+
 ## Repository Map
 
 ```text

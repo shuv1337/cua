@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use cua_driver_testkit::e2e::OracleKind;
 use cua_driver_testkit::{spawn_in_job, workspace_root, Driver, McpDriver};
-use image::{imageops::FilterType, RgbImage};
+use image::RgbImage;
 use serde_json::{json, Value};
 
 const SESSION: &str = "hyprland-dual-display";
@@ -43,6 +44,11 @@ fn qualify_layout(monitors: &Value) {
         assert_eq!(m["scale"], 1.5, "{name} scale");
         assert_eq!(m["dpmsStatus"], true, "{name} must be powered");
         assert_eq!(m["disabled"], false, "{name} must be enabled");
+        assert!(
+            matches!(m.get("mirrorOf"), Some(Value::Null))
+                || matches!(m["mirrorOf"].as_str(), Some("") | Some("none")),
+            "{name} must not be mirrored"
+        );
     }
 }
 
@@ -112,8 +118,15 @@ fn launch(driver: &mut McpDriver, dir: &Path, output: &str, x: f64) -> Fixture {
 }
 
 fn call(driver: &mut McpDriver, tool: &str, mut args: Value) -> Value {
-    args["session"] = json!(SESSION);
+    if args.get("session").is_none() {
+        args["session"] = json!(SESSION);
+    }
+    let started = Instant::now();
     let response = driver.call(tool, args);
+    println!(
+        "[dual-display-timing] tool={tool} elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
     assert!(!response.is_error(), "{tool}: {}", response.text());
     response.structured().clone()
 }
@@ -134,20 +147,64 @@ fn capture(driver: &mut McpDriver, dir: &Path, cap: u32) -> (Value, RgbImage) {
     );
     assert_eq!(state["screenshot_width"], pixels.width());
     assert_eq!(state["screenshot_height"], pixels.height());
+    assert_eq!(state["display"], "primary");
+    assert_eq!(state["screen_width"], 5120);
+    assert_eq!(state["screen_height"], 1440);
+    assert_eq!(
+        state["scale_factor"], 1.0,
+        "composite capture normalization, not output DPI multiplier"
+    );
+    if cap != 0 {
+        assert_eq!(state["screenshot_original_width"], 5120);
+        assert_eq!(state["screenshot_original_height"], 1440);
+    }
     (state, pixels)
 }
 
 fn output_pixels(dir: &Path, output: &str) -> RgbImage {
     let path = dir.join(format!("{output}.png"));
     assert!(Command::new("timeout")
-        .args(["10s", "grim", "-o", output])
+        .args(["10s", "grim", "-s", "1", "-o", output])
         .arg(&path)
         .status()
         .unwrap()
         .success());
     let raw = image::open(path).unwrap().to_rgb8();
-    assert_eq!(raw.dimensions(), (3840, 2160));
-    image::imageops::resize(&raw, 2560, 1440, FilterType::Triangle)
+    assert_eq!(raw.dimensions(), (2560, 1440));
+    raw
+}
+
+fn marker(pixels: &RgbImage, output_index: u32) -> (f64, f64) {
+    let half = pixels.width() / 2;
+    let mut bounds = (u32::MAX, u32::MAX, 0, 0);
+    let mut count = 0;
+    for y in 0..pixels.height() {
+        for x in output_index * half..(output_index + 1) * half {
+            if pixels.get_pixel(x, y).0.iter().all(|v| *v >= 245) {
+                bounds.0 = bounds.0.min(x);
+                bounds.1 = bounds.1.min(y);
+                bounds.2 = bounds.2.max(x);
+                bounds.3 = bounds.3.max(y);
+                count += 1;
+            }
+        }
+    }
+    assert!(count > 100, "visible white fixture marker missing");
+    (
+        (bounds.0 + bounds.2 + 1) as f64 / 2.0,
+        (bounds.1 + bounds.3 + 1) as f64 / 2.0,
+    )
+}
+
+fn pixel_close(actual: &image::Rgb<u8>, expected: &image::Rgb<u8>) {
+    assert!(
+        actual
+            .0
+            .iter()
+            .zip(expected.0)
+            .all(|(a, b)| (i16::from(*a) - i16::from(b)).abs() <= 8),
+        "independent capture pixels differ: {actual:?} vs {expected:?}"
+    );
 }
 
 fn fixture_pixels_ready(pixels: &RgbImage, output: &str) -> bool {
@@ -220,7 +277,7 @@ fn click(
     peer: &Fixture,
     x: f64,
     y: f64,
-    encoded: bool,
+    encoded: Option<(f64, f64)>,
     capture_id: Option<&str>,
 ) {
     let before = events(&f.journal);
@@ -230,8 +287,8 @@ fn click(
         .rev()
         .find_map(|e| e["clicks"].as_u64())
         .unwrap();
-    let mut args = json!({"scope": "desktop", "x": if encoded { x / 2.0 } else { x },
-                          "y": if encoded { y / 2.0 } else { y }});
+    let (image_x, image_y) = encoded.unwrap_or((x, y));
+    let mut args = json!({"scope": "desktop", "x": image_x, "y": image_y});
     if let Some(id) = capture_id {
         args["capture_id"] = json!(id);
     }
@@ -260,8 +317,135 @@ fn click(
     }
 }
 
+fn window_foreground_rows(driver: &mut McpDriver, target: &Fixture, peer: &Fixture) {
+    let session = "dual-display-window-frame";
+    call(
+        driver,
+        "start_session",
+        json!({"session":session,"capture_scope":"window"}),
+    );
+    let base = json!({"session":session,"pid":target.pid,"window_id":target.wid,
+                      "coordinate_frame":"desktop","delivery_mode":"foreground"});
+    for (tool, count, button) in [
+        ("click", 1, 1),
+        ("double_click", 2, 1),
+        ("right_click", 1, 3),
+    ] {
+        let before = events(&target.journal);
+        let peer_before = events(&peer.journal).len();
+        let clicks = before
+            .iter()
+            .rev()
+            .find_map(|e| e["clicks"].as_u64())
+            .unwrap();
+        let mut args = base.clone();
+        args["x"] = json!(3840);
+        args["y"] = json!(800);
+        call(driver, tool, args);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let journal = events(&target.journal);
+            let releases: Vec<_> = journal[before.len()..]
+                .iter()
+                .filter(|e| e["kind"] == "button-release")
+                .collect();
+            if releases.len() >= count {
+                std::thread::sleep(Duration::from_millis(150));
+                let settled = events(&target.journal);
+                for kind in ["button-press", "button-release"] {
+                    let observed: Vec<_> = settled[before.len()..]
+                        .iter()
+                        .filter(|e| e["kind"] == kind)
+                        .collect();
+                    assert_eq!(observed.len(), count, "{tool}: exact fixture event count");
+                    for event in observed {
+                        assert_point(event, 1280.0, 800.0);
+                        assert_eq!(event["button"], button);
+                    }
+                }
+                assert_eq!(releases.last().unwrap()["clicks"], clicks + count as u64);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{tool} never changed target fixture"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!events(&peer.journal)[peer_before..]
+            .iter()
+            .any(|e| e["kind"] == "button-press" || e["kind"] == "button-release"));
+        pointer(driver, 3840.0, 800.0);
+    }
+    // Native window-local foreground coordinates are already logical. This
+    // contrasts with the desktop-frame rows and catches a second /1.5 factor.
+    let before = events(&target.journal);
+    let clicks = before
+        .iter()
+        .rev()
+        .find_map(|e| e["clicks"].as_u64())
+        .unwrap();
+    let mut local = base.clone();
+    local.as_object_mut().unwrap().remove("coordinate_frame");
+    local["x"] = json!(100);
+    local["y"] = json!(50);
+    call(driver, "click", local);
+    wait_event(target, before.len(), "button-press", 100.0, 50.0);
+    assert_eq!(
+        wait_event(target, before.len(), "button-release", 100.0, 50.0)["clicks"],
+        clicks + 1
+    );
+    pointer(driver, 2660.0, 50.0);
+    let before = events(&target.journal);
+    let scrolls = before
+        .iter()
+        .rev()
+        .find_map(|e| e["scrolls"].as_u64())
+        .unwrap();
+    let peer_before = events(&peer.journal).len();
+    let mut args = base.clone();
+    args["x"] = json!(3840);
+    args["y"] = json!(1000);
+    args["direction"] = json!("down");
+    args["by"] = json!("line");
+    args["amount"] = json!(1);
+    call(driver, "scroll", args);
+    let e = wait_event(target, before.len(), "scroll", 1280.0, 1000.0);
+    assert_eq!(e["scrolls"], scrolls + 1);
+    assert!(!events(&peer.journal)[peer_before..]
+        .iter()
+        .any(|e| e["kind"] == "scroll"));
+    let before = events(&target.journal).len();
+    let mut args = base.clone();
+    args["from_x"] = json!(3760);
+    args["from_y"] = json!(900);
+    args["to_x"] = json!(3920);
+    args["to_y"] = json!(900);
+    call(driver, "drag", args);
+    wait_event(target, before, "button-press", 1200.0, 900.0);
+    wait_event(target, before, "button-release", 1360.0, 900.0);
+    pointer(driver, 3920.0, 900.0);
+    // Window-addressed held-button tools use the persistent primary-seat route,
+    // not background exact-client admission. Always attempt the release before
+    // asserting journals, so an oracle failure cannot leave a deliberate hold.
+    let before = events(&target.journal).len();
+    let mut down = base.clone();
+    down.as_object_mut().unwrap().remove("delivery_mode");
+    down["x"] = json!(2660);
+    down["y"] = json!(1100);
+    call(driver, "mouse_button_down", down);
+    let mut up = base;
+    up.as_object_mut().unwrap().remove("delivery_mode");
+    up["x"] = json!(2660);
+    up["y"] = json!(1100);
+    call(driver, "mouse_button_up", up);
+    wait_event(target, before, "button-press", 100.0, 1100.0);
+    wait_event(target, before, "button-release", 100.0, 1100.0);
+    pointer(driver, 2660.0, 1100.0);
+}
+
 #[test]
-#[ignore = "manual supporting evidence: explicitly prepared empty native Hyprland dual-output 1.5x desktop, GTK3, grim, candidate Driver"]
+#[ignore = "manual supporting evidence: explicitly prepared empty native Hyprland dual-output 1.5x desktop, GTK3, grim, candidate Driver/foreground plugin"]
 fn native_dual_output_capture_and_desktop_input() {
     for name in [
         "CUA_TEST_DUAL_DISPLAY_PREPARED",
@@ -288,6 +472,18 @@ fn native_dual_output_capture_and_desktop_input() {
         40
     );
     qualify_layout(&ipc("monitors"));
+    println!(
+        "[dual-display] hyprland_version={} source_sha={} oracles={:?}",
+        ipc("version"),
+        std::env::var("CUA_E2E_SOURCE_SHA").unwrap(),
+        [
+            OracleKind::FixtureState,
+            OracleKind::Pixels,
+            OracleKind::Cursor,
+            OracleKind::Focus,
+            OracleKind::NoLeakedInput
+        ]
+    );
     assert!(
         ipc("clients").as_array().unwrap().is_empty(),
         "refusing a desktop containing user windows; prepare an isolated empty desktop first"
@@ -338,18 +534,21 @@ fn native_dual_output_capture_and_desktop_input() {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    let (_, full) = capture(&mut driver, dir.path(), 0);
-    // Independent per-output backing captures; compare interior pixels after
-    // measured-size normalization, not a global 1.5 multiplier.
+    let (desktop_state, full) = capture(&mut driver, dir.path(), 0);
+    // Independent logical per-output captures: filtering is not required to be
+    // byte-identical to Driver resampling; compare interior colors and markers.
     for (output, offset) in [("DP-2", 0), ("DP-1", 2560)] {
         let logical = output_pixels(dir.path(), output);
-        for (x, y) in [(32, 32), (1280, 720), (2500, 1400), (100, 1000)] {
-            assert_eq!(
-                full.get_pixel(offset + x, y),
-                logical.get_pixel(x, y),
-                "{output} composed pixels at {x},{y}"
-            );
+        for (x, y) in [(32, 32), (1800, 1000), (2500, 1400), (100, 1000)] {
+            pixel_close(full.get_pixel(offset + x, y), logical.get_pixel(x, y));
         }
+        // The independent output image has one marker. Embed it beside a black
+        // half solely to reuse the two-output marker scanner.
+        let mut independent = RgbImage::new(5120, 1440);
+        image::imageops::replace(&mut independent, &logical, i64::from(offset), 0);
+        let observed = marker(&full, offset / 2560);
+        let expected = marker(&independent, offset / 2560);
+        assert!((observed.0 - expected.0).abs() <= 1.0 && (observed.1 - expected.1).abs() <= 1.0);
     }
     // Driver window offsets must agree with exact full-address compositor identity.
     let windows = call(&mut driver, "list_windows", json!({}));
@@ -364,6 +563,13 @@ fn native_dual_output_capture_and_desktop_input() {
         assert_eq!(w["bounds"]["y"], 0);
         assert_eq!(w["bounds"]["width"], 2560);
         assert_eq!(w["bounds"]["height"], 1440);
+        let desktop_window = desktop_state["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["pid"] == f.pid && w["window_id"] == f.wid)
+            .unwrap();
+        assert_eq!(desktop_window["bounds"]["x"], f.x);
     }
     for f in [&left, &right] {
         for (lx, y) in [
@@ -374,21 +580,53 @@ fn native_dual_output_capture_and_desktop_input() {
             (1280.0, 720.0),
         ] {
             let peer = if f.pid == left.pid { &right } else { &left };
-            click(&mut driver, f, peer, f.x + lx, y, false, None);
+            click(&mut driver, f, peer, f.x + lx, y, None, None);
         }
     }
-    click(&mut driver, &left, &right, 2559.0, 720.0, false, None);
-    click(&mut driver, &right, &left, 2560.0, 720.0, false, None);
+    click(&mut driver, &left, &right, 2559.0, 720.0, None, None);
+    click(&mut driver, &right, &left, 2560.0, 720.0, None, None);
     let (_, capped) = capture(&mut driver, dir.path(), 2560);
-    assert_eq!(capped.get_pixel(1920, 500), full.get_pixel(3840, 1000));
-    click(&mut driver, &left, &right, 1280.0, 720.0, true, None);
-    click(&mut driver, &right, &left, 3840.0, 720.0, true, None);
+    pixel_close(capped.get_pixel(1920, 500), full.get_pixel(3840, 1000));
+    let left_marker = marker(&capped, 0);
+    let right_marker = marker(&capped, 1);
+    assert_point(&json!({"x":left_marker.0,"y":left_marker.1}), 640.0, 360.0);
+    assert_point(
+        &json!({"x":right_marker.0,"y":right_marker.1}),
+        1920.0,
+        360.0,
+    );
+    click(
+        &mut driver,
+        &left,
+        &right,
+        1280.0,
+        720.0,
+        Some(left_marker),
+        None,
+    );
+    click(
+        &mut driver,
+        &right,
+        &left,
+        3840.0,
+        720.0,
+        Some(right_marker),
+        None,
+    );
     // Capture-bound mapping owns the transform: no second preview compensation.
-    let (state, _) = capture(&mut driver, dir.path(), 2560);
+    let (state, pixels) = capture(&mut driver, dir.path(), 2560);
     let id = state["capture_id"]
         .as_str()
         .expect("immutable desktop capture ID");
-    click(&mut driver, &right, &left, 3840.0, 720.0, true, Some(id));
+    click(
+        &mut driver,
+        &right,
+        &left,
+        3840.0,
+        720.0,
+        Some(marker(&pixels, 1)),
+        Some(id),
+    );
     let before = events(&right.journal).len();
     let left_before = events(&left.journal).len();
     let focus_before = ipc("activewindow")["address"].clone();
@@ -440,6 +678,31 @@ fn native_dual_output_capture_and_desktop_input() {
     // GTK's implicit primary-seat grab keeps the release on the original surface.
     wait_event(&left, before, "button-release", 2620.0, 720.0);
     pointer(&mut driver, 2620.0, 720.0);
+    let before = events(&right.journal).len();
+    call(
+        &mut driver,
+        "move_cursor",
+        json!({"scope":"desktop","x":4000,"y":100}),
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let journal = events(&right.journal);
+        if let Some(motion) = journal[before..]
+            .iter()
+            .rev()
+            .find(|e| e["kind"] == "motion-notify")
+        {
+            if (motion["x"].as_f64().unwrap() - 1440.0).abs() <= 1.0
+                && (motion["y"].as_f64().unwrap() - 100.0).abs() <= 1.0
+            {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "hover did not reach fixture");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    pointer(&mut driver, 4000.0, 100.0);
+    window_foreground_rows(&mut driver, &right, &left);
     qualify_layout(&ipc("monitors"));
     // No retained desktop images: private temp files are removed on success/panic;
     // McpDriver's reaper owns only the two processes spawned above.
@@ -448,8 +711,8 @@ fn native_dual_output_capture_and_desktop_input() {
 #[test]
 fn home_layout_preflight_rejects_same_size_swapped_outputs() {
     let layout = json!([
-        {"name":"DP-2","width":3840,"height":2160,"scale":1.5,"x":0,"y":0,"transform":0,"dpmsStatus":true,"disabled":false},
-        {"name":"DP-1","width":3840,"height":2160,"scale":1.5,"x":2560,"y":0,"transform":0,"dpmsStatus":true,"disabled":false}
+        {"name":"DP-2","width":3840,"height":2160,"scale":1.5,"x":0,"y":0,"transform":0,"dpmsStatus":true,"disabled":false,"mirrorOf":"none"},
+        {"name":"DP-1","width":3840,"height":2160,"scale":1.5,"x":2560,"y":0,"transform":0,"dpmsStatus":true,"disabled":false,"mirrorOf":"none"}
     ]);
     qualify_layout(&layout);
     let mut swapped = layout;
@@ -475,4 +738,32 @@ fn static_pixel_oracle_distinguishes_outputs_and_unsettled_surfaces() {
         pixels.put_pixel(32, 32, image::Rgb([0, 0, 0]));
         assert!(!fixture_pixels_ready(&pixels, output));
     }
+}
+
+#[test]
+fn capped_marker_coordinates_come_from_visible_pixels() {
+    let mut pixels = RgbImage::new(512, 144);
+    for (cx, cy) in [(128, 72), (384, 72)] {
+        for y in cy - 16..cy + 16 {
+            for x in cx - 16..cx + 16 {
+                pixels.put_pixel(x, y, image::Rgb([255, 255, 255]));
+            }
+        }
+    }
+    assert_eq!(marker(&pixels, 0), (128.0, 72.0));
+    assert_eq!(marker(&pixels, 1), (384.0, 72.0));
+    let capped = image::imageops::resize(&pixels, 256, 72, image::imageops::FilterType::Lanczos3);
+    assert_eq!(marker(&capped, 0), (64.0, 36.0));
+    assert_eq!(marker(&capped, 1), (192.0, 36.0));
+    let mut moved = RgbImage::new(256, 72);
+    for y in 24..48 {
+        for x in 200..224 {
+            moved.put_pixel(x, y, image::Rgb([255, 255, 255]));
+        }
+    }
+    assert_eq!(
+        marker(&moved, 1),
+        (212.0, 36.0),
+        "scanner must not substitute expected geometry"
+    );
 }

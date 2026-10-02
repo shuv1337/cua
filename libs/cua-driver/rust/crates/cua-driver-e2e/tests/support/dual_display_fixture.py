@@ -44,6 +44,10 @@ def draw(widget, cr):
     cr.rectangle(0, 0, widget.get_allocated_width() / 2,
                  widget.get_allocated_height() / 2)
     cr.fill()
+    cr.set_source_rgb(1, 1, 1)
+    cr.rectangle(widget.get_allocated_width() / 2 - 24,
+                 widget.get_allocated_height() / 2 - 24, 48, 48)
+    cr.fill()
     return False
 
 
@@ -54,7 +58,9 @@ def event(widget, e):
             state["clicks"] += 1
         if e.type == Gdk.EventType.SCROLL:
             state["scrolls"] += 1
-        record(e.type.value_nick, x=e.x, y=e.y, **state)
+        button = int(e.button) if e.type in (Gdk.EventType.BUTTON_PRESS,
+                                             Gdk.EventType.BUTTON_RELEASE) else None
+        record(e.type.value_nick, x=e.x, y=e.y, button=button, **state)
     return False
 
 
