@@ -17,6 +17,16 @@ pub fn hyprland_turn_context(
     binding_current: impl Fn() -> bool + Send + Sync + 'static,
 ) -> Result<SharedRecordingTurn, RecordingUnavailable> {
     use cua_driver_core::tool_args::ArgsExt;
+    // Discovery runs inside the budgeted preparation worker. Do not use the
+    // legacy element callback synchronously before acquiring the runtime slot.
+    let window_id = window_id.or_else(|| {
+        let pid = i32::try_from(pid?).ok()?;
+        let store = cua_driver_core::snapshot_store::current_runtime_store::<
+            crate::atspi::snapshot::AtspiSnapshot,
+        >()?;
+        let (_, window, _) = store.resolve(pid, args).ok()?.into_parts(None);
+        window
+    });
     let plan = crate::wayland::hyprland::desktop_capture_plan().map_err(|error| {
         if error
             .downcast_ref::<crate::wayland::hyprland::UnsupportedDisplayTransform>()
@@ -158,7 +168,7 @@ impl RecordingTurnContext for HyprlandRecordingTurn {
         deadline: std::time::Instant,
     ) -> cua_driver_core::recording::ScreenshotCapture {
         use cua_driver_core::recording::ScreenshotCapture;
-        let capture = || -> Result<Vec<u8>, RecordingUnavailable> {
+        let capture = || -> Result<RecordingPixels, RecordingUnavailable> {
             if std::time::Instant::now() >= deadline {
                 return Err(RecordingUnavailable::BudgetExceeded);
             }
@@ -169,11 +179,16 @@ impl RecordingTurnContext for HyprlandRecordingTurn {
                 self.composite,
                 deadline,
                 || single_output_recording_capture(deadline),
-                |frame| crate::wayland::hyprland::compose_desktop_capture_until(frame, deadline),
+                |frame| {
+                    crate::wayland::hyprland::compose_desktop_capture_until(frame, deadline)
+                        .map(RecordingPixels::unqualified)
+                },
             )
             .map_err(|error| {
                 if error.to_string().contains("timeout") || error.to_string().contains("budget") {
                     RecordingUnavailable::BudgetExceeded
+                } else if error.to_string() == RecordingUnavailable::InvalidFrame.classification() {
+                    RecordingUnavailable::InvalidFrame
                 } else {
                     RecordingUnavailable::CaptureFailed
                 }
@@ -182,11 +197,13 @@ impl RecordingTurnContext for HyprlandRecordingTurn {
                 return Err(RecordingUnavailable::BudgetExceeded);
             }
             self.validate()?;
-            self.frame.check_png(&png)?;
             Ok(png)
         };
         match capture() {
-            Ok(png) => ScreenshotCapture::captured(png),
+            Ok(pixels) if pixels.frame_identity.as_ref() == self.frame.identity.as_ref() => {
+                ScreenshotCapture::captured_in_frame(pixels.png)
+            }
+            Ok(pixels) => ScreenshotCapture::unqualified(pixels.png),
             Err(error) => ScreenshotCapture::unavailable(error.classification()),
         }
     }
@@ -195,6 +212,10 @@ impl RecordingTurnContext for HyprlandRecordingTurn {
         self.point?
             .map(|point| self.validate_point(point))
             .transpose()
+    }
+
+    fn validate_authority(&self) -> Result<(), RecordingUnavailable> {
+        self.validate()
     }
 
     fn validate_point(&self, point: (f64, f64)) -> Result<(f64, f64), RecordingUnavailable> {
@@ -222,9 +243,9 @@ fn capture_recording_pixels(
     frame: &crate::wayland::hyprland::DesktopFrame,
     composite_required: bool,
     deadline: std::time::Instant,
-    single: impl FnOnce() -> anyhow::Result<Vec<u8>>,
-    composite: impl FnOnce(&crate::wayland::hyprland::DesktopFrame) -> anyhow::Result<Vec<u8>>,
-) -> anyhow::Result<Vec<u8>> {
+    single: impl FnOnce() -> anyhow::Result<RecordingPixels>,
+    composite: impl FnOnce(&crate::wayland::hyprland::DesktopFrame) -> anyhow::Result<RecordingPixels>,
+) -> anyhow::Result<RecordingPixels> {
     anyhow::ensure!(
         std::time::Instant::now() < deadline,
         "recording capture timeout"
@@ -236,7 +257,7 @@ fn capture_recording_pixels(
                 <= cua_driver_core::recording_frame::MAX_RECORDING_PIXELS),
         "recording native allocation budget exceeded"
     );
-    let png = if !composite_required {
+    let mut pixels = if !composite_required {
         single()?
     } else {
         composite(frame)?
@@ -245,14 +266,22 @@ fn capture_recording_pixels(
         std::time::Instant::now() < deadline,
         "recording capture timeout"
     );
-    let dimensions = cua_driver_core::image_utils::png_dimensions(&png)?;
+    let dimensions = cua_driver_core::recording_frame::validate_recording_png(&pixels.png)
+        .map_err(|error| anyhow::anyhow!(error.classification()))?;
+    // Unknown/wrong-peer source remains raw legacy pixels. Shape cannot confer
+    // provenance or authorize normalization into a compositor coordinate frame.
+    if pixels.frame_identity.as_ref() != Some(&frame.identity) {
+        pixels.frame_identity = None;
+        return Ok(pixels);
+    }
+    let png = pixels.png;
     let logical = (frame.width, frame.height);
     anyhow::ensure!(
         png.len() <= cua_driver_core::recording_frame::MAX_RECORDING_PNG_BYTES,
         "recording capture byte budget exceeded"
     );
     if dimensions == logical {
-        return Ok(png);
+        return Ok(RecordingPixels::qualified(png, frame.identity.clone()));
     }
     let output = frame
         .outputs
@@ -290,11 +319,47 @@ fn capture_recording_pixels(
         std::time::Instant::now() < deadline,
         "recording capture timeout"
     );
-    Ok(encoded.into_inner())
+    Ok(RecordingPixels::qualified(
+        encoded.into_inner(),
+        frame.identity.clone(),
+    ))
+}
+
+/// Native capture provenance supplied by a provider that actually verifies its
+/// capture connection/output. Metadata/header equality alone is NOT that proof.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct RecordingPixels {
+    pub png: Vec<u8>,
+    pub frame_identity: Option<cua_driver_core::capture_runtime::CaptureFrameIdentity>,
 }
 
 #[cfg(target_os = "linux")]
-fn single_output_recording_capture(deadline: std::time::Instant) -> anyhow::Result<Vec<u8>> {
+impl RecordingPixels {
+    pub fn unqualified(png: Vec<u8>) -> Self {
+        Self {
+            png,
+            frame_identity: None,
+        }
+    }
+    /// Caller must carry native capture connection/output attestation from the
+    /// same operation. Do not call for generic cascade, portal, X11 or grim
+    /// bytes just because another metadata connection has matching geometry.
+    pub fn qualified(
+        png: Vec<u8>,
+        identity: cua_driver_core::capture_runtime::CaptureFrameIdentity,
+    ) -> Self {
+        Self {
+            png,
+            frame_identity: Some(identity),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn single_output_recording_capture(
+    deadline: std::time::Instant,
+) -> anyhow::Result<RecordingPixels> {
     // Preserve the baseline backend order without screenshot_display_dispatch's
     // independent topology query/composite selection. The pinned capture plan
     // establishes that exactly one output was present, including standby.
@@ -304,30 +369,31 @@ fn single_output_recording_capture(deadline: std::time::Instant) -> anyhow::Resu
     );
     if crate::wayland::shell_helper::available() {
         return crate::wayland::shell_helper::screenshot_display()
+            .map(RecordingPixels::unqualified)
             .ok_or_else(|| anyhow::anyhow!("shell helper recording capture failed"));
     }
     if let Ok(png) = crate::wayland::screenshot_bytes() {
-        return Ok(png);
+        return Ok(RecordingPixels::unqualified(png));
     }
     anyhow::ensure!(
         std::time::Instant::now() < deadline,
         "recording capture timeout"
     );
     if let Ok(png) = crate::wayland::ext_screencopy::screenshot_via_ext_copy() {
-        return Ok(png);
+        return Ok(RecordingPixels::unqualified(png));
     }
     anyhow::ensure!(
         std::time::Instant::now() < deadline,
         "recording capture timeout"
     );
     if let Ok(png) = crate::wayland::portal_screenshot::screenshot_via_portal() {
-        return Ok(png);
+        return Ok(RecordingPixels::unqualified(png));
     }
     anyhow::ensure!(
         std::time::Instant::now() < deadline,
         "recording capture timeout"
     );
-    crate::capture::screenshot_display_bytes_x11()
+    crate::capture::screenshot_display_bytes_x11().map(RecordingPixels::unqualified)
 }
 
 #[cfg(target_os = "linux")]
@@ -466,11 +532,12 @@ pub fn screenshot_for_recording(window_id: Option<u64>, pid: Option<i64>) -> Opt
                         || single_output_recording_capture(deadline),
                         |frame| {
                             crate::wayland::hyprland::compose_desktop_capture_until(frame, deadline)
+                                .map(RecordingPixels::unqualified)
                         },
                     )
                     .ok()?;
                     frame.validate_current().ok()?;
-                    return Some(png);
+                    return Some(png.png);
                 }
                 Err(error)
                     if error
@@ -741,16 +808,17 @@ mod tests {
                 .unwrap()
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let qualified = |w, h| super::RecordingPixels::qualified(png(w, h), frame.identity.clone());
         let captured = super::capture_recording_pixels(
             &frame,
             false,
             deadline,
-            || Ok(png(12, 9)),
+            || Ok(qualified(12, 9)),
             |_| panic!("single output must not invoke grim composition"),
         )
         .unwrap();
         assert_eq!(
-            cua_driver_core::image_utils::png_dimensions(&captured).unwrap(),
+            cua_driver_core::image_utils::png_dimensions(&captured.png).unwrap(),
             (8, 6)
         );
         let recording = RecordingFrame {
@@ -762,15 +830,16 @@ mod tests {
         };
         let marker = recording.layout_point(-2.0, 2.0).unwrap();
         assert_eq!(marker, (6.0, 2.0));
-        recording.check_png(&captured).unwrap();
-        let marked = crate::capture::crosshair_png_bytes(&captured, marker.0, marker.1).unwrap();
+        recording.check_png(&captured.png).unwrap();
+        let marked =
+            crate::capture::crosshair_png_bytes(&captured.png, marker.0, marker.1).unwrap();
         let pixels = image::load_from_memory(&marked).unwrap().to_rgba8();
         assert_ne!(pixels.get_pixel(6, 2).0, [40; 4]);
         let error = super::capture_recording_pixels(
             &frame,
             false,
             deadline,
-            || Ok(png(16, 12)),
+            || Ok(qualified(16, 12)),
             |_| panic!("no composite"),
         )
         .unwrap_err();
@@ -791,11 +860,11 @@ mod tests {
             &frame,
             false,
             deadline,
-            || Ok(png(8, 6)),
+            || Ok(qualified(8, 6)),
             |_| panic!("no composite"),
         )
         .unwrap();
-        assert_eq!(logical, png(8, 6));
+        assert_eq!(logical.png, png(8, 6));
         // A standby output still makes the plan composite even with only one
         // powered tile. Never choose a first-output cascade by tile count.
         let composed = super::capture_recording_pixels(
@@ -805,11 +874,11 @@ mod tests {
             || panic!("standby-inclusive plan requires composition"),
             |pinned| {
                 assert!(std::ptr::eq(pinned, &frame));
-                Ok(png(8, 6))
+                Ok(qualified(8, 6))
             },
         )
         .unwrap();
-        assert_eq!(composed, png(8, 6));
+        assert_eq!(composed.png, png(8, 6));
         let mut oversized = frame.clone();
         oversized.outputs[0].native_width = u32::MAX;
         let error = super::capture_recording_pixels(
@@ -824,6 +893,40 @@ mod tests {
             error.to_string(),
             "recording native allocation budget exceeded"
         );
+        // An unrelated X server/portal with equal dimensions is not an output
+        // proof. Even a differently sized raw fallback remains legacy pixels.
+        for dimensions in [(8, 6), (12, 9)] {
+            let raw = super::capture_recording_pixels(
+                &frame,
+                false,
+                deadline,
+                || {
+                    Ok(super::RecordingPixels::unqualified(png(
+                        dimensions.0,
+                        dimensions.1,
+                    )))
+                },
+                |_| panic!("no forced grim"),
+            )
+            .unwrap();
+            assert!(raw.frame_identity.is_none());
+            assert_eq!(raw.png, png(dimensions.0, dimensions.1));
+        }
+        let invalid = png(8, 6)[..24].to_vec();
+        let error = super::capture_recording_pixels(
+            &frame,
+            false,
+            deadline,
+            || {
+                Ok(super::RecordingPixels::qualified(
+                    invalid,
+                    frame.identity.clone(),
+                ))
+            },
+            |_| panic!("no composite"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "recording_invalid_frame");
     }
 
     #[test]

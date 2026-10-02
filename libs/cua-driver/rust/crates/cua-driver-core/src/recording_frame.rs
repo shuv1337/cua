@@ -135,13 +135,40 @@ impl RecordingFrame {
 
     pub fn check_png(&self, png: &[u8]) -> Result<(), RecordingUnavailable> {
         self.validate()?;
-        if png.len() > MAX_RECORDING_PNG_BYTES
-            || crate::image_utils::png_dimensions(png).ok() != Some(self.dimensions)
-        {
+        if validate_recording_png(png)? != self.dimensions {
             return Err(RecordingUnavailable::InvalidFrame);
         }
         Ok(())
     }
+}
+
+/// Arbitrary callback bytes need a real bounded decode, not an IHDR prefix.
+pub fn validate_recording_png(png: &[u8]) -> Result<(u32, u32), RecordingUnavailable> {
+    use image::ImageDecoder;
+    const IEND: [u8; 12] = [0, 0, 0, 0, b'I', b'E', b'N', b'D', 174, 66, 96, 130];
+    if !png.ends_with(&IEND) {
+        return Err(RecordingUnavailable::InvalidFrame);
+    }
+    let dimensions =
+        crate::image_utils::png_dimensions(png).map_err(|_| RecordingUnavailable::InvalidFrame)?;
+    if png.len() > MAX_RECORDING_PNG_BYTES
+        || dimensions.0 == 0
+        || dimensions.1 == 0
+        || u64::from(dimensions.0) * u64::from(dimensions.1) > MAX_RECORDING_PIXELS
+    {
+        return Err(RecordingUnavailable::InvalidFrame);
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(dimensions.0);
+    limits.max_image_height = Some(dimensions.1);
+    limits.max_alloc = Some(MAX_RECORDING_PIXELS * 4);
+    let decoder = image::codecs::png::PngDecoder::with_limits(std::io::Cursor::new(png), limits)
+        .map_err(|_| RecordingUnavailable::InvalidFrame)?;
+    if decoder.total_bytes() > MAX_RECORDING_PIXELS * 4 {
+        return Err(RecordingUnavailable::InvalidFrame);
+    }
+    image::DynamicImage::from_decoder(decoder).map_err(|_| RecordingUnavailable::InvalidFrame)?;
+    Ok(dimensions)
 }
 
 /// Adapter-owned immutable snapshot; every operation fences against this same
@@ -151,6 +178,10 @@ pub trait RecordingTurnContext: Send + Sync {
     fn capture(&self, deadline: std::time::Instant) -> ScreenshotCapture;
     fn click_point(&self) -> Result<Option<(f64, f64)>, RecordingUnavailable>;
     fn validate_point(&self, point: (f64, f64)) -> Result<(f64, f64), RecordingUnavailable>;
+    /// Native fence used only in the bounded evidence worker, never admission.
+    fn validate_authority(&self) -> Result<(), RecordingUnavailable> {
+        Ok(())
+    }
     fn cursor_point(&self) -> Result<Option<(f64, f64)>, RecordingUnavailable> {
         Ok(None)
     }

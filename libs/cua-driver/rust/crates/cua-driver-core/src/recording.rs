@@ -35,6 +35,9 @@ mod recording_frame_tests;
 pub struct ScreenshotCapture {
     pub png: Option<Vec<u8>>,
     pub classification: Option<&'static str>,
+    /// Explicit adapter proof about the pixels' source, not inferred from IHDR
+    /// or a fresh metadata observation. Legacy captures have no such proof.
+    pub native_frame_qualified: bool,
 }
 
 impl ScreenshotCapture {
@@ -42,6 +45,7 @@ impl ScreenshotCapture {
         Self {
             png: Some(png),
             classification: None,
+            native_frame_qualified: false,
         }
     }
 
@@ -49,6 +53,23 @@ impl ScreenshotCapture {
         Self {
             png: None,
             classification: Some(classification),
+            native_frame_qualified: false,
+        }
+    }
+
+    pub fn captured_in_frame(png: Vec<u8>) -> Self {
+        Self {
+            png: Some(png),
+            classification: None,
+            native_frame_qualified: true,
+        }
+    }
+
+    pub fn unqualified(png: Vec<u8>) -> Self {
+        Self {
+            png: Some(png),
+            classification: Some(RecordingUnavailable::UnqualifiedFrame.classification()),
+            native_frame_qualified: false,
         }
     }
 }
@@ -364,9 +385,11 @@ struct TurnCapture {
     screenshot: Option<Vec<u8>>,
     screenshot_classification: Option<&'static str>,
     cursor_point: Option<(f64, f64)>,
+    frame_qualified: bool,
+    point_failure: Option<RecordingUnavailable>,
 }
 
-type TurnContextFn = Box<
+type TurnContextFn = Arc<
     dyn Fn(&Value, Option<u64>, Option<i64>) -> Result<SharedRecordingTurn, RecordingUnavailable>
         + Send
         + Sync,
@@ -378,6 +401,8 @@ struct TurnFrameScope {
     capture_bound: bool,
     capture_busy: Arc<std::sync::atomic::AtomicBool>,
     point_failure: Mutex<Option<RecordingUnavailable>>,
+    budget: Duration,
+    expected_capture_id: Option<String>,
 }
 
 tokio::task_local! {
@@ -424,6 +449,18 @@ impl RecordingAdmissionSink {
         binding: &crate::capture_registry::CaptureBinding,
         admission: &crate::capture_registry::CaptureActionAdmission,
     ) {
+        if self
+            .0
+            .expected_capture_id
+            .as_ref()
+            .is_some_and(|expected| *expected != admission.capture_id.to_string())
+        {
+            let mut retained = self.0.admitted_point.lock().unwrap();
+            if retained.is_none() {
+                *retained = Some(Err(RecordingUnavailable::InvalidFrame));
+            }
+            return;
+        }
         self.retain_action_point(
             binding,
             admission.frame_identity.as_ref(),
@@ -456,15 +493,44 @@ impl RecordingAdmissionSink {
                 if context.frame().binding.as_ref() != Some(binding) {
                     return Err(RecordingUnavailable::StaleFrame);
                 }
-                context.validate_point(context.frame().action_point(
-                    identity,
-                    target,
-                    native_dimensions,
-                    point.0,
-                    point.1,
-                )?)
+                context
+                    .frame()
+                    .action_point(identity, target, native_dimensions, point.0, point.1)
             }));
         }
+    }
+
+    /// Reconciled client-local source: origin is part of the proof, not guessed
+    /// from dimensions or copied from this sink to make equality pass.
+    pub fn retain_window_action_point(
+        &self,
+        binding: &crate::capture_registry::CaptureBinding,
+        identity: Option<&crate::capture_registry::CaptureFrameIdentity>,
+        source_window: &crate::recording_frame::RecordingWindow,
+        point: (f64, f64),
+    ) {
+        let matches = self
+            .0
+            .context
+            .as_ref()
+            .is_ok_and(|context| context.frame().window.as_ref() == Some(source_window));
+        if !matches {
+            let mut retained = self.0.admitted_point.lock().unwrap();
+            if retained.is_none() {
+                *retained = Some(Err(RecordingUnavailable::StaleFrame));
+            }
+            return;
+        }
+        self.retain_action_point(
+            binding,
+            identity,
+            &crate::capture_registry::CaptureTarget::Window {
+                pid: source_window.pid,
+                window_id: source_window.window_id,
+            },
+            source_window.dimensions,
+            point,
+        );
     }
 }
 
@@ -513,7 +579,7 @@ pub fn capture_dispatch_click_target(
 }
 
 fn point_in_image(png: &[u8], x: f64, y: f64) -> bool {
-    crate::image_utils::png_dimensions(png).is_ok_and(|(width, height)| {
+    crate::recording_frame::validate_recording_png(png).is_ok_and(|(width, height)| {
         u64::from(width) * u64::from(height) <= crate::recording_frame::MAX_RECORDING_PIXELS
             && png.len() <= crate::recording_frame::MAX_RECORDING_PNG_BYTES
             && x.is_finite()
@@ -592,6 +658,7 @@ pub struct RecordingSession {
     pixel_point_fn: OnceLock<PixelPointFnBox>,
     turn_context_fn: OnceLock<TurnContextFn>,
     image_capture_busy: Arc<std::sync::atomic::AtomicBool>,
+    frame_budget: Duration,
 }
 
 struct RecordingInner {
@@ -683,6 +750,7 @@ impl RecordingSession {
             pixel_point_fn: OnceLock::new(),
             turn_context_fn: OnceLock::new(),
             image_capture_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            frame_budget: Duration::from_secs(12),
             inner: Mutex::new(RecordingInner {
                 enabled: false,
                 generation: 0,
@@ -702,6 +770,14 @@ impl RecordingSession {
         }
     }
 
+    /// Optional stricter evidence latency budget, covering preparation, image,
+    /// semantic point/fence and state work. Never an input/action deadline.
+    pub fn new_with_frame_budget(budget: Duration) -> Self {
+        let mut session = Self::new();
+        session.frame_budget = budget.clamp(Duration::from_millis(1), Duration::from_secs(12));
+        session
+    }
+
     /// Install a factory for immutable turn geometry in this runtime only.
     pub fn set_turn_context_fn(
         &self,
@@ -714,7 +790,7 @@ impl RecordingSession {
             + Sync
             + 'static,
     ) {
-        let _ = self.turn_context_fn.set(Box::new(f));
+        let _ = self.turn_context_fn.set(Arc::new(f));
     }
 
     /// Install this registry's mapper from tool pixels to recording pixels.
@@ -1120,27 +1196,58 @@ impl RecordingSession {
         let args = strip_internal_keys(args).into_owned();
         use crate::tool_args::ArgsExt;
         let pid = args.opt_i64("pid");
-        let element = pid.and_then(|pid| {
-            ELEMENT_BOUNDS_FN.get()?(
-                pid,
-                &args,
-                self.turn_context_fn.get().is_none()
-                    && matches!(tool_name, "click" | "double_click" | "right_click"),
-            )
-        });
+        let element = pid
+            .filter(|_| self.turn_context_fn.get().is_none())
+            .and_then(|pid| {
+                ELEMENT_BOUNDS_FN.get()?(
+                    pid,
+                    &args,
+                    self.turn_context_fn.get().is_none()
+                        && matches!(tool_name, "click" | "double_click" | "right_click"),
+                )
+            });
         let window_id = element
             .map(|(window, _)| window)
             .or_else(|| args.opt_u64("window_id"));
+        let phase_deadline = Instant::now() + self.frame_budget;
+        let mut prepared_point = None;
         let frame_scope = if capture_visual_state {
             self.turn_context_fn.get().map(|factory| {
+                let factory = factory.clone();
+                let preparation_args = dispatch_args.clone();
+                let prepared = run_frame_evidence(
+                    self.image_capture_busy.clone(),
+                    phase_deadline,
+                    move || {
+                        let context = factory(&preparation_args, window_id, pid)?;
+                        if Instant::now() >= phase_deadline {
+                            return Err(RecordingUnavailable::BudgetExceeded);
+                        }
+                        let point = context.click_point();
+                        Ok((context, point))
+                    },
+                )
+                .and_then(|result| result);
+                let (context, point_failure) = match prepared {
+                    Ok((context, point)) => {
+                        prepared_point = point.ok().flatten();
+                        (Ok(context), point.err())
+                    }
+                    Err(error) => (Err(error), Some(error)),
+                };
                 Arc::new(TurnFrameScope {
-                    context: factory(&dispatch_args, window_id, pid),
+                    context,
                     admitted_point: Mutex::new(None),
                     capture_bound: matches!(tool_name, "click" | "double_click" | "right_click")
                         && (args.get("capture_id").is_some()
                             || (args.get("x").is_some() && args.get("y").is_some())),
                     capture_busy: self.image_capture_busy.clone(),
-                    point_failure: Mutex::new(None),
+                    point_failure: Mutex::new(point_failure),
+                    budget: self.frame_budget,
+                    expected_capture_id: args
+                        .get("capture_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
                 })
             })
         } else {
@@ -1152,18 +1259,7 @@ impl RecordingSession {
             if scope.capture_bound {
                 None
             } else {
-                match scope
-                    .context
-                    .as_ref()
-                    .map_err(|error| *error)
-                    .and_then(|context| context.click_point())
-                {
-                    Ok(point) => point,
-                    Err(error) => {
-                        *scope.point_failure.lock().unwrap() = Some(error);
-                        None
-                    }
-                }
+                prepared_point
             }
         } else {
             resolve_click_point(
@@ -1176,7 +1272,7 @@ impl RecordingSession {
             )
         };
         let before = if capture_visual_state {
-            capture_turn_in_frame(
+            capture_turn_in_frame_until(
                 window_id,
                 pid,
                 match (state_budget, predicted_refusal) {
@@ -1185,6 +1281,7 @@ impl RecordingSession {
                     (Some(budget), None) => StatePlan::Capture(budget),
                 },
                 frame_scope.as_deref(),
+                phase_deadline,
             )
         } else {
             TurnCapture::privacy_suppressed()
@@ -1319,15 +1416,22 @@ impl TurnCapture {
             screenshot: None,
             screenshot_classification: Some("privacy_suppressed"),
             cursor_point: None,
+            frame_qualified: false,
+            point_failure: None,
         }
     }
 }
 
 fn capture_turn(window_id: Option<u64>, pid: Option<i64>, state: StatePlan) -> TurnCapture {
-    let screenshot = SCREENSHOT_FN
+    let mut screenshot = SCREENSHOT_FN
         .get()
         .map(|capture| capture(window_id, pid))
         .unwrap_or_else(|| ScreenshotCapture::unavailable("capture_hook_unavailable"));
+    if let Some(png) = &screenshot.png {
+        if let Err(error) = crate::recording_frame::validate_recording_png(png) {
+            screenshot = ScreenshotCapture::unavailable(error.classification());
+        }
+    }
     TurnCapture {
         state: match state {
             // No target application: there is no state to walk.
@@ -1338,6 +1442,8 @@ fn capture_turn(window_id: Option<u64>, pid: Option<i64>, state: StatePlan) -> T
         screenshot: screenshot.png,
         screenshot_classification: screenshot.classification,
         cursor_point: None,
+        frame_qualified: false,
+        point_failure: None,
     }
 }
 
@@ -1353,123 +1459,198 @@ fn capture_turn_in_frame(
     let Some(scope) = scope else {
         return capture_turn(window_id, pid, state);
     };
-    let deadline = Instant::now() + Duration::from_secs(12);
-    let (screenshot, cursor_point) = match &scope.context {
-        Err(error) if *error != RecordingUnavailable::UnqualifiedFrame => {
-            (ScreenshotCapture::unavailable(error.classification()), None)
-        }
-        context => {
-            use std::sync::atomic::Ordering;
-            if scope.capture_busy.swap(true, Ordering::AcqRel) {
-                (
-                    ScreenshotCapture::unavailable(
-                        RecordingUnavailable::BudgetExceeded.classification(),
-                    ),
-                    None,
-                )
-            } else {
-                let context = context.as_ref().ok().cloned();
-                let busy = scope.capture_busy.clone();
-                let (tx, rx) = std::sync::mpsc::sync_channel(1);
-                let started = std::thread::Builder::new()
-                    .name("cua-recording-image".into())
-                    .spawn(move || {
-                        struct Release(Arc<std::sync::atomic::AtomicBool>);
-                        impl Drop for Release {
-                            fn drop(&mut self) {
-                                self.0.store(false, Ordering::Release);
-                            }
-                        }
-                        let _release = Release(busy);
-                        let mut capture = match &context {
-                            Some(context) => context.capture(deadline),
-                            None => {
-                                let mut capture = SCREENSHOT_FN
-                                    .get()
-                                    .map(|capture| capture(window_id, pid))
-                                    .unwrap_or_else(|| {
-                                        ScreenshotCapture::unavailable("capture_hook_unavailable")
-                                    });
-                                capture.classification =
-                                    Some(RecordingUnavailable::UnqualifiedFrame.classification());
-                                capture
-                            }
-                        };
-                        if let (Some(context), Some(png)) = (&context, &capture.png) {
-                            if let Err(error) = context.frame().check_png(png) {
-                                capture = ScreenshotCapture::unavailable(error.classification());
-                            }
-                        }
-                        if let Some(png) = &capture.png {
-                            let bounded = png.len()
-                                <= crate::recording_frame::MAX_RECORDING_PNG_BYTES
-                                && crate::image_utils::png_dimensions(png).is_ok_and(|(w, h)| {
-                                    w > 0
-                                        && h > 0
-                                        && u64::from(w) * u64::from(h)
-                                            <= crate::recording_frame::MAX_RECORDING_PIXELS
-                                });
-                            if !bounded {
-                                capture = ScreenshotCapture::unavailable(
-                                    RecordingUnavailable::InvalidFrame.classification(),
-                                );
-                            }
-                        }
-                        let cursor = if capture.png.is_some() {
-                            context
-                                .as_ref()
-                                .and_then(|context| context.cursor_point().ok().flatten())
-                        } else {
-                            None
-                        };
-                        if Instant::now() >= deadline {
-                            capture = ScreenshotCapture::unavailable(
-                                RecordingUnavailable::BudgetExceeded.classification(),
-                            );
-                        }
-                        // The next phase may begin as soon as recv completes.
-                        // Release the slot before publishing the finished result.
-                        drop(_release);
-                        let _ = tx.send((capture, cursor));
-                    });
-                if started.is_err() {
-                    scope.capture_busy.store(false, Ordering::Release);
-                    (
-                        ScreenshotCapture::unavailable(
-                            RecordingUnavailable::CaptureFailed.classification(),
-                        ),
-                        None,
-                    )
-                } else {
-                    rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                        .unwrap_or_else(|error| {
-                            let classification = match error {
-                                std::sync::mpsc::RecvTimeoutError::Timeout => {
-                                    RecordingUnavailable::BudgetExceeded
-                                }
-                                std::sync::mpsc::RecvTimeoutError::Disconnected => {
-                                    RecordingUnavailable::CaptureFailed
-                                }
-                            };
-                            (
-                                ScreenshotCapture::unavailable(classification.classification()),
-                                None,
-                            )
-                        })
+    capture_turn_in_frame_until(
+        window_id,
+        pid,
+        state,
+        Some(scope),
+        Instant::now() + scope.budget,
+    )
+}
+
+/// All native evidence work shares the runtime slot and this phase's deadline.
+/// Only channel results are published; late workers never mutate a turn/sink.
+fn run_frame_evidence<T: Send + 'static>(
+    busy: Arc<std::sync::atomic::AtomicBool>,
+    deadline: Instant,
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, RecordingUnavailable> {
+    use std::sync::atomic::Ordering;
+    if Instant::now() >= deadline || busy.swap(true, Ordering::AcqRel) {
+        return Err(RecordingUnavailable::BudgetExceeded);
+    }
+    let owned = busy.clone();
+    let runtime_scope = crate::tool::current_dispatch_runtime_scope();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let started = std::thread::Builder::new()
+        .name("cua-recording-evidence".into())
+        .spawn(move || {
+            struct Release(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
                 }
             }
-        }
-    };
-    TurnCapture {
-        state: match state {
-            _ if pid.is_none() => StateCapture::default(),
-            StatePlan::Capture(budget) => capture_state(window_id, pid, budget),
-            StatePlan::Skip(classification) => StateCapture::skipped(classification),
-        },
-        cursor_point: screenshot.png.as_ref().and(cursor_point),
-        screenshot: screenshot.png,
-        screenshot_classification: screenshot.classification,
+            let release = Release(owned);
+            let value = match runtime_scope {
+                Some(scope) => crate::tool::with_runtime_scope(scope, operation),
+                None => operation(),
+            };
+            drop(release);
+            if Instant::now() < deadline {
+                let _ = tx.send(value);
+            }
+        });
+    if started.is_err() {
+        busy.store(false, Ordering::Release);
+        return Err(RecordingUnavailable::CaptureFailed);
     }
+    rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => RecordingUnavailable::BudgetExceeded,
+            std::sync::mpsc::RecvTimeoutError::Disconnected if Instant::now() >= deadline => {
+                RecordingUnavailable::BudgetExceeded
+            }
+            _ => RecordingUnavailable::CaptureFailed,
+        })
+}
+
+fn unavailable_frame_turn(error: RecordingUnavailable, pid: Option<i64>) -> TurnCapture {
+    TurnCapture {
+        state: if pid.is_some() {
+            StateCapture::unavailable(error.classification())
+        } else {
+            StateCapture::default()
+        },
+        screenshot_classification: Some(error.classification()),
+        point_failure: Some(error),
+        ..Default::default()
+    }
+}
+
+fn capture_turn_in_frame_until(
+    window_id: Option<u64>,
+    pid: Option<i64>,
+    state: StatePlan,
+    scope: Option<&TurnFrameScope>,
+    deadline: Instant,
+) -> TurnCapture {
+    let Some(scope) = scope else {
+        return capture_turn(window_id, pid, state);
+    };
+    if let Err(error) = &scope.context {
+        if *error != RecordingUnavailable::UnqualifiedFrame {
+            return unavailable_frame_turn(*error, pid);
+        }
+    }
+    let context = scope.context.as_ref().ok().cloned();
+    let point = scope
+        .admitted_point
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|point| point.as_ref().ok())
+        .copied();
+    run_frame_evidence(scope.capture_busy.clone(), deadline, move || {
+        let mut screenshot = match &context {
+            Some(context) => context.capture(deadline),
+            None => {
+                let capture = SCREENSHOT_FN.get().map(|capture| capture(window_id, pid));
+                match capture.and_then(|capture| capture.png) {
+                    Some(png) => ScreenshotCapture::unqualified(png),
+                    None => ScreenshotCapture::unavailable("capture_failed"),
+                }
+            }
+        };
+        if let Some(png) = &screenshot.png {
+            let checked = if screenshot.native_frame_qualified {
+                context
+                    .as_ref()
+                    .ok_or(RecordingUnavailable::UnqualifiedFrame)
+                    .and_then(|context| context.frame().check_png(png))
+            } else {
+                crate::recording_frame::validate_recording_png(png).map(|_| ())
+            };
+            if let Err(error) = checked {
+                screenshot = ScreenshotCapture::unavailable(error.classification());
+            }
+        }
+        if screenshot.png.is_some() && !screenshot.native_frame_qualified {
+            screenshot.classification =
+                Some(RecordingUnavailable::UnqualifiedFrame.classification());
+        }
+        let mut point_failure = None;
+        if Instant::now() >= deadline {
+            return unavailable_frame_turn(RecordingUnavailable::BudgetExceeded, pid);
+        }
+        if screenshot.native_frame_qualified {
+            if let (Some(context), Some(point)) = (&context, point) {
+                point_failure = context.validate_point(point).err();
+            }
+        }
+        if Instant::now() >= deadline {
+            return unavailable_frame_turn(RecordingUnavailable::BudgetExceeded, pid);
+        }
+        let authority = context
+            .as_ref()
+            .map(|context| context.validate_authority())
+            .transpose();
+        if let Err(error) = authority {
+            return unavailable_frame_turn(error, pid);
+        }
+        // Stale/unavailable authority must not resolve an independent successor
+        // AX tree. Other source failures may still retain correctly fenced state.
+        if screenshot.classification == Some(RecordingUnavailable::StaleFrame.classification()) {
+            return unavailable_frame_turn(RecordingUnavailable::StaleFrame, pid);
+        }
+        let pinned_window_id = context
+            .as_ref()
+            .and_then(|context| context.frame().window.as_ref())
+            .map(|window| window.window_id)
+            .or(window_id);
+        let state = match state {
+            _ if pid.is_none() => StateCapture::default(),
+            StatePlan::Skip(classification) => StateCapture::skipped(classification),
+            StatePlan::Capture(mut budget) => {
+                budget.timeout_ms = budget.timeout_ms.min(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis() as u64,
+                );
+                if budget.timeout_ms == 0 {
+                    return unavailable_frame_turn(RecordingUnavailable::BudgetExceeded, pid);
+                }
+                capture_state(pinned_window_id, pid, budget)
+            }
+        };
+        if Instant::now() >= deadline {
+            return unavailable_frame_turn(RecordingUnavailable::BudgetExceeded, pid);
+        }
+        if let Some(context) = &context {
+            if let Err(error) = context.validate_authority() {
+                return unavailable_frame_turn(error, pid);
+            }
+        }
+        if Instant::now() >= deadline {
+            return unavailable_frame_turn(RecordingUnavailable::BudgetExceeded, pid);
+        }
+        let cursor_point = if screenshot.native_frame_qualified && screenshot.png.is_some() {
+            context
+                .as_ref()
+                .and_then(|context| context.cursor_point().ok().flatten())
+        } else {
+            None
+        };
+        TurnCapture {
+            state,
+            screenshot: screenshot.png,
+            screenshot_classification: screenshot.classification,
+            frame_qualified: screenshot.native_frame_qualified,
+            cursor_point,
+            point_failure,
+        }
+    })
+    .unwrap_or_else(|error| unavailable_frame_turn(error, pid))
 }
 
 /// Whether the tool refused the call before any input reached the target, so
@@ -1607,6 +1788,7 @@ fn write_evidence_manifest(
             "after": after.cursor_point.map(|(x, y)| serde_json::json!({"x": x, "y": y})),
         },
         "before": {
+            "native_frame_qualified": before.frame_qualified,
             "state": state_status(&before.state, state_expected),
             "screenshot": capture_status(
                 before.screenshot.is_some(),
@@ -1615,6 +1797,7 @@ fn write_evidence_manifest(
             ),
         },
         "after": {
+            "native_frame_qualified": after.frame_qualified,
             "state": state_status(&after.state, state_expected),
             "screenshot": capture_status(
                 after.screenshot.is_some(),
@@ -1796,6 +1979,14 @@ fn write_turn_with_after(
             click_point = None;
             supplemental.failure = before.screenshot_classification.or(Some("capture_failed"));
         }
+        if before.screenshot.is_some() && !before.frame_qualified {
+            click_point = None;
+            supplemental.failure = Some(RecordingUnavailable::UnqualifiedFrame.classification());
+        }
+        if let Some(error) = after.point_failure {
+            click_point = None;
+            supplemental.failure = Some(error.classification());
+        }
     }
     let click_source = supplemental
         .image
@@ -1867,8 +2058,10 @@ fn write_turn_with_after(
             payload["recording_frame"] = serde_json::json!({
                 "origin": {"x": frame.origin.0, "y": frame.origin.1},
                 "width": frame.dimensions.0, "height": frame.dimensions.1,
-                "native_identity_available": frame.identity.is_some(),
-                "native_frame_identity": frame.identity.as_ref().map(|identity| format!("{identity:?}")),
+                "native_identity_available": before.frame_qualified && after.frame_qualified && frame.identity.is_some(),
+                "phase_qualification": {"before":before.frame_qualified,"after":after.frame_qualified},
+                "source_coordinates_available": before.frame_qualified,
+                "native_frame_identity": frame.identity.as_ref().filter(|_| before.frame_qualified).map(|identity| format!("{identity:?}")),
                 "runtime_generation": frame.binding.as_ref().map(|binding| binding.runtime_generation()),
                 "session_generation": frame.binding.as_ref().map(|binding| binding.session_generation()),
                 "window": frame.window.as_ref().map(|window| serde_json::json!({
@@ -1914,8 +2107,17 @@ fn write_turn_with_after(
             (click_point, marker_source, CLICK_MARKER_FN.get())
         {
             if let Some(click_png) = marker(screenshot, cx, cy) {
-                std::fs::write(turn_dir.join("click.png"), click_png)?;
-                click_captured = true;
+                if crate::recording_frame::validate_recording_png(&click_png).is_ok_and(
+                    |dimensions| {
+                        Some(dimensions) == crate::image_utils::png_dimensions(screenshot).ok()
+                    },
+                ) {
+                    std::fs::write(turn_dir.join("click.png"), click_png)?;
+                    click_captured = true;
+                } else {
+                    supplemental.failure =
+                        Some(RecordingUnavailable::InvalidFrame.classification());
+                }
             }
         }
     }
@@ -2131,6 +2333,8 @@ mod tests {
                 state: StateCapture::captured(b"original state".to_vec()),
                 screenshot_classification: None,
                 cursor_point: None,
+                frame_qualified: false,
+                point_failure: None,
             },
             dispatch_click: Some(Arc::new(DispatchClickScope {
                 window_id: 902,
@@ -2635,21 +2839,25 @@ mod tests {
 
     #[test]
     fn turn_capture_brackets_action_and_preserves_post_action_aliases() {
+        fn phase_png(before: bool) -> Vec<u8> {
+            crate::image_utils::encode_rgba_to_png(
+                &vec![if before { 17 } else { 29 }; 128 * 32 * 4],
+                128,
+                32,
+            )
+            .unwrap()
+        }
         static SCREENSHOTS: AtomicUsize = AtomicUsize::new(0);
         static STATES: AtomicUsize = AtomicUsize::new(0);
         set_screenshot_fn(|window_id, pid| {
             if (window_id, pid) == (Some(2), Some(1)) {
                 let phase = SCREENSHOTS.fetch_add(1, Ordering::SeqCst);
-                return Some(if phase == 0 {
-                    b"before".to_vec()
-                } else {
-                    b"after".to_vec()
-                });
+                return Some(phase_png(phase == 0));
             }
             // Other recording tests share this process-global hook and may run
             // concurrently. Give them stable bytes without advancing this
             // test's before/after phase counter.
-            Some(b"after".to_vec())
+            Some(phase_png(false))
         });
         set_ax_snapshot_fn(|_, _| {
             let phase = STATES.fetch_add(1, Ordering::SeqCst);
@@ -2691,7 +2899,10 @@ mod tests {
             )
             .expect("recording should reserve a turn");
         let turn = output_dir.join("turn-00001");
-        assert_eq!(std::fs::read(turn.join("before.png")).unwrap(), b"before");
+        assert_eq!(
+            std::fs::read(turn.join("before.png")).unwrap(),
+            phase_png(true)
+        );
         assert!(!turn.join("after.png").exists());
 
         let action_record = crate::action_record::ActionExecutionRecord::builder(
@@ -2703,7 +2914,10 @@ mod tests {
         .build()
         .expect("valid action record");
         session.finish_turn_with_action(pending, "clicked", Some(&action_record));
-        assert_eq!(std::fs::read(turn.join("after.png")).unwrap(), b"after");
+        assert_eq!(
+            std::fs::read(turn.join("after.png")).unwrap(),
+            phase_png(false)
+        );
         assert_eq!(
             std::fs::read(turn.join("screenshot.png")).unwrap(),
             std::fs::read(turn.join("after.png")).unwrap()
@@ -2712,7 +2926,10 @@ mod tests {
             std::fs::read(turn.join("app_state.json")).unwrap(),
             std::fs::read(turn.join("after_state.json")).unwrap()
         );
-        assert_eq!(std::fs::read(turn.join("click.png")).unwrap(), b"click");
+        assert_eq!(
+            std::fs::read(turn.join("click.png")).unwrap(),
+            crate::image_utils::crosshair_png_bytes(&phase_png(true), 3.0, 4.0).unwrap()
+        );
         let action: Value = serde_json::from_slice(
             &std::fs::read(turn.join("action.json")).expect("read action truth"),
         )

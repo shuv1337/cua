@@ -9,6 +9,8 @@ struct Context {
     live: Arc<AtomicBool>,
     captures: AtomicUsize,
     point: Option<(f64, f64)>,
+    qualified: bool,
+    blocked_point: Option<Arc<(Mutex<bool>, std::sync::Condvar)>>,
 }
 
 impl RecordingTurnContext for Context {
@@ -27,19 +29,44 @@ impl RecordingTurnContext for Context {
             );
         }
         self.captures.fetch_add(1, Ordering::SeqCst);
-        ScreenshotCapture::captured(self.png.clone())
+        if self.qualified {
+            ScreenshotCapture::captured_in_frame(self.png.clone())
+        } else {
+            ScreenshotCapture::unqualified(self.png.clone())
+        }
     }
     fn click_point(&self) -> Result<Option<(f64, f64)>, RecordingUnavailable> {
-        Ok(self.point)
+        self.point
+            .map(|point| self.validate_point(point))
+            .transpose()
     }
     fn validate_point(&self, point: (f64, f64)) -> Result<(f64, f64), RecordingUnavailable> {
+        if let Some(gate) = self.blocked_point.as_ref().filter(|_| point != (1.0, 1.0)) {
+            let (lock, wake) = &**gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+        }
         if !self.live.load(Ordering::Acquire) {
             return Err(RecordingUnavailable::StaleFrame);
         }
         self.frame.image_point(point.0, point.1)
     }
     fn cursor_point(&self) -> Result<Option<(f64, f64)>, RecordingUnavailable> {
+        assert!(
+            self.qualified,
+            "unqualified pixels cannot receive a compositor cursor"
+        );
         self.validate_point((1.0, 1.0)).map(Some)
+    }
+
+    fn validate_authority(&self) -> Result<(), RecordingUnavailable> {
+        if self.live.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(RecordingUnavailable::StaleFrame)
+        }
     }
 }
 
@@ -60,6 +87,8 @@ fn context(service: &CaptureService, name: &str, dimensions: (u32, u32)) -> Arc<
         live: Arc::new(AtomicBool::new(true)),
         captures: AtomicUsize::new(0),
         point: Some((2.0, 1.0)),
+        qualified: true,
+        blocked_point: None,
     })
 }
 
@@ -313,6 +342,8 @@ fn capture_slot_and_expired_deadline_fail_closed_without_starting_more_workers()
         capture_bound: false,
         capture_busy: Arc::new(AtomicBool::new(true)),
         point_failure: Mutex::new(None),
+        budget: Duration::from_secs(12),
+        expected_capture_id: None,
     };
     let capture = capture_turn_in_frame(
         None,
@@ -410,4 +441,318 @@ async fn missing_handoff_never_remaps_raw_pixels_or_uses_an_independent_dispatch
     assert_eq!(evidence["click"]["source_image"], "before.png");
     assert!(!turn.join("click_source.png").exists());
     assert!(!turn.join("click.png").exists());
+}
+
+#[tokio::test]
+async fn wrong_peer_same_geometry_keeps_raw_pixels_without_marker_cursor_or_native_identity() {
+    let service = CaptureService::new(Default::default()).unwrap();
+    let mut context = context(&service, "owner", (8, 4));
+    Arc::get_mut(&mut context).unwrap().qualified = false;
+    let admitted = admission(&service, &context);
+    let output = tempfile::tempdir().unwrap();
+    let session = session(context.clone(), output.path());
+    let pending = session
+        .begin_turn(
+            "click",
+            &serde_json::json!({"capture_id":admitted.capture_id.to_string(),"x":3,"y":1}),
+            0,
+            RecordingCaller {
+                session: Some("owner"),
+                transport: None,
+            },
+        )
+        .unwrap();
+    scope_dispatch_click_capture(Some(&pending), async {
+        retain_recording_admission(context.frame.binding.as_ref().unwrap(), &admitted);
+    })
+    .await;
+    session.finish_turn(pending, "action delivered independently");
+    let turn = output.path().join("turn-00001");
+    assert_eq!(std::fs::read(turn.join("before.png")).unwrap(), context.png);
+    let evidence = read(&turn, "evidence.json");
+    assert_eq!(evidence["before"]["screenshot"]["status"], "captured");
+    assert_eq!(
+        evidence["before"]["screenshot"]["classification"],
+        "recording_coordinate_attestation_unavailable"
+    );
+    assert_eq!(
+        evidence["click"]["classification"],
+        "recording_coordinate_attestation_unavailable"
+    );
+    assert!(evidence["cursor"]["before"].is_null());
+    assert!(evidence["cursor"]["after"].is_null());
+    let action = read(&turn, "action.json");
+    assert_eq!(
+        action["recording_frame"]["native_identity_available"],
+        false
+    );
+    assert!(action["recording_frame"]["native_frame_identity"].is_null());
+    assert!(action.get("click_point").is_none());
+    assert!(!turn.join("click.png").exists());
+}
+
+#[test]
+fn logical_ihdr_prefix_is_not_a_captured_image_and_stale_authority_skips_enabled_state() {
+    let service = CaptureService::new(Default::default()).unwrap();
+    let mut invalid = context(&service, "owner", (8, 4));
+    Arc::get_mut(&mut invalid).unwrap().png.truncate(24);
+    assert_eq!(
+        invalid.frame.check_png(&invalid.png),
+        Err(RecordingUnavailable::InvalidFrame)
+    );
+    assert!(!point_in_image(&invalid.png, 1.0, 1.0));
+    let png = image(8, 4);
+    assert_eq!(
+        validate_recording_png(&png[..png.len() - 12]),
+        Err(RecordingUnavailable::InvalidFrame)
+    );
+    let scope = |context| TurnFrameScope {
+        context: Ok(context),
+        admitted_point: Mutex::new(None),
+        capture_bound: false,
+        capture_busy: Arc::new(AtomicBool::new(false)),
+        point_failure: Mutex::new(None),
+        budget: Duration::from_millis(100),
+        expected_capture_id: None,
+    };
+    let capture = capture_turn_in_frame(
+        None,
+        None,
+        StatePlan::Skip(STATE_SKIPPED_DISABLED),
+        Some(&scope(invalid)),
+    );
+    assert_eq!(
+        capture.screenshot_classification,
+        Some("recording_invalid_frame")
+    );
+    assert!(capture.screenshot.is_none());
+    assert!(capture.cursor_point.is_none());
+    assert!(!capture.frame_qualified);
+
+    let stale = context(&service, "owner", (8, 4));
+    stale.live.store(false, Ordering::Release);
+    let capture = capture_turn_in_frame(
+        Some(42),
+        Some(43),
+        StatePlan::Capture(StateCaptureBudget::default()),
+        Some(&scope(stale)),
+    );
+    assert_eq!(
+        capture.screenshot_classification,
+        Some("recording_stale_frame")
+    );
+    assert_eq!(capture.state.classification, Some("recording_stale_frame"));
+    assert!(capture.state.bytes.is_none());
+}
+
+fn release_gate(gate: &Arc<(Mutex<bool>, std::sync::Condvar)>) {
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+}
+
+#[tokio::test]
+async fn slow_factory_and_semantic_point_share_the_phase_slot_and_cannot_publish_late() {
+    for block_semantic in [false, true] {
+        let service = CaptureService::new(Default::default()).unwrap();
+        let mut context = context(&service, "owner", (8, 4));
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        if block_semantic {
+            Arc::get_mut(&mut context).unwrap().blocked_point = Some(gate.clone());
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let output = tempfile::tempdir().unwrap();
+        let session = RecordingSession::new_with_frame_budget(Duration::from_millis(40));
+        let source = context.clone();
+        let count = calls.clone();
+        session.set_turn_context_fn(move |_, _, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            if !block_semantic {
+                std::thread::sleep(Duration::from_millis(180));
+            }
+            Ok(source.clone())
+        });
+        session
+            .start_with_state_budget(output.path().to_str().unwrap(), false, None, None)
+            .unwrap();
+        let start = Instant::now();
+        let pending = session
+            .begin_turn(
+                "click",
+                &serde_json::json!({"element_token":"semantic"}),
+                0,
+                RecordingCaller::default(),
+            )
+            .unwrap();
+        assert!(start.elapsed() < Duration::from_millis(150));
+        session.finish_turn(pending, "valid action not refused by recording timeout");
+        let second = session
+            .begin_turn(
+                "click",
+                &serde_json::json!({"x":3,"y":1}),
+                0,
+                RecordingCaller::default(),
+            )
+            .unwrap();
+        session.finish_turn(second, "next action unchanged");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "an abandoned provider holds the runtime slot"
+        );
+        release_gate(&gate);
+        std::thread::sleep(Duration::from_millis(220));
+        for (index, result) in [
+            (1, "valid action not refused by recording timeout"),
+            (2, "next action unchanged"),
+        ] {
+            let turn = output.path().join(format!("turn-{index:05}"));
+            assert_eq!(read(&turn, "action.json")["result_summary"], result);
+            assert_eq!(
+                read(&turn, "evidence.json")["before"]["screenshot"]["classification"],
+                "recording_budget_exceeded"
+            );
+            assert!(!turn.join("before.png").exists());
+            assert!(!turn.join("after.png").exists());
+        }
+        assert_eq!(context.captures.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn blocked_native_point_validator_never_blocks_action_handoff_or_turn_finalization() {
+    let service = CaptureService::new(Default::default()).unwrap();
+    let mut context = context(&service, "owner", (8, 4));
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let mutable = Arc::get_mut(&mut context).unwrap();
+    mutable.point = None;
+    mutable.blocked_point = Some(gate.clone());
+    let admitted = admission(&service, &context);
+    let output = tempfile::tempdir().unwrap();
+    let session = RecordingSession::new_with_frame_budget(Duration::from_millis(40));
+    let source = context.clone();
+    session.set_turn_context_fn(move |_, _, _| Ok(source.clone()));
+    session
+        .start_with_state_budget(output.path().to_str().unwrap(), false, None, None)
+        .unwrap();
+    let pending = session
+        .begin_turn(
+            "click",
+            &serde_json::json!({"capture_id":admitted.capture_id.to_string(),"x":3,"y":1}),
+            0,
+            RecordingCaller::default(),
+        )
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    scope_dispatch_click_capture(Some(&pending), async {
+        let sink = recording_admission_sink().unwrap();
+        let binding = context.frame.binding.clone().unwrap();
+        std::thread::spawn(move || {
+            sink.retain(&binding, &admitted);
+            tx.send(()).unwrap();
+        });
+    })
+    .await;
+    if rx.recv_timeout(Duration::from_millis(100)).is_err() {
+        release_gate(&gate);
+        panic!("native validator blocked action-facing retain");
+    }
+    let start = Instant::now();
+    use crate::action_record::{
+        ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
+    };
+    let truth = ActionExecutionRecord::builder(
+        ActionEffect::Unverifiable,
+        ActionTransport::LinuxAtSpiAction,
+        RequestedDelivery::Background,
+    )
+    .actual_delivery(ActualDelivery::Background)
+    .build()
+    .unwrap();
+    session.finish_turn_with_outcome(
+        pending,
+        "original action effect retained",
+        Some(&truth),
+        false,
+    );
+    assert!(start.elapsed() < Duration::from_millis(150));
+    let turn = output.path().join("turn-00001");
+    assert_eq!(
+        read(&turn, "evidence.json")["after"]["screenshot"]["classification"],
+        "recording_budget_exceeded"
+    );
+    let action = std::fs::read(turn.join("action.json")).unwrap();
+    assert_eq!(
+        read(&turn, "action.json")["action_truth"],
+        truth.debug_json()
+    );
+    assert_eq!(read(&turn, "action.json")["result_error"], false);
+    release_gate(&gate);
+    std::thread::sleep(Duration::from_millis(80));
+    assert_eq!(std::fs::read(turn.join("action.json")).unwrap(), action);
+    assert!(!turn.join("after.png").exists());
+}
+
+#[tokio::test]
+async fn crossed_same_session_capture_sink_and_different_source_window_origin_are_refused() {
+    let service = CaptureService::new(Default::default()).unwrap();
+    let mut context = context(&service, "owner", (8, 4));
+    Arc::get_mut(&mut context).unwrap().frame.window = Some(RecordingWindow {
+        pid: 7,
+        window_id: 9,
+        origin: (-2560, 0),
+        dimensions: (8, 4),
+    });
+    let expected = admission(&service, &context);
+    let wrong = admission(&service, &context);
+    let output = tempfile::tempdir().unwrap();
+    let session = session(context.clone(), output.path());
+    let pending = session
+        .begin_turn(
+            "click",
+            &serde_json::json!({"capture_id":expected.capture_id.to_string(),"x":3,"y":1}),
+            0,
+            RecordingCaller {
+                session: Some("owner"),
+                transport: None,
+            },
+        )
+        .unwrap();
+    scope_dispatch_click_capture(Some(&pending), async {
+        retain_recording_admission(context.frame.binding.as_ref().unwrap(), &wrong);
+    })
+    .await;
+    session.finish_turn(pending, "action result unchanged");
+    assert_eq!(
+        read(&output.path().join("turn-00001"), "evidence.json")["click"]["classification"],
+        "recording_invalid_frame"
+    );
+
+    let pending = session
+        .begin_turn(
+            "click",
+            &serde_json::json!({"pid":7,"window_id":9,"x":3,"y":1}),
+            0,
+            RecordingCaller {
+                session: Some("owner"),
+                transport: None,
+            },
+        )
+        .unwrap();
+    scope_dispatch_click_capture(Some(&pending), async {
+        let sink = recording_admission_sink().unwrap();
+        let mut source = context.frame.window.clone().unwrap();
+        source.origin.0 += 1;
+        sink.retain_window_action_point(
+            context.frame.binding.as_ref().unwrap(),
+            context.frame.identity.as_ref(),
+            &source,
+            (3.0, 1.0),
+        );
+    })
+    .await;
+    session.finish_turn(pending, "guarded action independently valid");
+    assert_eq!(
+        read(&output.path().join("turn-00002"), "evidence.json")["click"]["classification"],
+        "recording_stale_frame"
+    );
 }
