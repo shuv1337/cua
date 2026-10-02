@@ -1,5 +1,7 @@
 """Protocol, readiness, and diagnostic checks; not native compositor evidence."""
 
+import copy
+import json
 import os
 import subprocess
 import sys
@@ -8,6 +10,102 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import live_discovery as discovery
+
+
+class DiscoveryStatusTest(unittest.TestCase):
+    def metadata(self, production=False):
+        value = {"state": "discovery_only", "abi": {"match": True},
+                 "capabilities": {"supported": ["discovery"], "enabled": ["discovery"]},
+                 "transport": {"ready": True}, "compositor_epoch": 42,
+                 "protocol": {"major": 2, "minor": 0, "max_frame_bytes": 4120}}
+        if production:
+            lane = {"held_observer": True, "held_cleanup_unconfirmed": False,
+                    "foreground_cleanup_pending": False, "held_button": 0,
+                    "held_keys": 0, "lease_active": False, "drag_active": False}
+            value.update(state="input_v3_candidate", input={
+                "protocol": 3, "test_only": False, "source_guard_version": 1,
+                "held_phase_version": 1, "upgrade": "desktop_restart",
+                "lanes": [lane.copy(), lane.copy()]})
+        return value
+
+    def observe(self, value):
+        with patch.object(discovery, "hyprctl", return_value=json.dumps(value)) as query:
+            result = discovery.status()
+        query.assert_called_once_with("-j", "cua:status")
+        return result
+
+    def rejected(self, value):
+        with self.assertRaises((AssertionError, KeyError, TypeError)):
+            self.observe(value)
+
+    def test_discovery_and_experiment_tiers_remain_unchanged(self):
+        value = self.metadata()
+        self.assertEqual(self.observe(value), value)
+        value.update(state="input_experiment", experiment={"test_only": True})
+        self.assertEqual(self.observe(value), value)
+        value["experiment"]["test_only"] = False
+        self.rejected(value)
+        value = self.metadata()
+        value["state"] = "input_v3_candidate"
+        self.rejected(value)
+
+    def test_idle_production_tier_passes(self):
+        value = self.metadata(production=True)
+        self.assertEqual(self.observe(value), value)
+
+    def test_missing_or_incompatible_production_fields_fail(self):
+        original = self.metadata(production=True)
+        for key, bad in (("protocol", 2), ("protocol", 4), ("test_only", True),
+                         ("source_guard_version", 0), ("source_guard_version", 2),
+                         ("held_phase_version", 0), ("held_phase_version", 2),
+                         ("upgrade", "hot_reload"), ("lanes", []),
+                         ("lanes", original["input"]["lanes"][:1]),
+                         ("lanes", original["input"]["lanes"] * 2)):
+            with self.subTest(field=key, bad=bad):
+                value = copy.deepcopy(original)
+                value["input"][key] = bad
+                self.rejected(value)
+                del value["input"][key]
+                self.rejected(value)
+        for state in ("discovery_only", "input_experiment"):
+            value = copy.deepcopy(original)
+            value["state"] = state
+            self.rejected(value)
+
+    def test_each_lane_requires_observer_no_debt_and_no_active_hold(self):
+        original = self.metadata(production=True)
+        for index in (0, 1):
+            for key, bad in (("held_observer", False), ("held_observer", 1),
+                             ("held_cleanup_unconfirmed", True),
+                             ("foreground_cleanup_pending", True),
+                             ("held_button", 1), ("held_keys", 1),
+                             ("lease_active", True), ("drag_active", True)):
+                with self.subTest(lane=index, field=key, bad=bad):
+                    value = copy.deepcopy(original)
+                    value["input"]["lanes"][index][key] = bad
+                    self.rejected(value)
+                    del value["input"]["lanes"][index][key]
+                    self.rejected(value)
+
+    def test_all_tiers_retain_abi_capability_transport_and_v2_framing_checks(self):
+        for tier in ("discovery", "experiment", "production"):
+            original = self.metadata(tier == "production")
+            if tier == "experiment":
+                original.update(state="input_experiment", experiment={"test_only": True})
+            for path, bad in ((("abi", "match"), False),
+                              (("capabilities", "supported"), ["discovery", "input"]),
+                              (("capabilities", "enabled"), ["discovery", "input"]),
+                              (("transport", "ready"), False),
+                              (("protocol", "major"), 3), (("protocol", "minor"), 1),
+                              (("protocol", "max_frame_bytes"), 8192),
+                              (("compositor_epoch",), 0)):
+                with self.subTest(tier=tier, field=path):
+                    value = copy.deepcopy(original)
+                    parent = value if len(path) == 1 else value[path[0]]
+                    parent[path[-1]] = bad
+                    self.rejected(value)
+                    del parent[path[-1]]
+                    self.rejected(value)
 
 
 class DiscoveryReadinessTest(unittest.TestCase):

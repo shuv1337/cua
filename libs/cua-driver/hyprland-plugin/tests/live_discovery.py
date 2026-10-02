@@ -28,6 +28,19 @@ def status():
     if value.get("experiment"):
         assert value["state"] == "input_experiment"
         assert value["experiment"]["test_only"] is True
+    elif value.get("input", {}).get("protocol") == 3:
+        assert value["state"] == "input_v3_candidate"
+        assert value["input"]["test_only"] is False
+        assert value["input"]["source_guard_version"] == 1
+        assert value["input"]["held_phase_version"] == 1
+        assert value["input"]["upgrade"] == "desktop_restart"
+        assert len(value["input"]["lanes"]) == 2
+        for lane in value["input"]["lanes"]:
+            assert lane["held_observer"] is True
+            assert lane["held_cleanup_unconfirmed"] is False
+            assert lane["foreground_cleanup_pending"] is False
+            assert lane["held_button"] == 0 and lane["held_keys"] == 0
+            assert lane["lease_active"] is False and lane["drag_active"] is False
     else:
         assert value["state"] == "discovery_only"
     assert value["abi"]["match"] is True
