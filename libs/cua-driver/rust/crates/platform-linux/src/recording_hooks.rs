@@ -822,6 +822,7 @@ mod tests {
         use crate::wayland::hyprland::{DesktopFrame, FrameOutput};
         use cua_driver_core::recording_frame::RecordingFrame;
         let frame = DesktopFrame {
+            topology_authority: false,
             peer: None,
             x: -8,
             y: 0,

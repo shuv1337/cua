@@ -816,6 +816,10 @@ fn capture_via_screencopy_in(
     selected: Option<&hyprland::FrameOutput>,
     deadline: std::time::Instant,
 ) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        std::time::Instant::now() < deadline,
+        "native screencopy phase deadline expired before connection"
+    );
     let conn = if native.is_some() {
         hyprland::wayland_connection()?
     } else {
@@ -826,11 +830,15 @@ fn capture_via_screencopy_in(
     }
     let mut queue = conn.new_event_queue::<State>();
     let qh = queue.handle();
+    anyhow::ensure!(
+        std::time::Instant::now() < deadline,
+        "native screencopy phase deadline expired before registry"
+    );
     conn.display().get_registry(&qh, ());
 
     let mut state = State::default();
-    bounded_roundtrip(&conn, &mut queue, &mut state)?;
-    bounded_roundtrip(&conn, &mut queue, &mut state)?;
+    bounded_roundtrip_until(&conn, &mut queue, &mut state, deadline)?;
+    bounded_roundtrip_until(&conn, &mut queue, &mut state, deadline)?;
 
     let manager = state
         .scrcopy_manager
@@ -842,6 +850,10 @@ fn capture_via_screencopy_in(
         .ok_or_else(|| anyhow::anyhow!("compositor does not expose wl_shm"))?;
     let output = select_capture_output(&state, selected.map(|output| output.name.as_str()))?;
 
+    anyhow::ensure!(
+        std::time::Instant::now() < deadline,
+        "native screencopy phase deadline expired before output request"
+    );
     let frame = manager.capture_output(0, &output, &qh, ());
     // Drain Buffer / Flags events; spin until Ready or Failed (or timeout).
     let mut buffer: Option<WlBuffer> = None;
@@ -854,7 +866,7 @@ fn capture_via_screencopy_in(
     let mut buffer_spec = None;
 
     loop {
-        bounded_roundtrip(&conn, &mut queue, &mut state)?;
+        bounded_roundtrip_until(&conn, &mut queue, &mut state, deadline)?;
         if state.capture.failed {
             anyhow::bail!("compositor signalled screencopy failure");
         }
@@ -895,6 +907,10 @@ fn capture_via_screencopy_in(
                 fmt,
                 &qh,
                 (),
+            );
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "native screencopy phase deadline expired before copy"
             );
             frame.copy(&b);
             buffer = Some(b);
@@ -1568,13 +1584,31 @@ fn bounded_roundtrip(
     queue: &mut wayland_client::EventQueue<State>,
     state: &mut State,
 ) -> anyhow::Result<()> {
+    bounded_roundtrip_until(
+        conn,
+        queue,
+        state,
+        std::time::Instant::now() + std::time::Duration::from_secs(2),
+    )
+}
+
+fn bounded_roundtrip_until(
+    conn: &Connection,
+    queue: &mut wayland_client::EventQueue<State>,
+    state: &mut State,
+    phase_deadline: std::time::Instant,
+) -> anyhow::Result<()> {
     use std::os::fd::{AsFd, AsRawFd};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     };
     use std::time::{Duration, Instant};
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = phase_deadline.min(Instant::now() + Duration::from_secs(2));
+    anyhow::ensure!(
+        Instant::now() < deadline,
+        "Wayland acknowledgment deadline expired before sync"
+    );
     let done = Arc::new(AtomicBool::new(false));
     conn.display().sync(&queue.handle(), done.clone());
     while !done.load(Ordering::Acquire) {
@@ -4312,6 +4346,35 @@ mod output_transform_tests {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn registry_and_copy_sync_share_the_received_absolute_deadline() {
+        for registry_phase in [true, false] {
+            let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let conn = Connection::from_socket(socket).unwrap();
+            let mut queue = conn.new_event_queue::<State>();
+            let mut state = State::default();
+            if registry_phase {
+                conn.display().get_registry(&queue.handle(), ());
+            }
+            let start = std::time::Instant::now();
+            let deadline = start + std::time::Duration::from_millis(15);
+            assert!(bounded_roundtrip_until(&conn, &mut queue, &mut state, deadline).is_err());
+            assert!(start.elapsed() < std::time::Duration::from_millis(300));
+            // A subsequent phase does not reset to another two-second wait or
+            // even queue another sync after the original deadline expires.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            use std::io::Read;
+            peer.set_nonblocking(true).unwrap();
+            let mut bytes = [0u8; 1024];
+            while matches!(peer.read(&mut bytes),Ok(count) if count>0) {}
+            assert!(bounded_roundtrip_until(&conn, &mut queue, &mut state, deadline).is_err());
+            conn.flush().unwrap();
+            assert_eq!(
+                peer.read(&mut bytes).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+    #[test]
     fn dropped_session_sends_owned_release_before_destroy_on_original_wire() {
         use std::io::Read;
         let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -4440,6 +4503,7 @@ mod tests {
         let space = super::DesktopInputSpace {
             snapshot: Some(super::hyprland::DesktopSnapshot {
                 frame: super::hyprland::DesktopFrame {
+                    topology_authority: false,
                     peer: None,
                     x: -2560,
                     y: -100,

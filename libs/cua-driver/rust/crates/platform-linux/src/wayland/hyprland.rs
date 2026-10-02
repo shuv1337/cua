@@ -168,6 +168,7 @@ pub struct DesktopFrame {
     pub scale: f64,
     pub outputs: Vec<FrameOutput>,
     pub identity: cua_driver_core::capture_runtime::CaptureFrameIdentity,
+    pub(crate) topology_authority: bool,
     pub(crate) peer: Option<CompositorPeer>,
 }
 
@@ -250,7 +251,10 @@ impl DesktopFrame {
         // v0.56.2 socket2 omits layout/mode/DPMS signals. The already-loaded
         // production v3 plugin exports its monotonic event generations via
         // existing status; socket2 alone cannot certify those ABA transitions.
-        let plugin_epoch = topology_plugin_epoch(&peer)?;
+        // Baseline observation/read-only tools remain usable without a plugin.
+        // Socket2-only identity is explicitly limited; it cannot qualify a
+        // native capture for action or recording ABA authority.
+        let plugin_epoch = topology_plugin_epoch(&peer).unwrap_or_default();
         Ok(self.bind_observed_authority(peer, events, &plugin_epoch))
     }
 
@@ -261,6 +265,7 @@ impl DesktopFrame {
         plugin_epoch: &[(u64, String, u64)],
     ) -> Self {
         let incarnation = format!("{peer:?}");
+        self.topology_authority = !plugin_epoch.is_empty();
         self.identity =
             cua_driver_core::capture_runtime::CaptureFrameIdentity::from_native_snapshot(
                 format!(
@@ -471,6 +476,7 @@ pub(super) fn validate_window_observation(
                     },
                     || {
                         let plugin_before = original_frame
+                            .filter(|frame| frame.topology_authority)
                             .map(|_| topology_plugin_epoch(peer))
                             .transpose()?;
                         let (monitors, observed): (serde_json::Value, _) =
@@ -503,6 +509,7 @@ pub(super) fn validate_window_observation(
                             i32::try_from(window.pid).context("unrepresentable native pid")?,
                         )?;
                         let plugin_after = original_frame
+                            .filter(|frame| frame.topology_authority)
                             .map(|_| topology_plugin_epoch(peer))
                             .transpose()?;
                         Ok((plugin_before, monitors, window, process_start, plugin_after))
@@ -539,9 +546,7 @@ pub(super) fn validate_window_observation(
                     .bind_observed_authority(
                         peer.clone(),
                         before.topology(),
-                        plugin_before
-                            .as_ref()
-                            .expect("frame requires plugin authority"),
+                        plugin_before.as_deref().unwrap_or(&[]),
                     );
                 if current.identity != original.identity {
                     bail!(cua_driver_core::capture_runtime::CaptureActionError::NativeActionFrameMismatch);
@@ -1120,6 +1125,7 @@ fn desktop_frame_from_monitors(mut monitors: Vec<DisplayMonitor>) -> Result<Desk
         scale,
         outputs,
         identity,
+        topology_authority: false,
         peer: None,
     })
 }
@@ -1297,6 +1303,13 @@ pub(crate) struct NativeDesktopPixels {
 }
 
 impl NativeDesktopPixels {
+    #[cfg(test)]
+    pub(crate) fn test_pixels(
+        png: Vec<u8>,
+        identity: cua_driver_core::capture_runtime::CaptureFrameIdentity,
+    ) -> Self {
+        Self { png, identity }
+    }
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -1311,6 +1324,10 @@ pub(crate) fn capture_native_desktop_until(
     frame: &DesktopFrame,
     deadline: Instant,
 ) -> Result<NativeDesktopPixels> {
+    anyhow::ensure!(
+        frame.topology_authority,
+        "topology_epoch_unavailable: qualified capture requires complete topology event authority"
+    );
     let png = compose_desktop_capture_with(frame, deadline, |output, deadline| {
         super::qualified_output_capture(frame, output, deadline)
     })?;

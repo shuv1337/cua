@@ -1332,6 +1332,49 @@ impl CaptureService {
         Ok(id)
     }
 
+    /// A visual-only desktop refresh must not leave an older cap/observation
+    /// installed as the coordinate source for the newly displayed image. No ID
+    /// is minted, and an older completion cannot revoke a newer publication.
+    pub fn invalidate_desktop_observation_started(
+        &self,
+        binding: &CaptureBinding,
+        sequence: u64,
+    ) -> Result<(), CaptureStoreError> {
+        let generations = self
+            .session_generations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if self.runtime_retired.load(Ordering::Acquire)
+            || binding.runtime_generation() != self.runtime_generation
+            || generations
+                .get(binding.session_id())
+                .is_some_and(|generation| *generation != binding.session_generation())
+        {
+            return Err(CaptureStoreError::InvalidBinding);
+        }
+        if self
+            .publication_sequences
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&(binding.clone(), CaptureTarget::PrimaryDesktop))
+            .copied()
+            != Some(sequence)
+        {
+            return Err(CaptureStoreError::InvalidBinding);
+        }
+        if let Some((observed_binding, _, stale, _, _)) = self
+            .desktop_observations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(binding.session_id())
+        {
+            if observed_binding == binding {
+                *stale = true;
+            }
+        }
+        Ok(())
+    }
+
     /// Validate the last delivered desktop image, including uncapped ratio-one
     /// images. Once observed stale, it stays stale even if the layout returns;
     /// only a new successful publication restores coordinate authority.
@@ -1760,6 +1803,61 @@ mod tests {
                 ))
             ));
         }
+    }
+
+    #[test]
+    fn visual_only_refresh_mints_no_id_or_cap_and_cannot_revoke_newer_publication() {
+        let service = CaptureService::default();
+        let owner = service.current_binding("visual-only").unwrap();
+        let frame = CaptureFrameIdentity::from_native_snapshot(b"original native operation");
+        let publish = |sequence| {
+            service.publish_started_in_frame(
+                CapturePublication {
+                    png_bytes: png(2, 2, 1),
+                    target: CaptureTarget::PrimaryDesktop,
+                    encoded_dimensions: EncodedScreenshotDimensions::new(2, 2).unwrap(),
+                    native_action_dimensions: NativeActionDimensions::new(4, 4).unwrap(),
+                    screenshot_to_action: ScreenshotToActionTransform::new(
+                        2.0, 0.0, 0.0, 2.0, 0.0, 0.0,
+                    )
+                    .unwrap(),
+                    session_id: owner.session_id.clone(),
+                    session_generation: owner.session_generation,
+                },
+                Some(frame.clone()),
+                Some(sequence),
+            )
+        };
+        let first = service
+            .begin_publication(&owner, CaptureTarget::PrimaryDesktop)
+            .unwrap();
+        publish(first).unwrap();
+        let fallback = service
+            .begin_publication(&owner, CaptureTarget::PrimaryDesktop)
+            .unwrap();
+        service
+            .invalidate_desktop_observation_started(&owner, fallback)
+            .unwrap();
+        assert_eq!(
+            service
+                .validate_desktop_observation(&owner, &frame)
+                .unwrap_err(),
+            CaptureActionError::NativeActionFrameMismatch
+        );
+        let newer = service
+            .begin_publication(&owner, CaptureTarget::PrimaryDesktop)
+            .unwrap();
+        publish(newer).unwrap();
+        assert!(service
+            .invalidate_desktop_observation_started(&owner, fallback)
+            .is_err());
+        service
+            .validate_desktop_observation(&owner, &frame)
+            .unwrap();
+        service.retire_session(&owner);
+        assert!(service
+            .invalidate_desktop_observation_started(&owner, newer)
+            .is_err());
     }
 
     #[test]

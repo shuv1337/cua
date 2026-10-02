@@ -1,5 +1,6 @@
 //! Real Linux tool implementations (compiled only on Linux).
 
+use anyhow::Context;
 use async_trait::async_trait;
 use cua_driver_contract::{
     ClickButton, DragInput, GetCursorPositionInput, GetDesktopStateInput, GetScreenSizeInput,
@@ -166,9 +167,53 @@ fn window_source_refusal(error: impl std::fmt::Display) -> ToolResult {
     }))
 }
 
+fn coordinate_free_semantic(tool: &str, args: &Value) -> bool {
+    if args.get("x").is_some() || args.get("y").is_some() {
+        return false;
+    }
+    tool == "set_value"
+        || (tool == "click"
+            && args
+                .get("element_token")
+                .is_some_and(|value| !value.is_null())
+            && args
+                .get("button")
+                .and_then(Value::as_str)
+                .is_none_or(|button| button == "left")
+            && args
+                .get("count")
+                .and_then(Value::as_u64)
+                .is_none_or(|count| count == 1)
+            && args
+                .get("modifiers")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty))
+}
+
 #[cfg(test)]
 mod native_pointer_outcome_tests {
     use super::*;
+    #[test]
+    fn semantic_authority_is_coordinate_free_not_a_desktop_guard_bypass() {
+        let semantic = json!({"pid":7,"element_token":"snapshot:0","scope":"desktop"});
+        assert!(coordinate_free_semantic("click", &semantic));
+        assert!(coordinate_free_semantic("set_value", &semantic));
+        assert!(!coordinate_free_semantic("double_click", &semantic));
+        assert!(!coordinate_free_semantic("mouse_button_down", &semantic));
+        for extra in [
+            json!({"x":1}),
+            json!({"y":2}),
+            json!({"button":"right"}),
+            json!({"count":2}),
+            json!({"modifiers":["ctrl"]}),
+        ] {
+            let mut args = semantic.clone();
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(!coordinate_free_semantic("click", &args));
+        }
+    }
     #[test]
     fn contextual_owned_cleanup_errors_survive_input_and_desktop_conversion() {
         for convert in [input_error_result, desktop_frame_error, linux_input_error] {
@@ -248,6 +293,17 @@ impl<T: Tool> Tool for NativePointerOutcomeTool<T> {
     }
     async fn invoke(&self, args: Value) -> ToolResult {
         let tool = self.0.def().name.as_str();
+        if coordinate_free_semantic(tool, &args) {
+            if args.get("capture_id").is_some_and(|value| !value.is_null()) {
+                return ToolResult::error(
+                    "capture_id cannot authorize a coordinate-free semantic operation",
+                )
+                .with_structured(json!({"code":"invalid_arguments","effect":"none"}));
+            }
+            // No point is translated. The resolved unique AT-SPI node/frame
+            // supplies semantic authority independently of desktop pixels.
+            return native_pointer_outcome(self.0.invoke(args).await);
+        }
         let targeted = args.get("pid").is_some_and(|value| !value.is_null())
             || args.get("window_id").is_some_and(|value| !value.is_null())
             || args
@@ -270,7 +326,7 @@ impl<T: Tool> Tool for NativePointerOutcomeTool<T> {
         );
         let guarded = source_tool
             && targeted
-            && (required || crate::capture_action_frame::recording_sink().is_some())
+            && required
             && crate::wayland::is_wayland()
             && crate::wayland::hyprland::is_session()
             && tool != "mouse_button_up";
@@ -3106,6 +3162,11 @@ async fn spawn_blocking_bounded<T: Send + 'static>(
 /// foreground `code` (`foreground_unavailable` / `foreground_timeout`) when the
 /// message carries one so the caller can branch instead of parsing prose.
 fn input_error_result(e: anyhow::Error) -> ToolResult {
+    if e.is::<crate::atspi::native::SemanticDispatchUnknown>() {
+        return ToolResult::error(e.to_string()).with_structured(
+            json!({"code":"semantic_dispatch_unknown","effect":"partial","retryable":false}),
+        );
+    }
     if let Some(outcome) = owned_pointer_error_result(&e) {
         return outcome;
     }
@@ -6819,7 +6880,7 @@ impl ClickTool {
                         crate::input::with_x11_foreground_opts(
                             xid,
                             crate::input::ForegroundOptions::pointer(),
-                            || crate::atspi::perform_action_observed(&observed_for_ax),
+                            || crate::atspi::perform_action_observed(pid, &observed_for_ax),
                         )
                     },
                 )
@@ -7358,9 +7419,9 @@ impl Tool for ClickTool {
                         // dialog mutter then focuses. Snapshot, act, restore.
                         match guard_pid {
                             Some(pid) => crate::input::focus_guard::guarded(Some(pid), || {
-                                crate::atspi::perform_action_observed(&observed_for_ax)
+                                crate::atspi::perform_action_observed(pid, &observed_for_ax)
                             }),
-                            None => crate::atspi::perform_action_observed(&observed_for_ax)
+                            None => crate::atspi::perform_action_observed(pid, &observed_for_ax)
                                 .map(|value| (value, None)),
                         }
                     }),
@@ -7402,6 +7463,9 @@ impl Tool for ClickTool {
                 // The observed object is gone: the snapshot is stale. Refuse
                 // rather than retarget whatever now lives at that index.
                 if let Ok(Err(error)) = &ax_result {
+                    if error.is::<crate::atspi::native::SemanticDispatchUnknown>() {
+                        return foreground_ax_click_unknown(pid, idx);
+                    }
                     if error.is::<crate::atspi::native::CachedElementGone>() {
                         return ToolResult::error(format!(
                             "AT-SPI element click failed: stale_element_token: observed \
@@ -7417,6 +7481,11 @@ impl Tool for ClickTool {
                 // AT-SPI errors can arrive after dispatch. Do not introduce a
                 // primary-seat replay when its semantic outcome is uncertain.
                 if foreground_hyprland {
+                    return foreground_ax_click_unknown(pid, idx);
+                }
+                if crate::wayland::hyprland::is_session() && desktop_frame_requested(&args) {
+                    // A semantic attempt may already have effects; do not
+                    // replace it with newly resolved pointer coordinates.
                     return foreground_ax_click_unknown(pid, idx);
                 }
             }
@@ -7673,7 +7742,13 @@ impl Tool for ClickTool {
         // Resolve the screen point the cursor glides to. Tool coordinates are
         // always window-local screenshot pixels; native Wayland translates
         // through compositor/AT-SPI geometry while X11 uses XTranslateCoordinates.
-        let wayland_output_point = if crate::wayland::wayland_input_enabled() {
+        let retained_source = window_action_source();
+        let retained_layout_point = retained_source
+            .as_ref()
+            .map(|source| source.layout_point((x, y)));
+        let wayland_output_point = if let Some((sx, sy)) = retained_layout_point {
+            Some((sx.round() as i32, sy.round() as i32))
+        } else if crate::wayland::wayland_input_enabled() {
             Some(crate::wayland::window_local_to_output(
                 xid,
                 x.round() as i32,
@@ -7682,7 +7757,9 @@ impl Tool for ClickTool {
         } else {
             None
         };
-        let glide_target = if let Some((sx, sy)) = wayland_output_point {
+        let glide_target = if retained_layout_point.is_some() {
+            retained_layout_point
+        } else if let Some((sx, sy)) = wayland_output_point {
             Some((sx as f64, sy as f64))
         } else {
             tokio::task::spawn_blocking(move || window_local_to_screen(xid, x, y))
@@ -7724,7 +7801,7 @@ impl Tool for ClickTool {
                     "modified clicks are unsupported by isolated input",
                 );
             }
-            if button == 1 && count == 1 {
+            if retained_source.is_none() && button == 1 && count == 1 {
                 let semantic = tokio::task::spawn_blocking(move || {
                     crate::atspi::perform_action_at_screen_point(pid, xid, output_x, output_y)
                 })
@@ -10938,7 +11015,7 @@ impl Tool for DoubleClickTool {
         if let Some(refusal) = unavailable_wayland_focused_input_background(delivery, true) {
             return refusal;
         }
-        if hyprland_foreground(delivery) {
+        if hyprland_foreground(delivery) || isolated_hyprland_background(delivery) {
             // Share exact-target validation and the admitted native click lifecycle.
             let mut args = args;
             args["button"] = json!("left");
@@ -11225,7 +11302,7 @@ impl Tool for RightClickTool {
         if let Some(refusal) = unavailable_wayland_focused_input_background(delivery, true) {
             return refusal;
         }
-        if hyprland_foreground(delivery) {
+        if hyprland_foreground(delivery) || isolated_hyprland_background(delivery) {
             // Share exact-target validation and the admitted native click lifecycle.
             let mut args = args;
             args["button"] = json!("right");
@@ -13312,6 +13389,238 @@ fn normalize_desktop_capture_for_action_frame(
 pub struct GetDesktopStateTool {
     state: Arc<ToolState>,
 }
+
+fn desktop_pixels_from_operation(
+    frame: &crate::wayland::hyprland::DesktopFrame,
+    deadline: std::time::Instant,
+    native: impl FnOnce(
+        &crate::wayland::hyprland::DesktopFrame,
+        std::time::Instant,
+    ) -> anyhow::Result<crate::wayland::hyprland::NativeDesktopPixels>,
+    fallback: impl FnOnce() -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<(
+    Vec<u8>,
+    Option<cua_driver_core::capture_runtime::CaptureFrameIdentity>,
+)> {
+    if std::time::Instant::now() < deadline {
+        if let Ok(proof) = native(frame, deadline) {
+            let (png, identity) = proof.into_parts();
+            if frame.topology_authority
+                && identity == frame.identity
+                && std::time::Instant::now() < deadline
+            {
+                return Ok((png, Some(identity)));
+            }
+        }
+    }
+    fallback().map(|png| (png, None))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_desktop_operation(
+    service: &cua_driver_core::capture_runtime::CaptureService,
+    args: &Value,
+    png: &[u8],
+    encoded: (u32, u32),
+    native: (u32, u32),
+    hyprland: bool,
+    identity: Option<cua_driver_core::capture_runtime::CaptureFrameIdentity>,
+    deadline: std::time::Instant,
+) -> anyhow::Result<Option<String>> {
+    if !hyprland || (identity.is_some() && std::time::Instant::now() < deadline) {
+        return crate::capture_action_frame::publish_desktop_in_frame(
+            service, args, png, encoded, native, identity,
+        )
+        .map(Some);
+    }
+    let binding = service.binding(
+        args.get("_session_id")
+            .and_then(Value::as_str)
+            .context("capture session unavailable")?,
+        args.get("_capture_session_generation")
+            .and_then(Value::as_u64)
+            .context("original capture generation unavailable")?,
+    )?;
+    service.invalidate_desktop_observation_started(
+        &binding,
+        args.get("_capture_started_sequence")
+            .and_then(Value::as_u64)
+            .context("original capture sequence unavailable")?,
+    )?;
+    Ok(None)
+}
+
+#[cfg(test)]
+mod desktop_operation_tests {
+    use super::*;
+    use cua_driver_core::capture_runtime::*;
+    fn frame() -> crate::wayland::hyprland::DesktopFrame {
+        use crate::wayland::hyprland::{DesktopFrame, FrameOutput};
+        DesktopFrame {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 4,
+            scale: 1.5,
+            peer: None,
+            topology_authority: true,
+            identity: CaptureFrameIdentity::from_native_snapshot(
+                b"original capture outputs and peer",
+            ),
+            outputs: vec![
+                FrameOutput {
+                    name: "DP-2".into(),
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                    native_width: 6,
+                    native_height: 6,
+                },
+                FrameOutput {
+                    name: "DP-1".into(),
+                    x: 4,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                    native_width: 6,
+                    native_height: 6,
+                },
+            ],
+        }
+    }
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        cua_driver_core::image_utils::encode_rgba_to_png(&vec![255; (w * h * 4) as usize], w, h)
+            .unwrap()
+    }
+    #[test]
+    fn get_desktop_publication_uses_operation_proof_and_original_binding_cap_deadline() {
+        let service = CaptureService::default();
+        let args = crate::capture_action_frame::pin_publication_binding(
+            &service,
+            &json!({"_session_id":"capture-proof"}),
+        )
+        .unwrap();
+        let original = frame();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (pixels, identity) = desktop_pixels_from_operation(
+            &original,
+            deadline,
+            |plan, received| {
+                assert_eq!(received, deadline);
+                assert_eq!(plan.outputs, original.outputs);
+                Ok(crate::wayland::hyprland::NativeDesktopPixels::test_pixels(
+                    png(8, 4),
+                    plan.identity.clone(),
+                ))
+            },
+            || panic!("qualified capture must not fallback"),
+        )
+        .unwrap();
+        let capped = crate::capture::resize_png_if_needed(&pixels, 4).unwrap();
+        let id = publish_desktop_operation(
+            &service,
+            &args,
+            &capped,
+            (4, 2),
+            (8, 4),
+            true,
+            identity,
+            deadline,
+        )
+        .unwrap()
+        .unwrap();
+        let admission = service
+            .admit_action_in_frame(
+                CaptureActionRequest {
+                    capture_id: id.parse().unwrap(),
+                    binding: service.binding_from_args(&args).unwrap(),
+                    target: CaptureTarget::PrimaryDesktop,
+                    current_native_action_dimensions: NativeActionDimensions::new(8, 4).unwrap(),
+                    screenshot_x: 1.0,
+                    screenshot_y: 1.0,
+                },
+                Some(&original.identity),
+            )
+            .unwrap();
+        assert_eq!((admission.action_x, admission.action_y), (2.0, 2.0));
+    }
+    #[test]
+    fn get_desktop_wrong_peer_equal_size_fallback_is_visual_only_and_mints_no_id() {
+        let service = CaptureService::default();
+        let args = crate::capture_action_frame::pin_publication_binding(
+            &service,
+            &json!({"_session_id":"wrong-peer"}),
+        )
+        .unwrap();
+        let original = frame();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (pixels, identity) = desktop_pixels_from_operation(
+            &original,
+            deadline,
+            |_, _| anyhow::bail!("actual fd belongs to successor peer"),
+            || Ok(png(8, 4)),
+        )
+        .unwrap();
+        assert!(identity.is_none());
+        assert!(publish_desktop_operation(
+            &service,
+            &args,
+            &pixels,
+            (8, 4),
+            (8, 4),
+            true,
+            identity,
+            deadline
+        )
+        .unwrap()
+        .is_none());
+        let mut coordinates = json!({"scope":"desktop","x":1.0,"y":1.0});
+        assert!(!service.map_desktop_observation_args(
+            &service.binding_from_args(&args).unwrap(),
+            &mut coordinates
+        ));
+    }
+    #[test]
+    fn desktop_capture_frame_mismatch_keeps_its_tool_error_code() {
+        let result = desktop_frame_error(anyhow::Error::new(
+            CaptureActionError::NativeActionFrameMismatch,
+        ));
+        assert_eq!(
+            result.structured_content.unwrap()["code"],
+            "capture_frame_mismatch"
+        );
+    }
+
+    #[test]
+    fn limited_baseline_and_expired_native_captures_keep_visual_pixels_without_authority() {
+        let mut original = frame();
+        original.topology_authority = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (pixels, identity) = desktop_pixels_from_operation(
+            &original,
+            deadline,
+            |plan, _| {
+                Ok(crate::wayland::hyprland::NativeDesktopPixels::test_pixels(
+                    png(8, 4),
+                    plan.identity.clone(),
+                ))
+            },
+            || Ok(png(8, 4)),
+        )
+        .unwrap();
+        assert!(!pixels.is_empty());
+        assert!(identity.is_none());
+        let (_, identity) = desktop_pixels_from_operation(
+            &original,
+            std::time::Instant::now(),
+            |_, _| panic!("expired phase must not begin another native operation"),
+            || Ok(png(8, 4)),
+        )
+        .unwrap();
+        assert!(identity.is_none());
+    }
+}
 static GDS_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
 #[async_trait]
@@ -13357,21 +13666,39 @@ impl Tool for GetDesktopStateTool {
             // reported) instead of being baked over the controls it reads.
             // Hyprland: read the desktop frame once. The screenshot, its action
             // size and the window geometry below all use it.
+            let capture_deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
             let hyprland_plan =
                 if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
                     Some(crate::wayland::hyprland::desktop_capture_plan()?)
                 } else {
                     None
                 };
+            let mut qualified_capture_identity = None;
             let (native_png, overlay_capture) =
                 cursor_overlay::capture_exclusion::capture_excluding_overlays(
                     &crate::overlay_capture::OverlayExcluder,
                     |hidden| {
-                        // A multi-monitor layout is composed from the frame
-                        // read above, so the image is exactly that frame.
+                        // Only this operation's actual-fd/output proof can
+                        // authorize coordinates. Fallback pixels remain visual.
                         let png = match &hyprland_plan {
-                            Some(plan) if plan.composite => {
-                                crate::wayland::hyprland::compose_desktop_capture(&plan.frame)?
+                            Some(plan) => {
+                                let (png, identity) = desktop_pixels_from_operation(
+                                    &plan.frame,
+                                    capture_deadline,
+                                    crate::wayland::hyprland::capture_native_desktop_until,
+                                    || {
+                                        if plan.composite {
+                                            crate::wayland::hyprland::compose_desktop_capture_until(
+                                                &plan.frame,
+                                                capture_deadline,
+                                            )
+                                        } else {
+                                            crate::capture::screenshot_display_bytes()
+                                        }
+                                    },
+                                )?;
+                                qualified_capture_identity = identity;
+                                png
                             }
                             _ => crate::capture::screenshot_display_bytes()?,
                         };
@@ -13439,13 +13766,15 @@ impl Tool for GetDesktopStateTool {
                 );
                 frame.rebase_windows(&mut windows);
             }
-            let capture_id = crate::capture_action_frame::publish_desktop_in_frame(
+            let capture_id = publish_desktop_operation(
                 &capture_service,
                 &capture_args,
                 &png,
                 (shot_w, shot_h),
                 (screen_w, screen_h),
-                hyprland_frame.as_ref().map(|frame| frame.identity.clone()),
+                hyprland_frame.is_some(),
+                qualified_capture_identity,
+                capture_deadline,
             )?;
             Ok((
                 b64,
@@ -13493,6 +13822,7 @@ impl Tool for GetDesktopStateTool {
                     "screenshot_mime_type": "image/png",
                     "windows": windows.iter().map(window_record_json).collect::<Vec<_>>(),
                     "capture_id": capture_id,
+                    "action_capture_available": capture_id.is_some(),
                     "agent_overlay_capture": overlay_capture,
                 });
                 if (frame_scale - 1.0).abs() > 0.001 {
@@ -13504,7 +13834,9 @@ impl Tool for GetDesktopStateTool {
                     content.push(cua_driver_core::protocol::Content::image_png(b64));
                 }
                 let window_lines = desktop_window_lines(&windows, frame_scale);
-                let mut frame_note = if (frame_scale - 1.0).abs() > 0.001 {
+                let mut frame_note = if capture_id.is_none() {
+                    "; visual-only capture: no action capture ID or coordinate authority".to_owned()
+                } else if (frame_scale - 1.0).abs() > 0.001 {
                     format!(
                         "; x/y for scope:\"desktop\" actions are pixels of THIS screenshot \
                          (mapped ×{frame_scale:.2} back to the screen automatically)"

@@ -435,6 +435,9 @@ fn source_metadata(target: &Value) -> Result<SourceMetadata> {
 }
 
 impl WindowSource {
+    pub(crate) fn layout_point(&self, point: (f64, f64)) -> (f64, f64) {
+        (self.geometry[0] + point.0, self.geometry[1] + point.1)
+    }
     fn retain_action_point(&self, point: (f64, f64)) {
         let Some(sink) = crate::capture_action_frame::recording_sink() else {
             return;
@@ -1776,6 +1779,7 @@ mod tests {
         let metadata = source_metadata(&guarded_target()).unwrap();
         Arc::new(WindowSource {
             frame: super::super::hyprland::DesktopFrame {
+                topology_authority: true,
                 x: 0,
                 y: 0,
                 width: 5120,
@@ -1819,6 +1823,16 @@ mod tests {
             admission: Mutex::new(None),
             native_validator: Some(|| Ok(())),
         })
+    }
+
+    #[test]
+    fn retained_overlay_layout_point_keeps_fractional_second_output_origin() {
+        let (client, _peer) = production_test_client();
+        let source = fixture_window_source(&client);
+        assert_eq!(source.layout_point((10.25, 10.25)), (2570.5, 20.75));
+        // The projection is pure retained geometry, not a native window lookup
+        // or a rounded local coordinate reconstructed under successor placement.
+        assert_eq!(source.layout_point((0.0, 0.0)), (2560.25, 10.5));
     }
 
     #[test]

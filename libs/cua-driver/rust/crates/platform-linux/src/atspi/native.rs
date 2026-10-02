@@ -3610,6 +3610,15 @@ impl std::fmt::Display for CachedElementGone {
 }
 impl std::error::Error for CachedElementGone {}
 
+#[derive(Debug)]
+pub struct SemanticDispatchUnknown(pub String);
+impl std::fmt::Display for SemanticDispatchUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for SemanticDispatchUnknown {}
+
 /// Open a cached accessible and prove it is still alive (one role read).
 async fn live_accessible<'a>(
     conn: &'a AccessibilityConnection,
@@ -3632,15 +3641,160 @@ async fn live_accessible<'a>(
     Ok((acc, role))
 }
 
+fn check_semantic_source_address(
+    object: &ObjectRef,
+    identity: &super::AtspiIdentity,
+) -> Result<()> {
+    if !identity.bus_name.starts_with(':')
+        || !identity.frame_bus_name.starts_with(':')
+        || object.bus != identity.bus_name
+        || object.path != identity.path
+        || identity.path == "/org/a11y/atspi/null"
+        || identity.frame_path == "/org/a11y/atspi/null"
+    {
+        return Err(CachedElementGone(
+            "semantic source identity is not the original unique node/frame".into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod semantic_source_tests {
+    use super::*;
+    #[test]
+    fn observed_semantic_source_requires_original_unique_node_and_frame_addresses() {
+        let original = super::super::AtspiIdentity {
+            bus_name: ":1.42".into(),
+            path: "/node/7".into(),
+            frame_bus_name: ":1.41".into(),
+            frame_path: "/frame/2".into(),
+        };
+        let object = ObjectRef {
+            bus: original.bus_name.clone(),
+            path: original.path.clone(),
+        };
+        check_semantic_source_address(&object, &original).unwrap();
+        for changed in [
+            ObjectRef {
+                bus: ":1.43".into(),
+                ..object.clone()
+            },
+            ObjectRef {
+                path: "/node/8".into(),
+                ..object.clone()
+            },
+        ] {
+            assert!(check_semantic_source_address(&changed, &original)
+                .unwrap_err()
+                .is::<CachedElementGone>());
+        }
+        let mut unpinned = original.clone();
+        unpinned.frame_bus_name = "org.example.Frame".into();
+        assert!(check_semantic_source_address(&object, &unpinned).is_err());
+        unpinned = original;
+        unpinned.frame_path = "/org/a11y/atspi/null".into();
+        assert!(check_semantic_source_address(&object, &unpinned).is_err());
+    }
+}
+
+async fn live_semantic_source<'a>(
+    conn: &'a AccessibilityConnection,
+    object: &ObjectRef,
+    source: Option<(&super::AtspiIdentity, u32)>,
+) -> Result<(AccessibleProxy<'a>, String)> {
+    if let Some((identity, pid)) = source {
+        check_semantic_source_address(object, identity)?;
+        let dbus = atspi::zbus::fdo::DBusProxy::new(conn.connection()).await?;
+        let bus = atspi::zbus::names::BusName::try_from(identity.frame_bus_name.as_str())?;
+        if dbus.get_connection_unix_process_id(bus).await? != pid {
+            return Err(CachedElementGone(
+                "semantic source frame belongs to a different process".into(),
+            )
+            .into());
+        }
+        let mut current = raw_ref(object);
+        let mut seen = std::collections::HashSet::new();
+        let mut owners = std::collections::HashMap::new();
+        let mut found = false;
+        for _ in 0..64 {
+            if current.name == identity.frame_bus_name && current.path == identity.frame_path {
+                found = true;
+                break;
+            }
+            if !seen.insert((current.name.clone(), current.path.clone())) {
+                break;
+            }
+            let proxy =
+                atspi::zbus::proxy::Builder::<atspi::zbus::Proxy<'_>>::new(conn.connection())
+                    .cache_properties(atspi::zbus::proxy::CacheProperties::No)
+                    .destination(current.name.as_str())?
+                    .path(current.path.as_str())?
+                    .interface("org.a11y.atspi.Accessible")?
+                    .build()
+                    .await?;
+            let (name, path): (String, atspi::zbus::zvariant::OwnedObjectPath) =
+                proxy.get_property("Parent").await?;
+            if path.as_str() == "/org/a11y/atspi/null" {
+                break;
+            }
+            current = identity_ref(
+                conn,
+                &RawObjectRef {
+                    name,
+                    path: path.to_string(),
+                },
+                &mut owners,
+            )
+            .await
+            .ok_or_else(|| {
+                CachedElementGone("semantic source parent has no original unique owner".into())
+            })?;
+        }
+        if !found {
+            return Err(CachedElementGone(
+                "semantic source node no longer belongs to its original frame".into(),
+            )
+            .into());
+        }
+        live_accessible(
+            conn,
+            &ObjectRef {
+                bus: identity.frame_bus_name.clone(),
+                path: identity.frame_path.clone(),
+            },
+        )
+        .await?;
+    }
+    live_accessible(conn, object).await
+}
+
 /// [`perform_action`] on a snapshot-cached element identity. Same contract:
 /// `Ok((action_name, suspected_noop))`. Errors when the object no longer
 /// exists so the caller can fall back to resolving the index afresh.
 pub fn perform_action_ref(object_ref: &ObjectRef) -> Result<(String, bool, bool)> {
+    perform_action_source(object_ref, None)
+}
+
+pub fn perform_action_observed_ref(
+    object_ref: &ObjectRef,
+    identity: &super::AtspiIdentity,
+    pid: u32,
+) -> Result<(String, bool, bool)> {
+    perform_action_source(object_ref, Some((identity, pid)))
+}
+
+fn perform_action_source(
+    object_ref: &ObjectRef,
+    source: Option<(&super::AtspiIdentity, u32)>,
+) -> Result<(String, bool, bool)> {
+    let started = std::sync::atomic::AtomicBool::new(false);
     bounded_for(
         REF_ACTION_BUDGET,
         async {
             let conn = shared_connection().await?;
-            let (acc, role) = live_accessible(conn, object_ref).await?;
+            let (acc, role) = live_semantic_source(conn, object_ref, source).await?;
             let proxies = acc
                 .proxies()
                 .await
@@ -3657,10 +3811,16 @@ pub fn perform_action_ref(object_ref: &ObjectRef) -> Result<(String, bool, bool)
             // is unknown, not dispatched-implies-success, and must not be
             // folded into `rejected`/`suspected_noop` (which would claim the
             // toolkit declined it) nor silently reported as a plain success.
+            live_semantic_source(conn, object_ref, source).await?;
+            started.store(true, std::sync::atomic::Ordering::Release);
             let mut unacknowledged = false;
             let rejected = match call(ap.do_action(chosen as i32)).await {
                 Some(Ok(accepted)) => !accepted,
-                Some(Err(e)) => return Err(anyhow!("doAction failed: {e}")),
+                Some(Err(e)) => {
+                    return Err(
+                        SemanticDispatchUnknown(format!("doAction outcome unknown: {e}")).into(),
+                    )
+                }
                 // The request was delivered; a GTK item whose action opens a
                 // dialog (nested main loop) only replies once that dialog
                 // closes. Treat the timeout as dispatched-but-unconfirmed:
@@ -3678,7 +3838,18 @@ pub fn perform_action_ref(object_ref: &ObjectRef) -> Result<(String, bool, bool)
                 unacknowledged,
             ))
         },
-        || Err(anyhow!("perform_action (cached element) timed out")),
+        || {
+            if started.load(std::sync::atomic::Ordering::Acquire) {
+                Err(
+                    SemanticDispatchUnknown("perform_action timed out after dispatch".into())
+                        .into(),
+                )
+            } else {
+                Err(anyhow!(
+                    "perform_action (cached element) timed out before dispatch"
+                ))
+            }
+        },
     )
 }
 
@@ -5335,15 +5506,87 @@ pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
 /// [`set_value`] on a snapshot-cached element identity (the exact object the
 /// caller's `element_index` named, not the same ordinal in a fresh walk).
 pub fn set_value_ref(object_ref: &ObjectRef, value: &str) -> Result<()> {
+    set_value_source(object_ref, None, value)
+}
+
+pub fn set_value_observed_ref(
+    object_ref: &ObjectRef,
+    identity: &super::AtspiIdentity,
+    pid: u32,
+    value: &str,
+) -> Result<()> {
+    set_value_source(object_ref, Some((identity, pid)), value)
+}
+
+fn set_value_source(
+    object_ref: &ObjectRef,
+    source: Option<(&super::AtspiIdentity, u32)>,
+    value: &str,
+) -> Result<()> {
+    let started = std::sync::atomic::AtomicBool::new(false);
     bounded_for(
         REF_ACTION_BUDGET,
         async {
             let conn = shared_connection().await?;
-            let (acc, _) = live_accessible(conn, object_ref).await?;
+            let (acc, _) = live_semantic_source(conn, object_ref, source).await?;
             let ifaces = match call(acc.get_interfaces()).await {
                 Some(Ok(ifaces)) => ifaces,
                 _ => return Err(anyhow!("cached element interfaces unavailable")),
             };
+            if source.is_some() {
+                let proxies = acc.proxies().await?;
+                if ifaces.contains(Interface::EditableText) {
+                    let et = proxies.editable_text().await?;
+                    live_semantic_source(conn, object_ref, source).await?;
+                    started.store(true, std::sync::atomic::Ordering::Release);
+                    match call(et.set_text_contents(value)).await {
+                        Some(Ok(true)) => {},
+                        _ => return Err(SemanticDispatchUnknown("observed EditableText write was not acknowledged as accepted; no insert/value replay".into()).into()),
+                    }
+                    // Commit is a second semantic effect, on the same original
+                    // object only. Reconcile again after method discovery.
+                    if let Some(Ok(ap)) = call(proxies.action()).await {
+                        let names = action_names(&ap).await;
+                        if let Some(index) = names
+                            .iter()
+                            .position(|name| normalized_action_verb(name) == "activate")
+                        {
+                            live_semantic_source(conn, object_ref, source)
+                                .await
+                                .map_err(|error| {
+                                    SemanticDispatchUnknown(format!(
+                                        "write acknowledged but commit source changed: {error}"
+                                    ))
+                                })?;
+                            if !matches!(call(ap.do_action(index as i32)).await, Some(Ok(true))) {
+                                return Err(SemanticDispatchUnknown(
+                                    "write acknowledged but semantic commit unconfirmed".into(),
+                                )
+                                .into());
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                if ifaces.contains(Interface::Value) {
+                    let value: f64 = value
+                        .parse()
+                        .map_err(|_| anyhow!("value is not numeric for a Value element"))?;
+                    let vp = proxies.value().await?;
+                    live_semantic_source(conn, object_ref, source).await?;
+                    started.store(true, std::sync::atomic::Ordering::Release);
+                    return match call(vp.set_current_value(value)).await {
+                        Some(Ok(())) => Ok(()),
+                        _ => Err(SemanticDispatchUnknown(
+                            "observed Value write outcome unknown; no replay".into(),
+                        )
+                        .into()),
+                    };
+                }
+                return Err(anyhow!(
+                    "{NO_VALUE_ROUTE}: observed element exposes neither EditableText nor Value"
+                ));
+            }
             set_value_on(
                 &acc,
                 ifaces.contains(Interface::Value),
@@ -5352,7 +5595,18 @@ pub fn set_value_ref(object_ref: &ObjectRef, value: &str) -> Result<()> {
             )
             .await
         },
-        || Err(anyhow!("set_value (cached element) timed out")),
+        || {
+            if started.load(std::sync::atomic::Ordering::Acquire) {
+                Err(
+                    SemanticDispatchUnknown("set_value timed out after observed dispatch".into())
+                        .into(),
+                )
+            } else {
+                Err(anyhow!(
+                    "set_value (cached element) timed out before dispatch"
+                ))
+            }
+        },
     )
 }
 
@@ -5622,11 +5876,26 @@ async fn selected_child_name(
 /// `Value` interface's number, else the `Text` content. `None` when the
 /// element exposes neither (or does not answer in time).
 pub fn read_value_ref(object_ref: &ObjectRef) -> Result<Option<String>> {
+    read_value_source(object_ref, None)
+}
+
+pub fn read_value_observed_ref(
+    object_ref: &ObjectRef,
+    identity: &super::AtspiIdentity,
+    pid: u32,
+) -> Result<Option<String>> {
+    read_value_source(object_ref, Some((identity, pid)))
+}
+
+fn read_value_source(
+    object_ref: &ObjectRef,
+    source: Option<(&super::AtspiIdentity, u32)>,
+) -> Result<Option<String>> {
     bounded_for(
         REF_ACTION_BUDGET,
         async {
             let conn = shared_connection().await?;
-            let (acc, _) = live_accessible(conn, object_ref).await?;
+            let (acc, _) = live_semantic_source(conn, object_ref, source).await?;
             let ifaces = match call(acc.get_interfaces()).await {
                 Some(Ok(ifaces)) => ifaces,
                 _ => return Ok(None),

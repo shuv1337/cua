@@ -309,13 +309,33 @@ fn walked_object(node: &AtspiNode) -> Result<(AtspiIdentity, &native::ObjectRef)
 /// [`perform_action`] on the exact object a snapshot observed. Never re-walks
 /// or retargets by index: when the object is gone the error downcasts to
 /// [`native::CachedElementGone`] so the caller can refuse as stale.
-pub fn perform_action_observed(element: &cache::CachedElement) -> Result<(String, bool, bool)> {
+pub fn perform_action_observed(
+    pid: u32,
+    element: &cache::CachedElement,
+) -> Result<(String, bool, bool)> {
     let Some(object_ref) = element.object_ref.as_ref() else {
         return Err(
             native::CachedElementGone("observed element has no D-Bus address".into()).into(),
         );
     };
-    native::perform_action_ref(object_ref)
+    native::perform_action_observed_ref(object_ref, &element.identity, pid)
+}
+
+/// Mutate only the resolved snapshot object; never retry a live ordinal after
+/// an error or a cache replacement. Semantic authority is the original unique
+/// AT-SPI owner/frame/node, not a desktop coordinate or recording marker.
+pub fn set_value_observed(pid: u32, element: &cache::CachedElement, value: &str) -> Result<()> {
+    let object_ref = element
+        .object_ref
+        .as_ref()
+        .ok_or_else(|| native::CachedElementGone("observed element has no D-Bus address".into()))?;
+    native::set_value_observed_ref(object_ref, &element.identity, pid, value)
+}
+
+pub fn read_value_observed(pid: u32, element: &cache::CachedElement) -> Option<String> {
+    native::read_value_observed_ref(element.object_ref.as_ref()?, &element.identity, pid)
+        .ok()
+        .flatten()
 }
 
 /// Whether the exact object a snapshot observed is on screen right now
@@ -647,7 +667,12 @@ pub fn type_into_token(pid: u32, token: &TokenElement, text: &str) -> Result<()>
 pub fn set_value_token(pid: u32, token: &TokenElement, value: &str) -> Result<()> {
     token
         .act(
-            |object| match native::set_value_ref(object, value) {
+            |object| match native::set_value_observed_ref(
+                object,
+                &token.observed.identity,
+                pid,
+                value,
+            ) {
                 // A missing value route is the element's own answer, not a
                 // failure to reach it, so it is never re-resolved.
                 Err(error) if native::is_no_value_route(&error) => {

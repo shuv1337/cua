@@ -325,8 +325,10 @@ fn invalidates_topology(line: &str) -> Result<bool> {
     if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         bail!("invalid Hyprland event name");
     }
-    // Monitor topology/config transitions revoke even if the next live query
-    // returns the old arrangement. Unknown event kinds conservatively revoke.
+    // Hyprland v0.56.2 socket2 informational vocabulary. Monitor/config and
+    // unknown events still revoke. Complete layout/mode/DPMS authority ALSO
+    // requires the production plugin generation; this list cannot replace it.
+    // Screencopy's own start/stop and foreign custom markers are not topology.
     Ok(!matches!(
         name,
         "activewindow"
@@ -349,9 +351,21 @@ fn invalidates_topology(line: &str) -> Result<bool> {
             | "changefloatingmode"
             | "fullscreen"
             | "urgent"
-            | "minimize"
+            | "minimized"
             | "pin"
             | "screencast"
+            | "screencastv2"
+            | "custom"
+            | "openlayer"
+            | "closelayer"
+            | "bell"
+            | "changeworkspaceid"
+            | "kill"
+            | "lockgroups"
+            | "moveintogroup"
+            | "moveoutofgroup"
+            | "submap"
+            | "togglegroup"
             | "activelayout"
             | "moveworkspace"
             | "moveworkspacev2"
@@ -416,7 +430,102 @@ mod tests {
             .unwrap();
         let mut epoch = 0;
         drain_marker(&mut reader, &mut Vec::new(), &mut epoch, "ours").unwrap();
-        assert_eq!(epoch, 3);
+        assert_eq!(epoch, 2);
+    }
+
+    #[test]
+    fn capture_layer_bell_and_foreign_custom_interleaving_preserve_topology() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        writer.write_all(b"screencast>>1,0\nscreencastv2>>1,0,DP-1\nopenlayer>>overlay\nbell>>123\ncustom>>foreign-runtime\ncloselayer>>overlay\nscreencast>>0,0\nscreencastv2>>0,0,DP-1\ncustom>>ours\n").unwrap();
+        let mut epoch = 0;
+        drain_marker(&mut reader, &mut Vec::new(), &mut epoch, "ours").unwrap();
+        assert_eq!(epoch, 0);
+        for name in [
+            "activelayout",
+            "activespecial",
+            "activespecialv2",
+            "activewindow",
+            "activewindowv2",
+            "bell",
+            "changefloatingmode",
+            "changeworkspaceid",
+            "closelayer",
+            "createworkspace",
+            "createworkspacev2",
+            "custom",
+            "destroyworkspace",
+            "destroyworkspacev2",
+            "focusedmon",
+            "focusedmonv2",
+            "fullscreen",
+            "kill",
+            "lockgroups",
+            "minimized",
+            "moveintogroup",
+            "moveoutofgroup",
+            "movewindow",
+            "movewindowv2",
+            "moveworkspace",
+            "moveworkspacev2",
+            "openlayer",
+            "pin",
+            "renameworkspace",
+            "screencast",
+            "screencastv2",
+            "submap",
+            "togglegroup",
+            "urgent",
+            "windowtitle",
+            "windowtitlev2",
+            "workspace",
+            "workspacev2",
+        ] {
+            assert!(
+                !invalidates_topology(&format!("{name}>>payload")).unwrap(),
+                "{name}"
+            );
+        }
+        for name in [
+            "monitoradded",
+            "monitoraddedv2",
+            "monitorremoved",
+            "monitorremovedv2",
+            "configreloaded",
+            "futuremode",
+        ] {
+            assert!(
+                invalidates_topology(&format!("{name}>>payload")).unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn parent_readonly_capture_sequence_seven_custom_four_start_stop_pairs_is_informational() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        for i in 0..7 {
+            writer
+                .write_all(format!("custom>>foreign-or-own-{i}\n").as_bytes())
+                .unwrap();
+        }
+        for (started, output) in [(1, "DP-2"), (0, "DP-2"), (1, "DP-1"), (0, "DP-1")] {
+            writer
+                .write_all(
+                    format!("screencast>>{started},0\nscreencastv2>>{started},0,{output}\n")
+                        .as_bytes(),
+                )
+                .unwrap();
+        }
+        let mut epoch = 0;
+        drain(&mut reader, &mut Vec::new(), &mut epoch).unwrap();
+        assert_eq!(epoch, 0);
+        writer
+            .write_all(b"monitorremoved>>DP-1\nmonitoradded>>DP-1\ncustom>>complete\n")
+            .unwrap();
+        drain_marker(&mut reader, &mut Vec::new(), &mut epoch, "complete").unwrap();
+        assert_eq!(epoch, 2);
     }
 
     #[test]
