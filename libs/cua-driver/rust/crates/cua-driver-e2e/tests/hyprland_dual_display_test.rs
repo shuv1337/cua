@@ -19,6 +19,91 @@ use dual_display_guard::{phase, OwnedDesktop};
 
 const SESSION: &str = "hyprland-dual-display";
 
+#[test]
+fn fixture_pins_gtk_and_gdk3_before_repository_imports() {
+    // Parse the fixture, but execute ONLY its GI preamble using a fake importer.
+    // No real GI import, display connection, argument parsing or window creation.
+    let regression = r#"
+import ast
+import builtins
+import sys
+import types
+
+tree = ast.parse(sys.stdin.read())
+pins = {}
+repository_imports = []
+preamble = []
+for node in tree.body:
+    if isinstance(node, ast.Import) and any(a.name == 'gi' for a in node.names):
+        preamble.append(node)
+    elif (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+          and isinstance(node.value.func, ast.Attribute)
+          and isinstance(node.value.func.value, ast.Name)
+          and node.value.func.value.id == 'gi'
+          and node.value.func.attr == 'require_version'):
+        namespace, version = [ast.literal_eval(a) for a in node.value.args]
+        assert namespace not in pins, 'duplicate GI namespace pin'
+        pins[namespace] = (version, node.lineno)
+        preamble.append(node)
+    elif isinstance(node, ast.ImportFrom) and node.module == 'gi.repository':
+        repository_imports.append(node)
+        preamble.append(node)
+assert repository_imports, 'missing GI repository import'
+for namespace in ('Gtk', 'Gdk'):
+    assert pins[namespace][0] == '3.0'
+    assert all(pins[namespace][1] < node.lineno for node in repository_imports), 'pin must precede every repository import'
+
+def run(nodes):
+    selected = {}
+    def require_version(namespace, version):
+        if namespace in selected and selected[namespace] != version:
+            raise ImportError('namespace already loaded with another version')
+        selected[namespace] = version
+    gi = types.SimpleNamespace(require_version=require_version)
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == 'gi':
+            return gi
+        assert name == 'gi.repository' and level == 0, 'only mocked GI imports permitted'
+        for namespace in fromlist:
+            if namespace == 'Gdk':
+                selected.setdefault('Gdk', '4.0')  # GTK3+GTK4 host default
+            if namespace == 'Gtk':
+                require_version('Gdk', selected['Gtk'])
+        return types.SimpleNamespace(**{namespace: object() for namespace in fromlist})
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), '<mocked-gi-preamble>', 'exec'),
+         {'__builtins__': {**vars(builtins), '__import__': fake_import}})
+    assert selected['Gtk'] == selected['Gdk'] == '3.0'
+
+run(preamble)
+# Prove the mock catches the actual regression, not just the happy path.
+without_gdk_pin = [node for node in preamble if node.lineno != pins['Gdk'][1]]
+try:
+    run(without_gdk_pin)
+except ImportError:
+    pass
+else:
+    raise AssertionError('missing Gdk3 pin must fail on simulated GTK4 host')
+"#;
+    let mut child = Command::new("python3")
+        .args(["-I", "-c", regression])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Python AST/mock regression interpreter");
+    std::io::Write::write_all(
+        &mut child.stdin.take().unwrap(),
+        include_bytes!("support/dual_display_fixture.py"),
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "GI preamble regression: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn ipc(topic: &str) -> Value {
     dual_display_guard::query(topic).expect("bounded independent Hyprland observation")
 }
