@@ -19,6 +19,44 @@ use dual_display_guard::{phase, OwnedDesktop};
 
 const SESSION: &str = "hyprland-dual-display";
 
+#[tokio::test]
+async fn default_session_allows_mixed_modalities_but_legacy_desktop_stays_strict() {
+    use cua_driver_core::capture_scope::{enforce_tool, get_session};
+    use cua_driver_core::session_tools::{EndSessionTool, StartSessionTool};
+    use cua_driver_core::tool::Tool;
+
+    // In-memory lifecycle/scope checks only; no Driver, platform hooks or input.
+    let modern = format!("dual-display-modern-policy-{}", std::process::id());
+    let legacy = format!("dual-display-legacy-policy-{}", std::process::id());
+    for (session, args) in [
+        (&modern, json!({"session": modern})),
+        (
+            &legacy,
+            json!({"session": legacy, "capture_scope": "desktop"}),
+        ),
+    ] {
+        let started = StartSessionTool.invoke(args).await;
+        assert_ne!(started.is_error, Some(true));
+        assert!(enforce_tool("get_desktop_state", &json!({"session": session})).is_ok());
+        let held = json!({"session": session, "pid": 42, "window_id": 7, "coordinate_frame": "desktop", "x": 100, "y": 720});
+        if session == &modern {
+            assert!(
+                get_session(session).is_none(),
+                "default start must not bind deprecated capture policy"
+            );
+            assert!(enforce_tool("mouse_button_down", &held).is_ok());
+            assert!(enforce_tool("get_window_state", &held).is_ok());
+        } else {
+            assert_eq!(
+                enforce_tool("mouse_button_down", &held).unwrap_err().code,
+                "window_scope_disabled"
+            );
+        }
+        let ended = EndSessionTool.invoke(json!({"session": session})).await;
+        assert_ne!(ended.is_error, Some(true));
+    }
+}
+
 #[test]
 fn fixture_pins_gtk_and_gdk3_before_repository_imports() {
     // Parse the fixture, but execute ONLY its GI preamble using a fake importer.
@@ -775,11 +813,7 @@ fn setup() -> (OwnedDesktop, tempfile::TempDir, Fixture, Fixture) {
         .tempdir()
         .unwrap();
     let mut driver = OwnedDesktop::new();
-    call(
-        &mut driver,
-        "start_session",
-        json!({"capture_scope": "desktop"}),
-    );
+    call(&mut driver, "start_session", json!({}));
     let left = launch(&mut driver, dir.path(), "DP-2", 0.0);
     let right = launch(&mut driver, dir.path(), "DP-1", 2560.0);
     phase();
