@@ -123,18 +123,65 @@ fn client_snapshot(clients: &Value) -> Result<BTreeMap<String, Value>, String> {
         let address = c["address"]
             .as_str()
             .ok_or_else(|| "missing client address".to_owned())?;
-        // An inactive managed X11 client can legitimately advertise PID 0.
-        // Workspace/pinning proves non-visibility; preserve that value rather
-        // than rejecting an ordinary inactive client for missing X11 PID hints.
-        need(c["pid"].as_u64().is_some(), "missing client PID field")?;
-        // Preserve all reported client fields except the two documented focus
-        // bookkeeping fields. Never print these private snapshots in diagnostics.
-        let mut stable = c.clone();
-        let object = stable
-            .as_object_mut()
-            .ok_or_else(|| "invalid client record".to_owned())?;
-        object.remove("focusHistoryID");
-        object.remove("fullscreenClient");
+        need(!address.is_empty(), "unknown client address")?;
+        // PID 0/-1 is legitimate for non-own inactive X11/unmapping clients.
+        // Own fixture binding still requires the actual positive child PID.
+        for key in ["pid", "monitor", "fullscreen"] {
+            need(
+                c[key].as_i64().is_some(),
+                "missing/unknown signed identity field",
+            )?;
+        }
+        for key in ["floating", "pinned", "mapped", "hidden", "xwayland"] {
+            need(c[key].is_boolean(), "missing/unknown safety boolean")?;
+        }
+        need(c["class"].is_string(), "missing/unknown client class")?;
+        need(
+            c["workspace"]["id"].as_i64().is_some() && c["workspace"]["name"].is_string(),
+            "missing/unknown workspace identity",
+        )?;
+        for key in ["at", "size"] {
+            need(
+                c[key]
+                    .as_array()
+                    .is_some_and(|a| a.len() == 2 && a.iter().all(|n| n.as_i64().is_some())),
+                "missing/unknown placement vector",
+            )?;
+        }
+        need(
+            c["grouped"]
+                .as_array()
+                .is_some_and(|a| a.iter().all(Value::is_string))
+                && c["swallowing"].is_string(),
+            "missing/unknown grouping/swallowing identity",
+        )?;
+        // Placement/identity only: background titles, tags, idle inhibition,
+        // content types and descriptions are not input-isolation evidence.
+        // Never retain/dump those user-content fields in preservation snapshots.
+        let mut object = serde_json::Map::new();
+        for key in [
+            "address",
+            "pid",
+            "class",
+            "monitor",
+            "at",
+            "size",
+            "floating",
+            "pinned",
+            "fullscreen",
+            "mapped",
+            "hidden",
+            "xwayland",
+            "grouped",
+            "swallowing",
+        ] {
+            object.insert(key.to_owned(), c[key].clone());
+        }
+        object.insert(
+            "workspace".into(),
+            json!({"id":c["workspace"]["id"],"name":c["workspace"]["name"]}),
+        );
+        let stable = Value::Object(object);
         need(
             snapshot.insert(address.to_owned(), stable).is_none(),
             "duplicate client address",
@@ -390,7 +437,7 @@ mod tests {
         {"name":"DP-1","id":1,"activeWorkspace":{"id":92},"specialWorkspace":{"id":0}}])
     }
     fn client() -> Value {
-        json!({"address":"0x123","pid":123,"workspace":{"id":1},"monitor":0,"mapped":true,"hidden":false,"visible":true,"pinned":false,"xwayland":false,"fullscreen":2,"at":[10,20],"size":[600,500]})
+        json!({"address":"0x123","pid":123,"class":"user-app","workspace":{"id":1,"name":"1"},"monitor":0,"mapped":true,"hidden":false,"visible":true,"floating":false,"pinned":false,"xwayland":false,"fullscreen":2,"at":[10,20],"size":[600,500],"grouped":[],"swallowing":"0x0"})
     }
     #[test]
     fn ordinary_mapped_inactive_hidden_false_is_allowed() {
@@ -410,6 +457,8 @@ mod tests {
         c["xwayland"] = json!(true);
         c["pid"] = json!(0);
         inactive_managed(&c, [0, 1]).unwrap();
+        client_snapshot(&json!([c.clone()])).unwrap();
+        c["pid"] = json!(-1);
         client_snapshot(&json!([c.clone()])).unwrap();
         c["workspace"]["id"] = json!(-98);
         inactive_managed(&c, [0, 1]).unwrap();
@@ -488,6 +537,123 @@ mod tests {
         assert!(context
             .validate(&monitors(), &json!([client(), new]), true)
             .is_err());
+    }
+    #[test]
+    fn background_title_and_metadata_changes_preserve_stable_projection() {
+        let mut old = client();
+        old["title"] = json!("old private title");
+        old["inhibitingIdle"] = json!(false);
+        let clients = json!([old.clone()]);
+        let context = Context {
+            before: client_snapshot(&clients).unwrap(),
+            ids: [0, 1],
+            bindings: vec![],
+        };
+        let mut changed = old;
+        for key in [
+            "title",
+            "initialTitle",
+            "contentType",
+            "xdgTag",
+            "xdgDescription",
+            "tearingHint",
+            "tags",
+        ] {
+            changed[key] = json!("independent background metadata update");
+        }
+        changed["inhibitingIdle"] = json!(true);
+        changed["focusHistoryID"] = json!(99);
+        changed["fullscreenClient"] = json!(1);
+        context
+            .validate(&monitors(), &json!([changed.clone()]), true)
+            .unwrap();
+        let projection = client_snapshot(&json!([changed])).unwrap();
+        for key in [
+            "title",
+            "initialTitle",
+            "inhibitingIdle",
+            "contentType",
+            "xdgTag",
+            "xdgDescription",
+            "tearingHint",
+            "tags",
+        ] {
+            assert!(projection["0x123"].get(key).is_none());
+        }
+    }
+    #[test]
+    fn stable_identity_placement_pinning_and_grouping_changes_are_refused() {
+        let context = Context {
+            before: client_snapshot(&json!([client()])).unwrap(),
+            ids: [0, 1],
+            bindings: vec![],
+        };
+        for (key, value) in [
+            ("pid", json!(-1)),
+            ("class", json!("different-owner")),
+            ("at", json!([11, 20])),
+            ("size", json!([601, 500])),
+            ("floating", json!(true)),
+            ("monitor", json!(1)),
+            ("pinned", json!(true)),
+            ("fullscreen", json!(0)),
+            ("mapped", json!(false)),
+            ("hidden", json!(true)),
+            ("xwayland", json!(true)),
+            ("grouped", json!(["0x456"])),
+            ("swallowing", json!("0x456")),
+        ] {
+            let mut changed = client();
+            changed[key] = value;
+            assert!(
+                context
+                    .validate(&monitors(), &json!([changed]), true)
+                    .is_err(),
+                "stable projection changed: {key}"
+            );
+        }
+        for (key, value) in [("id", json!(2)), ("name", json!("renamed"))] {
+            let mut changed = client();
+            changed["workspace"][key] = value;
+            assert!(context
+                .validate(&monitors(), &json!([changed]), true)
+                .is_err());
+        }
+    }
+    #[test]
+    fn missing_or_unknown_mandatory_projection_fields_fail_closed() {
+        for key in [
+            "address",
+            "pid",
+            "class",
+            "workspace",
+            "monitor",
+            "at",
+            "size",
+            "floating",
+            "pinned",
+            "fullscreen",
+            "mapped",
+            "hidden",
+            "xwayland",
+            "grouped",
+            "swallowing",
+        ] {
+            let mut missing = client();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                client_snapshot(&json!([missing])).is_err(),
+                "mandatory field: {key}"
+            );
+            let mut unknown = client();
+            unknown[key] = Value::Null;
+            assert!(client_snapshot(&json!([unknown])).is_err());
+        }
+        for key in ["id", "name"] {
+            let mut missing = client();
+            missing["workspace"].as_object_mut().unwrap().remove(key);
+            assert!(client_snapshot(&json!([missing])).is_err());
+        }
     }
     #[test]
     fn overlay_layers_fail_closed() {

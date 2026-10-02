@@ -535,7 +535,7 @@ fn held_button_row(driver: &mut OwnedDesktop, target: &Fixture) {
     let up = down.clone();
     // Arm before dispatch because an error/transport loss may have an unknown
     // effect. Cleanup is ONLY an owned-target release, never input replay.
-    driver.release = Some(json!({"session":session,"pid":target.pid,"window_id":target.wid}));
+    driver.release = Some(owned_release_args(session, target.pid, target.wid));
     let down_response = driver.call("mouse_button_down", down);
     let up_response = driver.call("mouse_button_up", up);
     eprintln!(
@@ -556,6 +556,50 @@ fn held_button_row(driver: &mut OwnedDesktop, target: &Fixture) {
     wait_event(target, before, "button-release", 100.0, 1100.0);
     pointer(driver, 2660.0, 1100.0);
     driver.release = None;
+}
+
+fn qualified_hyprland_version(raw: &str) -> bool {
+    let raw = raw.trim();
+    let raw = raw.strip_prefix('v').unwrap_or(raw);
+    let Some(suffix) = raw.strip_prefix("0.56.2") else {
+        return false;
+    };
+    if suffix.is_empty() {
+        return true;
+    }
+    // Exact major/minor/patch only, with well-formed semver package/commit
+    // suffixes. Never mistake 0.56.20, a fourth component or a new ABI for 0.56.2.
+    fn identifiers(value: &str, prerelease: bool) -> bool {
+        !value.is_empty()
+            && value.split('.').all(|part| {
+                !part.is_empty()
+                    && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                    && !(prerelease
+                        && part.len() > 1
+                        && part.starts_with('0')
+                        && part.bytes().all(|b| b.is_ascii_digit()))
+            })
+    }
+    if let Some(build) = suffix.strip_prefix('+') {
+        return identifiers(build, false);
+    }
+    if let Some(rest) = suffix.strip_prefix('-') {
+        let (pre, build) = rest
+            .split_once('+')
+            .map_or((rest, None), |(pre, build)| (pre, Some(build)));
+        return identifiers(pre, true) && build.is_none_or(|build| identifiers(build, false));
+    }
+    false
+}
+
+fn owned_release_args(session: &str, pid: u32, window_id: u64) -> Value {
+    assert!(
+        pid > 0 && window_id > 0,
+        "cleanup must identify an owned fixture"
+    );
+    // Frozen-base descriptor permits coordinate-less up; its coordinate helper
+    // returns the stored hold point and the Wayland release emits no motion.
+    json!({"session":session,"pid":pid,"window_id":window_id})
 }
 
 fn native_preflight() {
@@ -584,10 +628,15 @@ fn native_preflight() {
         40
     );
     qualify_layout(&ipc("monitors"));
-    assert_eq!(ipc("version")["version"],"0.56.2","workspace-based unmanaged authority is qualified for Hyprland 0.56.2; re-review before changing this precondition");
+    let version = ipc("version");
+    assert!(qualified_hyprland_version(version["version"].as_str().unwrap_or("")),"workspace-based unmanaged authority requires qualified Hyprland 0.56.2 semantics; version suffixes do not authorize a new ABI");
+    println!(
+        "[dual-display-version] version={} tag={} commit={}",
+        version["version"], version["tag"], version["commit"]
+    );
     println!(
         "[dual-display] hyprland_version={} source_sha={} oracles={:?}",
-        ipc("version"),
+        version,
         std::env::var("CUA_E2E_SOURCE_SHA").unwrap(),
         [
             OracleKind::FixtureState,
@@ -875,6 +924,61 @@ fn home_layout_preflight_rejects_same_size_swapped_outputs() {
     swapped[0]["x"] = json!(2560);
     swapped[1]["x"] = json!(0);
     assert!(std::panic::catch_unwind(|| qualify_layout(&swapped)).is_err());
+}
+
+#[test]
+fn qualified_version_accepts_suffix_formats_but_never_another_abi() {
+    for version in [
+        "0.56.2",
+        "v0.56.2",
+        "0.56.2-3",
+        "v0.56.2-dirty",
+        "0.56.2-123-gabcdef",
+        "0.56.2+arch.3",
+        "v0.56.2-3+gabcdef",
+    ] {
+        assert!(
+            qualified_hyprland_version(version),
+            "qualified format: {version}"
+        );
+    }
+    for version in [
+        "0.56.20",
+        "v0.56.3",
+        "0.57.2",
+        "1.56.2",
+        "0.056.2",
+        "vv0.56.2",
+        "0.56.2.1",
+        "0.56.2-",
+        "0.56.2+",
+        "0.56.2-01",
+        "0.56.2garbage",
+        "0.56.2-dirty/modified",
+        "0.56.2+build+more",
+        "",
+    ] {
+        assert!(
+            !qualified_hyprland_version(version),
+            "unqualified/ambiguous format: {version}"
+        );
+    }
+}
+
+#[test]
+fn owned_cleanup_release_has_no_coordinates_or_new_motion_fields() {
+    let args = owned_release_args("owned", 42, 0x123);
+    assert_eq!(args, json!({"session":"owned","pid":42,"window_id":0x123}));
+    for key in [
+        "x",
+        "y",
+        "coordinate_frame",
+        "scope",
+        "from_zoom",
+        "capture_id",
+    ] {
+        assert!(args.get(key).is_none());
+    }
 }
 
 #[test]

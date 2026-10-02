@@ -175,7 +175,10 @@ The workspace predicate is qualified against Hyprland 0.56.2: unmanaged
 XWayland surfaces are assigned a workspace on map/configure, so active-workspace
 membership catches them without inventing an `overrideRedirect` JSON field.
 Missing/ambiguous workspace or monitor identity fails closed. Re-review this
-guarantee before changing the compositor-version precondition.
+guarantee before changing the compositor-version precondition. Version parsing
+allows an optional `v` prefix and well-formed package/commit semver suffixes;
+the numeric major/minor/patch must still be exactly `0.56.2`. Version, tag and
+commit are logged; a suffix never authorizes a new ABI.
 
 The **separate foreground-plugin row** additionally requires an already
 configured/attested candidate native foreground route and
@@ -206,6 +209,11 @@ Later, on the already prepared 91/92 workspaces, build the Driver from
 the integrated stable candidate, record the checkout SHA and binary hash, and
 run explicitly (absolute binary path, replace the SHA/path below):
 
+**Safety stop:** do not run either native row until the product's P0-A
+stuck-primary-button/release-before-device-destruction fix is cleared by the
+parent/reviewers. Test cleanup cannot repair that product failure. The commands
+below are for the cleared candidate only; compilation implies no native run.
+
 ```bash
 env -u DISPLAY CUA_TEST_DUAL_DISPLAY_PREPARED=1 \
   CUA_DRIVER_RS_ENABLE_WAYLAND=1 CUA_E2E_UNRESTRICTED_GUI=1 \
@@ -226,7 +234,8 @@ Before and after every capture/action boundary, the guard reads **monitors →
 clients/workspaces → monitors**, requiring 91/92 to stay active and no special
 workspace to appear. It verifies exact fixture PID/full-address/workspace/output
 and bounds, expected workspace window counts, no foreign active/pinned clients,
-and every pre-existing client's private snapshot unchanged. Inactive clients
+and every pre-existing client's private **placement/identity projection**
+unchanged. Inactive clients
 are not misclassified by `hidden` or `visible`. Overlay-layer checks repeat at
 these boundaries. This is fail-closed observation, not an atomic compositor
 transaction; no concurrent agent/human input is allowed.
@@ -267,11 +276,21 @@ uses raw down/up responses without a panicking wrapper/check between them, and
 attempts an owned-target release on failure/unwind before reaping the Driver.
 An explicit owned release is the only permitted cleanup retry; no input action
 is replayed. Actual release events must still pass the external oracle.
+Cleanup omits x/y: the frozen-base descriptor permits coordinate-less up, its
+coordinate helper uses the stored hold point, and the Wayland release path
+emits release/frame without primary-pointer motion. Re-verify on the integrated
+P0-A-fixed candidate; descriptor acceptance is not native release qualification.
 
 The testkit reaper terminates only the two fixture processes on success or
 failure. Afterwards, including during assertion unwind, the guard verifies
-all pre-existing clients unchanged (all client fields except volatile
-`focusHistoryID`/`fullscreenClient`) and active workspaces still 91/92, with the
+all pre-existing clients' stable placement/identity unchanged: address, signed
+PID, class, workspace id/name, monitor, at, size, floating, pinned, fullscreen,
+mapped, hidden, xwayland, grouped and swallowing. Missing/unknown mandatory
+safety fields fail closed. Background title, idle inhibition, content-type,
+tag/description, tearing-hint and rule-tag updates are not preservation failures
+and are not retained/dumped in snapshots. PID 0/−1 on non-own inactive clients
+is allowed and preserved; fixture PIDs still match their positive owned child
+PID. Active workspaces must remain 91/92, with the
 fixtures gone and workspace window counts zero. Failure cannot become a pass;
 an unwind cleanup failure emits a clear parent-restoration warning.
 Private temporary fixture journals/screenshots are removed by RAII;
@@ -292,6 +311,12 @@ process was forcibly terminated.
    client snapshots. Ensure 91/92 are unused/empty and on the intended outputs;
    if occupied, stop rather than moving/closing user apps. Record notification
    suppression state before changing it, if needed.
+   Check mapped overlay surfaces from the installed Driver, OSD (e.g. SwayOSD),
+   notifications (e.g. Mako) and recording indicators. Suppress only an owned,
+   explicitly authorized overlay/OSD/notification instance or use its approved
+   temporary hide/DND control; record its exact prior state and restore it after
+   the run. Never globally kill daemons or stop an unowned instance to pass the
+   guard. If ownership/suppression cannot be established, stop preparation.
 2. Using the parent's verified native workspace controls, focus DP-2 and select
    91, then DP-1 and select 92. Close only special-workspace *visibility*, if
    authorized, never its app windows. Confirm the read-only prerequisites above.
@@ -301,6 +326,8 @@ process was forcibly terminated.
 4. Inspect cleanup output even after failure. Verify the parent's client snapshot
    and monitor layout, restore the recorded active workspaces on each original
    monitor, then restore special-workspace visibility and notification state.
+   Restore any explicitly owned suppressed overlay/OSD instance to its recorded
+   state; do not restart an unrelated service that was not changed for this run.
    If preservation verification failed, inspect first; never blindly close,
    relocate or recreate user clients to force a match.
 
@@ -319,6 +346,9 @@ without reconfiguring the desktop; cover typed stale-frame/non-replay behavior
 at the common capture/topology owner and perform native transition proof only
 in a separately authorized disposable session. This row also does not attest
 binary/source identity merely because `CUA_E2E_SOURCE_SHA` was supplied.
+New/disappeared user windows or genuine placement/grouping changes still fail
+closed, including background dialogs on inactive workspaces; that is a known
+concurrent-activity failure source, not proof that the Driver disturbed them.
 
 ## Repository Map
 
