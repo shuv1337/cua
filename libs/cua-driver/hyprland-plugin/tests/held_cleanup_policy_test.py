@@ -4,6 +4,7 @@ No independent cleanup algorithm: the production method is extracted verbatim.
 This proves resource selection/order/refusal, not native Wayland delivery.
 """
 import os
+import json
 from pathlib import Path
 import re
 import shlex
@@ -21,6 +22,10 @@ class HeldCleanupPolicyTests(unittest.TestCase):
         match=re.search(r'^static void\nhandle_array\(.*?^}',source,re.M|re.S)
         self.assertIsNotNone(match)
         fixture=(ROOT/'tests/held_logger_queue_fault_fixture.cpp').read_text().replace('// PRODUCTION_HANDLE_ARRAY',match.group())
+        product=(ROOT/'src/input_experiment.cpp').read_text()
+        cleanup=re.search(r'^    void cleanup_held\(\).*?^    }',product,re.M|re.S)
+        self.assertIsNotNone(cleanup)
+        fixture=fixture.replace('// PRODUCTION_INDEPENDENT_CLEANUP',cleanup.group())
         flags=shlex.split(subprocess.check_output(['pkg-config','--cflags','--libs','wayland-server'],text=True))
         compiler=shlex.split(os.environ.get('CXX','')) or [shutil.which('clang++-18') or shutil.which('clang++') or 'c++']
         with tempfile.TemporaryDirectory(prefix='cua-held-queue-fault-') as directory:
@@ -34,11 +39,14 @@ class HeldCleanupPolicyTests(unittest.TestCase):
         source=(ROOT / 'src/input_experiment.cpp').read_text()
         methods=[]
         for name in ['stop_held_logger','detach_held_watchers','held_resource_destroyed','observed_cleanup',
-                     'retain_foreground_debt','foreground_cleanup_pending','held_cleanup_pending','held_event','capture_held_pointers','foreground_button','cleanup_held','held_retired_reply','native_held_phase_live']:
+                     'retain_foreground_debt','foreground_cleanup_pending','foreground_cleanup_debt','held_status_fields','held_cleanup_pending','held_event','capture_held_pointers','foreground_button','cleanup_held','held_retired_reply','native_held_phase_live']:
             match=re.search(r'^    (?:static )?(?:void|bool|std::string) '+name+r'\(.*?^    }',source,re.M|re.S)
             self.assertIsNotNone(match,name)
             methods.append(match.group())
         fixture=(ROOT / 'tests/held_pointer_journal_fixture.cpp').read_text().replace('// PRODUCTION_OBSERVER','\n'.join(methods))
+        move=re.search(r'^            if \(!held_source\(c, f\[2\]\).*?^            }',source,re.M|re.S)
+        self.assertIsNotNone(move)
+        fixture=fixture.replace('// PRODUCTION_MOVE_RETIRE_BRANCH',move.group())
         flags=shlex.split(subprocess.check_output(['pkg-config','--cflags','--libs','wayland-server'],text=True))
         compiler=shlex.split(os.environ.get('CXX','')) or [shutil.which('clang++-18') or shutil.which('clang++') or 'c++']
         with tempfile.TemporaryDirectory(prefix='cua-held-observer-') as directory:
@@ -47,6 +55,23 @@ class HeldCleanupPolicyTests(unittest.TestCase):
             self.assertEqual(build.returncode,0,build.stdout+build.stderr)
             result=subprocess.run([str(binary)],capture_output=True,text=True,timeout=10)
             self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+
+            statuses={name:json.loads(body) for name,body in re.findall(r'^STATUS (\w+) (\{.*\})$',result.stdout,re.M)}
+            self.assertEqual(set(statuses),{'unavailable','ready','foreground_debt','independent_debt'})
+            for name,status in statuses.items():
+                for field in ['held_cleanup_unconfirmed','foreground_cleanup_pending','held_observer','held_foreground']:
+                    self.assertIs(type(status[field]),bool,(name,field))
+                self.assertEqual(status['source_guard_version'],1)
+                self.assertEqual(status['held_phase_version'],int(name!='unavailable'))
+            self.assertFalse(statuses['unavailable']['held_observer'])
+            self.assertFalse(statuses['unavailable']['held_foreground'])
+            self.assertTrue(statuses['ready']['held_foreground'])
+            self.assertTrue(statuses['foreground_debt']['foreground_cleanup_pending'])
+            self.assertFalse(statuses['foreground_debt']['held_cleanup_unconfirmed'])
+            self.assertFalse(statuses['foreground_debt']['held_foreground'])
+            self.assertTrue(statuses['independent_debt']['held_cleanup_unconfirmed'])
+            self.assertFalse(statuses['independent_debt']['foreground_cleanup_pending'])
+            self.assertTrue(statuses['independent_debt']['held_foreground'])
 
     @unittest.skipUnless(os.environ.get('CUA_HYPRLAND_SOURCE'), 'matching Hyprland source required for native-resource policy extraction')
     def test_foreground_original_surface_release_before_leave(self):

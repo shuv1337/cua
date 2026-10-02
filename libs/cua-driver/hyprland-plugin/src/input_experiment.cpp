@@ -195,6 +195,7 @@ struct InputExperiment::Impl {
         WP<CWLSurfaceResource> root;
         std::uint32_t button;
         bool effects = false;
+        bool press_attempted = false;
         std::vector<SP<CWlPointer>> independent;
         std::vector<WP<CWLPointerResource>> foreground;
         struct ObservedPointer {
@@ -585,10 +586,9 @@ struct InputExperiment::Impl {
             held->root == c.surface && native_held_phase_live() && held->phase.permits(reinterpret_cast<std::uintptr_t>(&c), handle, witness(c), Clock::now());
     }
     bool native_held_phase_live() const {
-        return held && (held->client->route != InputRoute::primary_foreground ||
-            !std::ranges::any_of(held->observed, [](const auto& p) {
+        return held && !std::ranges::any_of(held->observed, [](const auto& p) {
                 return p.destroyed || p.journal.left || p.journal.release_seen || p.journal.invalid;
-            }));
+            });
     }
     void stop_held_logger() {
         if (held_logger) wl_protocol_logger_destroy(held_logger);
@@ -628,7 +628,16 @@ struct InputExperiment::Impl {
             detach_held_watchers(foreground_debt);
             foreground_debt.reset();
         }
-        return foreground_debt.has_value();
+        return foreground_cleanup_debt();
+    }
+    bool foreground_cleanup_debt() const {
+        return (foreground_debt && !foreground_debt->phase.cleanup_confirmed) ||
+            (held && held->client && held->client->route == InputRoute::primary_foreground && held->phase.retired && !held->phase.cleanup_confirmed);
+    }
+    std::string held_status_fields() const {
+        return std::format(R"("held_cleanup_unconfirmed":{},"foreground_cleanup_pending":{},"held_observer":{},"source_guard_version":{},"held_phase_version":{},"held_foreground":{})",
+            held_cleanup_unconfirmed, foreground_cleanup_debt(), held_logger != nullptr, kProduction ? 1 : 0,
+            kProduction && held_logger ? 1 : 0, kProduction && held_logger && !foreground_cleanup_debt());
     }
     bool held_cleanup_pending(InputRoute route) {
         return route == InputRoute::primary_foreground ? foreground_cleanup_pending() : held_cleanup_unconfirmed;
@@ -659,7 +668,10 @@ struct InputExperiment::Impl {
                     PROTO::data && PROTO::data->dndActive()) observed.dnd_withheld = true;
                 // Retirement never reopens admission. A later exact native
                 // event can only upgrade its separately observed cleanup fact.
-                if (value->phase.retired && observed_cleanup(*value)) value->phase.cleanup_confirmed = true;
+                if (value->phase.retired && observed_cleanup(*value)) {
+                    value->phase.cleanup_confirmed = true;
+                    if (value->client && value->client->route == InputRoute::independent) self.held_cleanup_unconfirmed = false;
+                }
                 return;
             }
         };
@@ -667,6 +679,22 @@ struct InputExperiment::Impl {
     }
     bool capture_held_pointers() {
         if (!held_logger || !held) return false;
+        if (held->client->route == InputRoute::independent) {
+            if (held->independent.empty() || held->independent.size() > kMaxResources) return false;
+            held->observed.reserve(held->independent.size());
+            for (const auto& p : held->independent) {
+                if (!p || !p->resource() || p->version() < 5) return false;
+                held->observed.push_back({{}, p->resource(), HeldPointerJournal{.button = held->button}, false, false, {}});
+            }
+            // All entries are allocated before installing address-pinning
+            // listeners. These are positively known plugin-owned raw proxies.
+            for (auto& observed : held->observed) {
+                observed.watch.record = &observed;
+                observed.watch.listener.notify = held_resource_destroyed;
+                wl_resource_add_destroy_listener(observed.resource, &observed.watch.listener);
+            }
+            return true;
+        }
         if (held->foreground.empty() || held->foreground.size() > kMaxResources) return false;
         held->observed.reserve(held->foreground.size());
         for (const auto& weak : held->foreground) {
@@ -682,7 +710,7 @@ struct InputExperiment::Impl {
         const auto root = held->root.lock();
         // The captured proxy set is the device. Never discover new resources
         // during cleanup and never release a button to a successor focus.
-        if (held_button) {
+        if (held->press_attempted) {
             if (held->client->route == InputRoute::primary_foreground) {
                 confirmed = held_logger && !held->observed.empty();
                 for (auto& observed : held->observed) {
@@ -699,10 +727,18 @@ struct InputExperiment::Impl {
                     p->sendFrame(); p->sendFrame();
                     if (!observed.journal.cleaned()) confirmed = false;
                 }
-            } else for (const auto& p : held->independent) {
-                if (!p || !p->resource()) { confirmed = false; continue; }
-                p->sendButton(serial(), event_ms(), held->button, WL_POINTER_BUTTON_STATE_RELEASED);
-                if (p->version() >= 5) p->sendFrame();
+            } else {
+                confirmed = held_logger && !held->observed.empty() && held->observed.size() == held->independent.size();
+                for (std::size_t i = 0; i < held->observed.size(); ++i) {
+                    auto& observed = held->observed[i];
+                    if (observed.journal.cleaned()) continue;
+                    const auto p = i < held->independent.size() ? held->independent[i] : nullptr;
+                    if (!p || observed.destroyed || p->resource() != observed.resource) { confirmed = false; continue; }
+                    if (!observed.journal.release_seen)
+                        p->sendButton(serial(), event_ms(), held->button, WL_POINTER_BUTTON_STATE_RELEASED);
+                    p->sendFrame(); p->sendFrame();
+                    if (!observed.journal.cleaned()) confirmed = false;
+                }
             }
         }
         held_button = 0;
@@ -1264,7 +1300,7 @@ struct InputExperiment::Impl {
             if (f.size() != 1 || c.hello) { send(c, refusal("invalid_request")); return; }
             c.hello = true;
             if (kProduction)
-                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"source_guard_version":1,"held_phase_version":1,"held_foreground":{}}})", epoch, held_logger && !foreground_cleanup_pending()));
+                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"source_guard_version":1,"held_phase_version":{},"held_foreground":{}}})", epoch, held_logger ? 1 : 0, held_logger && !foreground_cleanup_pending()));
             else
                 send(c, std::format(R"({{"ok":true,"protocol":0,"epoch":"{}","challenge":"{}"}})", epoch, c.challenge));
             return;
@@ -1494,7 +1530,8 @@ struct InputExperiment::Impl {
             }
             if (!held_source(c, f[2]) || !packet_witness(c, f) || !available() ||
                 !input_layout_qualified(c.route, false, layout_qualified()) || primary_conflict(c) || agent_conflict(c)) {
-                revoke("held_source_changed", true); send(c, refusal("held_partial_unknown")); return;
+                revoke("held_source_changed", true);
+                send(c, held ? held_retired_reply(sequence) : refusal("held_partial_unknown")); return;
             }
             const auto x = real(f[12]), y = real(f[13]);
             if (!point(c, x, y)) { revoke("invalid_request", true); send(c, refusal("held_partial_unknown")); return; }
@@ -1528,9 +1565,9 @@ struct InputExperiment::Impl {
         }
         const auto x = real(f[12]), y = real(f[13]); const auto code = number(f[14]);
         if (!point(c, x, y) || code < 272 || code > 274) { send(c, refusal("invalid_request")); return; }
-        if (c.route == InputRoute::primary_foreground && !held_logger) { send(c, refusal("held_observer_unavailable")); return; }
+        if (!held_logger) { send(c, refusal("held_observer_unavailable")); return; }
         if (!consume_grant(c, 8)) return;
-        held.emplace(Held{&c, HeldPhase{reinterpret_cast<std::uintptr_t>(&c), nonce(), witness(c), expires}, c.surface, static_cast<std::uint32_t>(code), false, {}, {}, {}});
+        held.emplace(Held{&c, HeldPhase{reinterpret_cast<std::uintptr_t>(&c), nonce(), witness(c), expires}, c.surface, static_cast<std::uint32_t>(code), false, false, {}, {}, {}});
         held->effects = true; // activation/enter/motion are effects before press
         if (c.route == InputRoute::primary_foreground) {
             start_foreground(c, x, y, true, false, {});
@@ -1539,12 +1576,16 @@ struct InputExperiment::Impl {
         } else {
             if (!pointer_enter(c, x, y)) { revoke("client_not_bound", true); send(c, refusal("held_partial_unknown")); return; }
             for (const auto& p : pointers) if (!p->dead && p->wl->resource() && p->focus == c.surface) held->independent.push_back(p->wl);
+            if (!capture_held_pointers()) { revoke("held_observer_unavailable", true); send(c, refusal("held_partial_unknown")); return; }
         }
         if (!held_source(c, held->phase.handle)) { revoke("held_source_changed", true); send(c, refusal("held_partial_unknown")); return; }
+        held->press_attempted = true;
         if (c.route == InputRoute::primary_foreground) foreground_button(c, code, true);
         else button(code, true);
-        if (c.route == InputRoute::primary_foreground) {
-            for (const auto& weak : held->foreground) if (const auto p = weak.lock(); p && p->good()) p->sendFrame();
+        {
+            if (c.route == InputRoute::primary_foreground)
+                for (const auto& weak : held->foreground) { if (const auto p = weak.lock(); p && p->good()) p->sendFrame(); }
+            else for (const auto& p : held->independent) if (p && p->resource()) p->sendFrame();
             if (!std::ranges::all_of(held->observed, [](const auto& p) { return p.journal.began(); })) {
                 revoke("held_press_unconfirmed", true); send(c, refusal("held_partial_unknown")); return;
             }
@@ -1803,13 +1844,13 @@ std::string InputExperiment::status_json() const {
         if (!states.empty()) states += ',';
         const bool pointer_focus = std::ranges::any_of(lane->pointers, [](const auto& p) { return !p->dead && bool(p->focus); });
         const bool keyboard_focus = std::ranges::any_of(lane->keyboards, [](const auto& k) { return !k->dead && bool(k->focus); });
-        states += std::format(R"({{"lane":{},"epoch":"{}","desktop_generation":{},"reserved":{},"socket_cleanup":"{}","lease_active":{},"seat_resources":{},"pointer_resources":{},"keyboard_resources":{},"dispatches":{},"held_button":{},"held_keys":{},"drag_active":{},"pointer_focus":{},"keyboard_focus":{}}})",
+        states += std::format(R"({{"lane":{},"epoch":"{}","desktop_generation":{},"reserved":{},"socket_cleanup":"{}","lease_active":{},"seat_resources":{},"pointer_resources":{},"keyboard_resources":{},"dispatches":{},"held_button":{},"held_keys":{},"drag_active":{},"pointer_focus":{},"keyboard_focus":{},{}}})",
             lane->lane, lane->epoch, lane->desktop_generation, lane->reservation != nullptr, lane->socket_cleanup, lane->lease != nullptr, lane->seats.size(), lane->pointers.size(), lane->keyboards.size(), lane->dispatches,
-            lane->held_button, lane->held_keys.size(), lane->drag.has_value(), pointer_focus, keyboard_focus);
+            lane->held_button, lane->held_keys.size(), lane->drag.has_value(), pointer_focus, keyboard_focus, lane->held_status_fields());
     }
     // Aggregate legacy fields remain available to existing test probes.
-    return std::format(R"({{"protocol":{},"test_only":{},"seat_lifetime":"compositor","upgrade":"desktop_restart","transport_ready":{},"epoch":"{}","lease_active":{},"seat_resources":{},"pointer_resources":{},"keyboard_resources":{},"dispatches":{},"lanes":[{}]}})",
-        kProduction ? 3 : 0, !kProduction, !lanes_[0]->suspended && !lanes_[1]->suspended, lanes_[0]->epoch, lanes_[0]->lease != nullptr || lanes_[1]->lease != nullptr,
+    return std::format(R"({{"protocol":{},"test_only":{},"source_guard_version":{},"held_phase_version":{},"seat_lifetime":"compositor","upgrade":"desktop_restart","transport_ready":{},"epoch":"{}","lease_active":{},"seat_resources":{},"pointer_resources":{},"keyboard_resources":{},"dispatches":{},"lanes":[{}]}})",
+        kProduction ? 3 : 0, !kProduction, kProduction ? 1 : 0, kProduction && lanes_[0]->held_logger && lanes_[1]->held_logger ? 1 : 0, !lanes_[0]->suspended && !lanes_[1]->suspended, lanes_[0]->epoch, lanes_[0]->lease != nullptr || lanes_[1]->lease != nullptr,
         lanes_[0]->seats.size() + lanes_[1]->seats.size(), lanes_[0]->pointers.size() + lanes_[1]->pointers.size(),
         lanes_[0]->keyboards.size() + lanes_[1]->keyboards.size(), lanes_[0]->dispatches + lanes_[1]->dispatches, states);
 }

@@ -124,6 +124,24 @@ extracted native seat methods, and injected failures through the exact qualified
 `handle_array` body exercise this distinction; they are not compositor/application
 native delivery qualification.
 
+Independent held pointers are positively known plugin-owned `CWlPointer`
+resources, so their exact raw resource and destroy listener are retained before
+press without wrapper/userdata casts. They use the same button/frame journal
+and queue sentinels; an alive proxy or a native void send call is not confirmation.
+Observer absence disables held-phase admission on both routes, not independent
+finite input. Cleanup is gated by the hold's own press-attempt state and uses its
+original button, never the lane-global `held_button` counter. Confirmed source-
+change MOVE retirement preserves that cleanup fact in the typed retired reply;
+later UP returns the retained result without a duplicate release. Unproved DnD
+or destroyed-resource outcomes remain unconfirmed.
+
+STATUS exposes per-lane `held_cleanup_unconfirmed`, `foreground_cleanup_pending`,
+`held_observer`, `held_foreground`, `held_phase_version` and `source_guard_version`
+from live module state. Legacy fields are retained; aggregate capability versions
+are additive. These fields do not change production upgrade safety: the seat's
+lifetime remains the compositor's, unloading retires it one-way, and replacement
+requires a new desktop session, not a hotload under another path.
+
 Any module implementing it needs a newly built artifact and disposable matching-
 version compositor qualification before home distribution. Existing trusted
 profile hashes do not trust a new SO merely because its ABI version matches.

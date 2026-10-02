@@ -13221,7 +13221,7 @@ async fn actual_registry_mouse_drag_retains_two_x_cap_once_and_up_reports_owned_
     use cua_driver_core::{capture_runtime::*, tool::ToolRegistry};
     use std::os::fd::AsRawFd;
     use std::sync::atomic::AtomicUsize;
-    for completion in ["normal", "aborted", "dropped"] {
+    for completion in ["normal", "aborted", "dropped", "source_changed"] {
         let mut registry = ToolRegistry::new();
         let service = registry.capture_service();
         let state = ToolState::new_with_capture_service(service.clone());
@@ -13335,6 +13335,14 @@ async fn actual_registry_mouse_drag_retains_two_x_cap_once_and_up_reports_owned_
                 packet.ends_with(" 20.25 20.25"),
                 "retained 2x affine applied exactly once: {packet}"
             );
+            if completion == "source_changed" {
+                peer.send(json!({"ok":false,"code":"held_retired","detail":"original source changed after compositor release","effect":"partial","cleanup_confirmed":true,"sequence":2,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
+                assert!(
+                    receive().is_empty(),
+                    "confirmed retired MOVE and later UP must not repeat release/TARGET"
+                );
+                return;
+            }
             peer.send(json!({"ok":true,"phase":"held_moved","sequence":2,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
             assert_eq!(receive(), "HOLD_RELEASE 3 55555555555555555555555555555555");
             if completion != "dropped" {
@@ -13386,7 +13394,23 @@ async fn actual_registry_mouse_drag_retains_two_x_cap_once_and_up_reports_owned_
             "fixture owner {owner:?}"
         );
         let result=TEST_HELD_TOOL.scope(oracle,registry.invoke_from_trusted_adapter("mouse_drag",json!({"_session_id":owner,"pid":source.pid,"window_id":source.address,"coordinate_frame":"desktop","x":1290.25,"y":15.375,"duration_ms":0,"steps":1}))).await;
-        assert_ne!(result.is_error, Some(true), "{completion}: {result:?}");
+        assert_eq!(
+            result.is_error == Some(true),
+            completion == "source_changed",
+            "{completion}: {result:?}"
+        );
+        if completion == "source_changed" {
+            let record = result.action_record.as_ref().unwrap();
+            assert_eq!(record.cleanup_confirmed, Some(true));
+            assert_eq!(
+                record.effect,
+                cua_driver_core::action_record::ActionEffect::Partial
+            );
+            assert!(
+                handle.release(&owner, &source.binding).unwrap(),
+                "confirmed source-change MOVE must retain Released(true)"
+            );
+        }
         let result = registry
             .invoke_from_trusted_adapter("mouse_button_up", json!({"_session_id":owner}))
             .await;
@@ -13399,7 +13423,7 @@ async fn actual_registry_mouse_drag_retains_two_x_cap_once_and_up_reports_owned_
             result.structured_content.as_ref().unwrap()["cleanup_confirmed"],
             completion != "dropped"
         );
-        if completion == "aborted" {
+        if completion == "aborted" || completion == "source_changed" {
             assert_eq!(
                 result.structured_content.as_ref().unwrap()["effect"],
                 "partial"

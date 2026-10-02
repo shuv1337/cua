@@ -21,12 +21,13 @@ struct Proxy {
     std::string name;
     bool dead = false;
     HeldPointerJournal* journal = nullptr;
+    bool native = true;
     bool good() const { return live; }
-    bool resource() const { return live; }
+    const Proxy* resource() const { return live ? this : nullptr; }
     int version() const { return 5; }
-    void sendButton(unsigned, unsigned, unsigned, int) { ++buttons; events->push_back(name + ":release"); }
-    void sendButton(unsigned, unsigned code, int state) { if (!PROTO::seat->m_currentCaps) return; ++buttons; events->push_back(name + ":release"); if (journal) journal->observe(WL_POINTER_BUTTON,code,state); }
-    void sendFrame() { if (journal && !PROTO::seat->m_currentCaps) return; ++frames; events->push_back(name + ":frame"); if (journal) journal->observe(WL_POINTER_FRAME); }
+    void sendButton(unsigned, unsigned, unsigned code, int state) { ++buttons; events->push_back(name + ":release"); if (journal) journal->observe(WL_POINTER_BUTTON,code,state); }
+    void sendButton(unsigned, unsigned code, int state) { if (native && !PROTO::seat->m_currentCaps) return; ++buttons; events->push_back(name + ":release"); if (journal) journal->observe(WL_POINTER_BUTTON,code,state); }
+    void sendFrame() { if (native && journal && !PROTO::seat->m_currentCaps) return; ++frames; events->push_back(name + ":frame"); if (journal) journal->observe(WL_POINTER_FRAME); }
     ~Proxy() { events->push_back(name + ":destroy"); }
 };
 struct Client { InputRoute route; bool dead = false; };
@@ -41,8 +42,9 @@ struct Held {
     unsigned button = 272;
     std::vector<std::weak_ptr<Proxy>> foreground;
     std::vector<std::shared_ptr<Proxy>> independent;
-    struct ObservedPointer { std::weak_ptr<Proxy> owner; HeldPointerJournal journal; bool destroyed = false; };
+    struct ObservedPointer { std::weak_ptr<Proxy> owner; HeldPointerJournal journal; bool destroyed = false; const Proxy* resource = nullptr; };
     std::vector<ObservedPointer> observed = {};
+    bool press_attempted = false;
 };
 struct Owner {
     bool held_cleanup_unconfirmed = false;
@@ -76,6 +78,13 @@ struct Owner {
     // PRODUCTION_DISCONNECT_SWEEP
 };
 void check(bool condition, const char* message) { if (!condition) { std::cerr << message << '\n'; std::exit(1); } }
+void seed_owned_press(Owner& owner,const std::shared_ptr<Proxy>& proxy,bool native=false) {
+    owner.held->press_attempted=true;
+    owner.held->observed.push_back({proxy,HeldPointerJournal{.button=owner.held->button},false,proxy->resource()});
+    proxy->native=native;proxy->journal=&owner.held->observed.back().journal;
+    proxy->journal->observe(WL_POINTER_BUTTON,owner.held->button,WL_POINTER_BUTTON_STATE_PRESSED);
+    proxy->journal->observe(WL_POINTER_FRAME);proxy->journal->observe(WL_POINTER_FRAME);
+}
 int main() {
     for (bool foreground : {false, true}) {
         for (int fault = 0; fault < 6; ++fault) {
@@ -89,12 +98,7 @@ int main() {
             owner.held.emplace(Held{&client, HeldPhase{reinterpret_cast<std::uintptr_t>(&client), "handle", SourceWitness{"original-root", 7, 3, {}}, HeldPhase::Clock::now()}, root, 272, {original}, {original}});
             seat.m_state.pointerFocus = root;
             PROTO::seat->m_currentCaps = fault == 5 ? 0 : 1;
-            if (foreground) {
-                owner.held->observed.push_back({original,HeldPointerJournal{.button=272}});
-                original->journal=&owner.held->observed.front().journal;
-                original->journal->observe(WL_POINTER_BUTTON,272,WL_POINTER_BUTTON_STATE_PRESSED);
-                original->journal->observe(WL_POINTER_FRAME); original->journal->observe(WL_POINTER_FRAME);
-            }
+            seed_owned_press(owner,original,foreground);
             if (fault == 1) root->live = false;
             if (fault == 2) original->live = false;
             if (fault == 3) seat.m_state.pointerFocus = successor_root;
@@ -112,7 +116,7 @@ int main() {
             check(original->buttons == (attempted ? 1u : 0u), "duplicate cleanup release");
             owner.held.reset(); original.reset();
             if (confirmed) {
-                check(events.size() >= 3 && events[0] == "original:release" && events[1] == "original:frame" && events[foreground ? 3 : 2] == "original:destroy", "destruction preceded owned release/frame");
+                check(events.size() >= 4 && events[0] == "original:release" && events[1] == "original:frame" && events[3] == "original:destroy", "destruction preceded owned release/frame");
             }
             seat.m_state.pointerFocus.reset();
             successor.reset();
@@ -124,10 +128,11 @@ int main() {
         auto original = std::make_shared<Proxy>(true, 0, 0, &events, "original");
         Client client{InputRoute::independent}; Owner owner;
         owner.held.emplace(Held{&client, HeldPhase{reinterpret_cast<std::uintptr_t>(&client), "handle", SourceWitness{"original-root",7,3,{}}, HeldPhase::Clock::now()},root,272,{}, {original}});
+        seed_owned_press(owner,original);owner.held_button=0; // lane-global state is not the cleanup obligation
         root.reset();
         owner.revoke("source_destroyed",false);
         owner.held.reset(); original.reset();
-        check(events == std::vector<std::string>{"original:release","original:frame","original:leave","original:destroy"}, "production revoke order did not release original before leave/destruction");
+        check(events == std::vector<std::string>{"original:release","original:frame","original:frame","original:leave","original:destroy"}, "production revoke order did not release original before leave/destruction");
     }
     {
         std::vector<std::string> events;
@@ -137,12 +142,13 @@ int main() {
         owner.clients.push_back(std::make_unique<Client>(InputRoute::independent));
         owner.lease=owner.reservation=owner.clients.front().get();
         owner.held.emplace(Held{owner.lease,HeldPhase{reinterpret_cast<std::uintptr_t>(owner.lease),"handle",SourceWitness{"root",7,3,{}},HeldPhase::Clock::now()},root,272,{}, {original}});
+        seed_owned_press(owner,original);
         owner.lease->dead=true; root.reset();
         owner.disconnect_sweep();
         check(!owner.held && owner.clients.empty() && !owner.lease && !owner.reservation,"disconnect sweep retained dangling owner or handle");
-        check(original->buttons==1 && original->frames==1,"disconnect did not release original held resources before owner destruction");
+        check(original->buttons==1 && original->frames==2,"disconnect did not release original held resources before owner destruction");
         original.reset();
-        check(events==std::vector<std::string>{"original:release","original:frame","original:destroy"},"disconnect ordering mismatch");
+        check(events==std::vector<std::string>{"original:release","original:frame","original:frame","original:destroy"},"disconnect ordering mismatch");
     }
     {
         std::vector<std::string> events;
