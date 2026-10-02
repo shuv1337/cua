@@ -498,7 +498,7 @@ impl WindowSource {
             .unwrap_or_else(|error| error.into_inner());
         if slot.is_none() {
             *slot = Some(SourceAdmission {
-                capture_id: admission.capture_id.clone(),
+                capture_id: admission.capture_id,
                 target: admission.target.clone(),
             });
         }
@@ -1263,14 +1263,14 @@ pub fn cleanup_runtime(prefix: &str) {
 
 pub(crate) fn prepare_window_source(
     owner: Option<String>,
-    pid: u32,
-    address: u64,
+    target: (u32, u64),
     foreground: bool,
     frame: super::hyprland::DesktopFrame,
     binding: cua_driver_core::capture_runtime::CaptureBinding,
     requested_capture_id: Option<String>,
     cancellation: ActionCancellation,
 ) -> Result<WindowSource> {
+    let (pid, address) = target;
     ensure!(
         enabled() && protocol() == InputProtocol::Production,
         "window_source_guard_unavailable: production v3 input authority required"

@@ -341,8 +341,7 @@ impl<T: Tool> Tool for NativePointerOutcomeTool<T> {
             }
             crate::wayland::hyprland_input::prepare_window_source(
                 owner,
-                pid,
-                address,
+                (pid, address),
                 foreground,
                 frame,
                 binding,
