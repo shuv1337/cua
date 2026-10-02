@@ -13268,43 +13268,48 @@ async fn actual_registry_mouse_drag_retains_two_x_cap_once_and_up_reports_owned_
             &service,
             &owner,
         );
-        let id = service
-            .publish_in_frame(
-                CapturePublication {
-                    png_bytes: cua_driver_core::image_utils::encode_rgba_to_png(
-                        &vec![0; 1500 * 50 * 4],
-                        1500,
-                        50,
-                    )
-                    .unwrap(),
-                    target: CaptureTarget::PrimaryDesktop,
-                    encoded_dimensions: EncodedScreenshotDimensions::new(1500, 50).unwrap(),
-                    native_action_dimensions: NativeActionDimensions::new(3000, 100).unwrap(),
-                    screenshot_to_action: ScreenshotToActionTransform::new(
-                        2.0, 0.0, 0.0, 2.0, 0.0, 0.0,
-                    )
-                    .unwrap(),
-                    session_id: source.binding.session_id().into(),
-                    session_generation: source.binding.session_generation(),
-                },
-                Some(source.frame.identity.clone()),
-            )
-            .unwrap();
-        let admitted = service
-            .admit_action_in_frame(
-                CaptureActionRequest {
-                    capture_id: id,
-                    binding: source.binding.clone(),
-                    target: CaptureTarget::PrimaryDesktop,
-                    current_native_action_dimensions: NativeActionDimensions::new(3000, 100)
+        let publish = || {
+            service
+                .publish_in_frame(
+                    CapturePublication {
+                        png_bytes: cua_driver_core::image_utils::encode_rgba_to_png(
+                            &vec![0; 1500 * 50 * 4],
+                            1500,
+                            50,
+                        )
                         .unwrap(),
-                    screenshot_x: 1285.25,
-                    screenshot_y: 10.375,
-                },
-                Some(&source.frame.identity),
-            )
-            .unwrap();
-        source.retain_admission(&source.binding, &admitted);
+                        target: CaptureTarget::PrimaryDesktop,
+                        encoded_dimensions: EncodedScreenshotDimensions::new(1500, 50).unwrap(),
+                        native_action_dimensions: NativeActionDimensions::new(3000, 100).unwrap(),
+                        screenshot_to_action: ScreenshotToActionTransform::new(
+                            2.0, 0.0, 0.0, 2.0, 0.0, 0.0,
+                        )
+                        .unwrap(),
+                        session_id: source.binding.session_id().into(),
+                        session_generation: source.binding.session_generation(),
+                    },
+                    Some(source.frame.identity.clone()),
+                )
+                .unwrap()
+        };
+        let id = publish();
+        if completion != "source_changed" {
+            let admitted = service
+                .admit_action_in_frame(
+                    CaptureActionRequest {
+                        capture_id: id,
+                        binding: source.binding.clone(),
+                        target: CaptureTarget::PrimaryDesktop,
+                        current_native_action_dimensions: NativeActionDimensions::new(3000, 100)
+                            .unwrap(),
+                        screenshot_x: 1285.25,
+                        screenshot_y: 10.375,
+                    },
+                    Some(&source.frame.identity),
+                )
+                .unwrap();
+            source.retain_admission(&source.binding, &admitted);
+        }
         cua_driver_core::desktop_capture_scale::record_desktop_state_for_binding(
             &json!({"_session_id":owner}),
             Some(
@@ -13337,9 +13342,23 @@ async fn actual_registry_mouse_drag_retains_two_x_cap_once_and_up_reports_owned_
             );
             if completion == "source_changed" {
                 peer.send(json!({"ok":false,"code":"held_retired","detail":"original source changed after compositor release","effect":"partial","cleanup_confirmed":true,"sequence":2,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
+                assert!(receive().starts_with("FOREGROUND_TARGET "),"next deliberate down must reuse original connection, without RELEASE/reconnect");
+                peer.send(
+                    crate::wayland::hyprland_input::tests::guarded_target()
+                        .to_string()
+                        .as_bytes(),
+                )
+                .unwrap();
+                assert!(
+                    receive().starts_with("HOLD_BEGIN 3 "),
+                    "new begin must keep original transport sequence"
+                );
+                peer.send(json!({"ok":true,"phase":"held_started","sequence":3,"handle":"66666666666666666666666666666666"}).to_string().as_bytes()).unwrap();
+                assert_eq!(receive(), "HOLD_RELEASE 4 66666666666666666666666666666666");
+                peer.send(json!({"ok":true,"cleanup_confirmed":true,"sequence":4,"handle":"66666666666666666666666666666666"}).to_string().as_bytes()).unwrap();
                 assert!(
                     receive().is_empty(),
-                    "confirmed retired MOVE and later UP must not repeat release/TARGET"
+                    "new phase had extra release/reconnect"
                 );
                 return;
             }
@@ -13354,18 +13373,41 @@ async fn actual_registry_mouse_drag_retains_two_x_cap_once_and_up_reports_owned_
             );
         });
         let retained = source.clone();
-        let handle = tokio::task::spawn_blocking(move || {
-            crate::wayland::hyprland_input::begin_held_source(
-                retained,
-                (10.25, 10.25),
-                1,
-                true,
-                crate::wayland::hyprland_input::ActionCancellation::default(),
-            )
-        })
-        .await
-        .unwrap()
-        .unwrap();
+        let handle = if completion == "source_changed" {
+            registry.register(Box::new(MouseButtonDownTool {
+                state: state.clone(),
+            }));
+            let oracle = Arc::new(HeldToolOracle {
+                overlays: AtomicUsize::new(0),
+                arrived: tokio::sync::Notify::new(),
+                resume: tokio::sync::Notify::new(),
+            });
+            oracle.resume.notify_one();
+            let down=TEST_HELD_TOOL.scope(oracle,WINDOW_ACTION_SOURCE.scope(source.clone(),registry.invoke_from_trusted_adapter("mouse_button_down",json!({"_session_id":owner,"pid":source.pid,"window_id":source.address,"delivery_mode":"foreground","coordinate_frame":"desktop","capture_id":id.to_string(),"x":1285.25,"y":10.375})))).await;
+            assert_ne!(down.is_error, Some(true), "actual initial down: {down:?}");
+            state
+                .mouse_hold
+                .lock()
+                .unwrap()
+                .get(&owner)
+                .unwrap()
+                .guarded
+                .clone()
+                .unwrap()
+        } else {
+            tokio::task::spawn_blocking(move || {
+                crate::wayland::hyprland_input::begin_held_source(
+                    retained,
+                    (10.25, 10.25),
+                    1,
+                    true,
+                    crate::wayland::hyprland_input::ActionCancellation::default(),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap()
+        };
         state.mouse_hold.lock().unwrap().insert(
             owner.clone(),
             MouseHoldState {
@@ -13430,6 +13472,29 @@ async fn actual_registry_mouse_drag_retains_two_x_cap_once_and_up_reports_owned_
             );
         }
         assert_eq!(source.admission().unwrap().capture_id, id);
+        if completion == "source_changed" {
+            let next_id = publish();
+            let oracle = Arc::new(HeldToolOracle {
+                overlays: AtomicUsize::new(0),
+                arrived: tokio::sync::Notify::new(),
+                resume: tokio::sync::Notify::new(),
+            });
+            oracle.resume.notify_one();
+            let next=TEST_HELD_TOOL.scope(oracle,WINDOW_ACTION_SOURCE.scope(source.clone(),registry.invoke_from_trusted_adapter("mouse_button_down",json!({"_session_id":owner,"pid":source.pid,"window_id":source.address,"delivery_mode":"foreground","coordinate_frame":"desktop","capture_id":next_id.to_string(),"x":1285.25,"y":10.375})))).await;
+            assert_ne!(
+                next.is_error,
+                Some(true),
+                "next deliberate same-session down: {next:?}"
+            );
+            let up = registry
+                .invoke_from_trusted_adapter("mouse_button_up", json!({"_session_id":owner}))
+                .await;
+            assert_ne!(up.is_error, Some(true), "next phase up: {up:?}");
+            assert_eq!(
+                up.structured_content.as_ref().unwrap()["cleanup_confirmed"],
+                true
+            );
+        }
         drop(handle);
         crate::wayland::hyprland_input::tests::close_held_tool_fixture(&source);
         server.join().unwrap();

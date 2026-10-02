@@ -34,9 +34,10 @@ struct Proxy {
     }
     void sendButton(unsigned,unsigned time,unsigned code,wl_pointer_button_state state) {sendButton(time,code,state);}
     wl_resource* resource() const {return raw;}
+    void sendCapabilities(wl_seat_capability) {}
     void sendFrame() { if (!suppress_frames && version()>=5) wl_pointer_send_frame(raw); }
 };
-struct Client { InputRoute route=InputRoute::primary_foreground; };
+struct Client { InputRoute route=InputRoute::primary_foreground; std::string incarnation="fixture"; bool dead=false; };
 std::string refusal(const char* code);
 struct Held {
     Client* client;
@@ -55,14 +56,28 @@ struct Held {
     };
     std::vector<ObservedPointer> observed={};
     bool press_attempted=false;
+    InputRoute route=InputRoute::primary_foreground;
+    std::string owner_incarnation="fixture";
 };
 struct Impl {
-    std::optional<Held> held,foreground_debt;
+    std::optional<Held> held,foreground_debt,independent_debt;
     wl_protocol_logger* held_logger=nullptr;
     std::optional<std::size_t> held_press_slot;
     std::vector<std::weak_ptr<Proxy>> foreground_pointers;
     unsigned held_button=0;
     bool held_cleanup_unconfirmed=false;
+    bool drag=false;
+    bool suspended=false,retired=false;
+    Client* reservation=nullptr;
+    Client* lease=nullptr;
+    int listener=-1;
+    wl_event_source* listen_source=nullptr;
+    wl_global* global=nullptr;
+    struct Reset {void reset() {}} keymap_listener;
+    struct SeatResource {bool dead=true;std::shared_ptr<Proxy> wl;};
+    std::vector<std::unique_ptr<SeatResource>> seats;
+    std::vector<std::unique_ptr<Client>> clients;
+    void cleanup_socket() {}
     std::string reply;
     void require_foreground(Client&) {}
     unsigned event_ms() const { return 1; }
@@ -73,10 +88,26 @@ struct Impl {
     bool layout_qualified() const {return true;}
     bool primary_conflict(Client&) const {return false;}
     bool agent_conflict(Client&) const {return false;}
-    void revoke(const char* reason,bool) {held->phase.reason=reason;cleanup_held();}
+    void revoke(std::string_view reason,bool=true) {if(held)held->phase.reason=reason;cleanup_held();lease=nullptr;reservation=nullptr;}
+    void timer_owner_sweep() {
+        // PRODUCTION_TIMER_OWNER_SWEEP
+    }
     void send(Client&,std::string result) {reply=std::move(result);}
     void served_move_source_change(Client& c,const std::vector<std::string>& f,std::uint64_t sequence) {
         // PRODUCTION_MOVE_RETIRE_BRANCH
+    }
+    void served_target(Client& c,InputRoute route) {
+        // PRODUCTION_TARGET_ADMISSION
+        reply="target_admitted";
+    }
+    void served_begin(Client& c) {
+        // PRODUCTION_BEGIN_ADMISSION
+        reply="begin_admitted";
+    }
+    void served_old_release(Client& c,const std::vector<std::string>& f) {
+        const std::string command="HOLD_RELEASE";
+        // PRODUCTION_RELEASE_OWNERSHIP
+        reply="release_owned";
     }
     // PRODUCTION_OBSERVER
 };
@@ -102,9 +133,10 @@ struct World {
     }
     void begin(const std::vector<std::shared_ptr<Proxy>>& captured,InputRoute route=InputRoute::primary_foreground) {
         owner.route=route;
-        lane.held.emplace(Held{&owner,HeldPhase{1,"handle",SourceWitness{"root",1,1,{}},HeldPhase::Clock::now()},272,{},{}});
+        lane.held.emplace(Held{&owner,HeldPhase{reinterpret_cast<std::uintptr_t>(&owner),"handle",SourceWitness{"root",1,1,{}},HeldPhase::Clock::now()},272,{},{}});
         lane.foreground_pointers.clear();
         lane.held->root=root;seat.m_state.pointerFocus=root;
+        lane.held->route=route;lane.held->owner_incarnation=owner.incarnation;
         for (const auto& p:captured) {
             if(route==InputRoute::primary_foreground) {lane.foreground_pointers.push_back(p);lane.held->foreground.push_back(p);}
             else lane.held->independent.push_back(p);
@@ -119,6 +151,56 @@ struct World {
     ~World() {lane.stop_held_logger();wl_client_destroy(client);wl_display_destroy(display);close(sockets[1]);seat.m_state.pointerFocus.reset();}
 };
 int main() {
+    for(auto route:{InputRoute::primary_foreground,InputRoute::independent})
+    for(bool uncertain:{false,true}) for(bool retirement:{false,true}) {
+        World w;auto p=w.pointer();w.begin({p},route);
+        auto live=std::make_unique<Client>();live->route=route;
+        w.lane.held->client=live.get();w.lane.held->owner_incarnation=live->incarnation;
+        w.lane.lease=live.get();w.lane.reservation=live.get();
+        w.lane.clients.push_back(std::move(live));
+        if(uncertain)p->suppress_release=true;
+        if(retirement)w.lane.retire();else w.lane.suspend(); // actual clears/destroys unique_ptr owner
+        check(w.lane.clients.empty() && !w.lane.lease && !w.lane.reservation && !w.lane.held,"owner destruction retained live authority");
+        check(p->release_attempts==1,"suspend/retire original cleanup repeated/skipped");
+        auto& debt=route==InputRoute::primary_foreground ? w.lane.foreground_debt : w.lane.independent_debt;
+        check(bool(debt)==uncertain,"owner destruction erased unknown obligation or retained completed one");
+        if(debt)check(debt->client==nullptr && debt->route==route,"debt lost immutable route/retained dead client");
+        (void)w.lane.held_status_fields();w.lane.timer_owner_sweep();
+        // A failed resume follows the same suspend cleanup path, with no owner
+        // available; repeated suspension cannot repeat an original release.
+        w.lane.suspend("resume_failed");w.lane.timer_owner_sweep();
+        check(p->release_attempts==1,"partial-resume cleanup replayed release");
+        p->suppress_release=false;w.release(p); // logger after actual owner destruction (unless retired)
+        (void)w.lane.held_status_fields();w.lane.timer_owner_sweep();
+        if(uncertain && !retirement)check(debt->phase.cleanup_confirmed,"late original cleanup did not complete ownerless debt");
+        if(uncertain && retirement)check(!debt->phase.cleanup_confirmed,"unregistered retirement invented cleanup");
+        wl_resource_destroy(p->raw);p->raw=nullptr;
+        (void)w.lane.held_status_fields();w.lane.timer_owner_sweep();
+        if(uncertain && !retirement)check(debt->observed[0].destroyed,"ownerless original incarnation not destroyed");
+    }
+    for(bool via_target:{false,true}) for(const char* reason:{"held_source_changed","lease_expired"}) {
+        World w;auto p=w.pointer();w.begin({p});
+        Client foreign;
+        w.lane.served_target(w.owner,w.owner.route);check(w.lane.reply=="lease_busy" && w.lane.held,"live phase normalized");
+        w.lane.held->phase.retire(false);
+        w.lane.served_begin(w.owner);check(w.lane.reply=="held_cleanup_unconfirmed" && w.lane.held,"unconfirmed obligation normalized");
+        w.release(p);w.lane.held->phase.reason=reason;
+        w.lane.served_target(foreign,foreign.route);check(w.lane.reply=="lease_busy" && w.lane.held,"foreign owner discarded journal");
+        if(via_target)w.lane.served_target(w.owner,w.owner.route);else w.lane.served_begin(w.owner);
+        check(w.lane.reply==(via_target ? "target_admitted" : "begin_admitted") && !w.lane.held,"completed same-owner server admission stayed busy");
+        check(p->release_attempts==1,"normalization sent duplicate release");
+        w.begin({p});w.lane.held->phase.handle="successor";
+        std::vector<std::string> old{"HOLD_RELEASE","3","handle"};
+        w.lane.served_old_release(w.owner,old);
+        check(w.lane.reply=="held_owner_mismatch" && w.lane.held->phase.handle=="successor" && !w.lane.held->phase.retired && p->release_attempts==1,"old opaque handle affected successor");
+    }
+    {
+        World w;auto p=w.pointer();w.begin({p},InputRoute::independent);
+        w.lane.held->phase.retire(false);w.lane.held_cleanup_unconfirmed=true;
+        w.lane.served_target(w.owner,w.owner.route);check(w.lane.reply=="held_cleanup_unconfirmed","independent debt bypassed");
+        w.release(p);check(w.lane.held->phase.cleanup_confirmed && !w.lane.held_cleanup_unconfirmed,"late original proof not retained");
+        w.lane.served_target(w.owner,w.owner.route);check(w.lane.reply=="target_admitted" && !w.lane.held && p->release_attempts==1,"late independent confirmation stayed busy/replayed");
+    }
     {
         World w;auto p=w.pointer();w.lane.stop_held_logger();
         w.lane.held.emplace(Held{&w.owner,HeldPhase{1,"handle",SourceWitness{"root",1,1,{}},HeldPhase::Clock::now()},272,{p}});

@@ -45,6 +45,7 @@ struct Held {
     struct ObservedPointer { std::weak_ptr<Proxy> owner; HeldPointerJournal journal; bool destroyed = false; const Proxy* resource = nullptr; };
     std::vector<ObservedPointer> observed = {};
     bool press_attempted = false;
+    InputRoute route=InputRoute::primary_foreground;
 };
 struct Owner {
     bool held_cleanup_unconfirmed = false;
@@ -70,7 +71,8 @@ struct Owner {
     }
     void leave_keyboard() {}
     void retire_grant() { lease = nullptr; }
-    void retain_foreground_debt() { if (held && held->client->route == InputRoute::primary_foreground && !held->phase.cleanup_confirmed) { held->client=nullptr; foreground_debt=std::move(held); held.reset(); } }
+    void relinquish_held_owner() {cleanup_held();held.reset();}
+    bool held_owns_client(const Client& c) const {return held && held->client==&c;}
     static void detach_held_watchers(std::optional<Held>&) {}
     unsigned event_ms() const { return 1; }
     unsigned serial() const { return 2; }
@@ -80,6 +82,7 @@ struct Owner {
 void check(bool condition, const char* message) { if (!condition) { std::cerr << message << '\n'; std::exit(1); } }
 void seed_owned_press(Owner& owner,const std::shared_ptr<Proxy>& proxy,bool native=false) {
     owner.held->press_attempted=true;
+    owner.held->route=owner.held->client->route;
     owner.held->observed.push_back({proxy,HeldPointerJournal{.button=owner.held->button},false,proxy->resource()});
     proxy->native=native;proxy->journal=&owner.held->observed.back().journal;
     proxy->journal->observe(WL_POINTER_BUTTON,owner.held->button,WL_POINTER_BUTTON_STATE_PRESSED);

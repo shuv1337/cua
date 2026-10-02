@@ -39,7 +39,7 @@ class HeldCleanupPolicyTests(unittest.TestCase):
         source=(ROOT / 'src/input_experiment.cpp').read_text()
         methods=[]
         for name in ['stop_held_logger','detach_held_watchers','held_resource_destroyed','observed_cleanup',
-                     'retain_foreground_debt','foreground_cleanup_pending','foreground_cleanup_debt','held_status_fields','held_cleanup_pending','held_event','capture_held_pointers','foreground_button','cleanup_held','held_retired_reply','native_held_phase_live']:
+                     'suspend','retire','retain_foreground_debt','held_owns_client','relinquish_held_owner','foreground_cleanup_pending','foreground_cleanup_debt','held_status_fields','held_cleanup_pending','normalize_confirmed_retirement','held_event','capture_held_pointers','foreground_button','cleanup_held','held_retired_reply','native_held_phase_live']:
             match=re.search(r'^    (?:static )?(?:void|bool|std::string) '+name+r'\(.*?^    }',source,re.M|re.S)
             self.assertIsNotNone(match,name)
             methods.append(match.group())
@@ -47,11 +47,19 @@ class HeldCleanupPolicyTests(unittest.TestCase):
         move=re.search(r'^            if \(!held_source\(c, f\[2\]\).*?^            }',source,re.M|re.S)
         self.assertIsNotNone(move)
         fixture=fixture.replace('// PRODUCTION_MOVE_RETIRE_BRANCH',move.group())
+        sweep=source.split('        if (lease && lease->dead)',1)[1].split('        std::erase_if(pointers',1)[0]
+        fixture=fixture.replace('// PRODUCTION_TIMER_OWNER_SWEEP','if (lease && lease->dead)'+sweep)
+        target=source.split('const auto route = command == "FOREGROUND_TARGET"',1)[1].split('if (!bind_input_route',1)[0]
+        target=target[target.index('if (held_cleanup_pending'):].strip()
+        begin=source.split('// BEGIN consumes one original-source',1)[1].split('if (c.token.empty()',1)[0]
+        begin=begin[begin.index('if (held_cleanup_pending'):].strip()
+        ownership=source.split('const bool owned = held_owns_client(c) &&',1)[1].split('const bool aborted',1)[0]
+        fixture=fixture.replace('// PRODUCTION_TARGET_ADMISSION',target).replace('// PRODUCTION_BEGIN_ADMISSION',begin).replace('// PRODUCTION_RELEASE_OWNERSHIP','const bool owned = held_owns_client(c) &&'+ownership)
         flags=shlex.split(subprocess.check_output(['pkg-config','--cflags','--libs','wayland-server'],text=True))
         compiler=shlex.split(os.environ.get('CXX','')) or [shutil.which('clang++-18') or shutil.which('clang++') or 'c++']
         with tempfile.TemporaryDirectory(prefix='cua-held-observer-') as directory:
             cpp=Path(directory)/'observer.cpp';binary=Path(directory)/'observer';cpp.write_text(fixture)
-            build=subprocess.run([*compiler,'-std=c++23','-Wall','-Wextra','-Wpedantic','-Werror','-I',str(ROOT/'src'),str(cpp),'-o',str(binary),*flags],capture_output=True,text=True,timeout=60)
+            build=subprocess.run([*compiler,'-std=c++23','-fsanitize=address','-fno-omit-frame-pointer','-Wall','-Wextra','-Wpedantic','-Werror','-I',str(ROOT/'src'),str(cpp),'-o',str(binary),*flags],capture_output=True,text=True,timeout=60)
             self.assertEqual(build.returncode,0,build.stdout+build.stderr)
             result=subprocess.run([str(binary)],capture_output=True,text=True,timeout=10)
             self.assertEqual(result.returncode,0,result.stdout+result.stderr)

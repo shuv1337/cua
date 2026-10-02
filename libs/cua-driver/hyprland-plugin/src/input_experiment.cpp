@@ -170,6 +170,7 @@ struct InputExperiment::Impl {
         InputRoute route = InputRoute::unbound;
         bool foreground_attempted = false;
         std::string challenge, token, sourceIdentity;
+        const std::string incarnation = nonce();
         WP<Desktop::View::CWindow> window;
         WP<CWLSurfaceResource> surface;
         std::array<double, 6> geometry{};
@@ -207,6 +208,8 @@ struct InputExperiment::Impl {
             struct Watch { wl_listener listener{}; ObservedPointer* record = nullptr; } watch;
         };
         std::vector<ObservedPointer> observed;
+        InputRoute route = InputRoute::unbound;
+        std::string owner_incarnation;
     };
     int listener = -1;
     wl_event_source* listen_source = nullptr;
@@ -237,6 +240,7 @@ struct InputExperiment::Impl {
     wl_protocol_logger* held_logger = nullptr;
     std::optional<std::size_t> held_press_slot;
     std::optional<Held> foreground_debt;
+    std::optional<Held> independent_debt;
     std::uint32_t held_button = 0;
     std::vector<std::uint32_t> held_keys;
     xkb_context* xkb_context_ = nullptr;
@@ -448,6 +452,7 @@ struct InputExperiment::Impl {
     void suspend(std::string_view reason = "plugin_disabled") {
         suspended = true;
         revoke(reason, reason != "plugin_shutdown");
+        relinquish_held_owner();
         reservation = nullptr;
         if (listen_source) wl_event_source_remove(listen_source);
         listen_source = nullptr;
@@ -474,6 +479,7 @@ struct InputExperiment::Impl {
     }
     ~Impl() {
         revoke("plugin_shutdown");
+        relinquish_held_owner();
         stop_held_logger();
         if (global) wl_global_destroy(global);
         if (listen_source) wl_event_source_remove(listen_source);
@@ -582,7 +588,7 @@ struct InputExperiment::Impl {
         return !c.sourceIdentity.empty();
     }
     bool held_source(Client& c, const std::string& handle) {
-        return held && held->client == &c && refresh(c) &&
+        return held_owns_client(c) && refresh(c) &&
             held->root == c.surface && native_held_phase_live() && held->phase.permits(reinterpret_cast<std::uintptr_t>(&c), handle, witness(c), Clock::now());
     }
     bool native_held_phase_live() const {
@@ -595,6 +601,7 @@ struct InputExperiment::Impl {
         held_logger = nullptr;
         detach_held_watchers(held);
         detach_held_watchers(foreground_debt);
+        detach_held_watchers(independent_debt);
     }
     static void detach_held_watchers(std::optional<Held>& value) {
         if (!value) return;
@@ -615,12 +622,30 @@ struct InputExperiment::Impl {
         return !value.observed.empty() && std::ranges::all_of(value.observed, [](const auto& p) { return p.journal.cleaned(); });
     }
     void retain_foreground_debt() {
-        if (!held || held->client->route != InputRoute::primary_foreground || held->phase.cleanup_confirmed) return;
+        if (!held || held->route != InputRoute::primary_foreground || held->phase.cleanup_confirmed) return;
         // The journal and destroy listeners retain exact original resource
         // incarnations, not a dangling Client* or input authority. A new
         // independent owner is not blocked by foreground acknowledgement debt.
         held->client = nullptr;
         foreground_debt = std::move(held);
+        held.reset();
+    }
+    bool held_owns_client(const Client& c) const {
+        return held && held->client == &c && held->owner_incarnation == c.incarnation;
+    }
+    void relinquish_held_owner() {
+        if (!held) return;
+        cleanup_held();
+        if (held->phase.cleanup_confirmed) {
+            detach_held_watchers(held);
+            held.reset();
+            return;
+        }
+        // Unknown obligations retain immutable route and exact resource
+        // incarnations, never a dangling owner or authority after client death.
+        held->client = nullptr;
+        auto& debt = held->route == InputRoute::primary_foreground ? foreground_debt : independent_debt;
+        debt = std::move(held);
         held.reset();
     }
     bool foreground_cleanup_pending() {
@@ -632,7 +657,7 @@ struct InputExperiment::Impl {
     }
     bool foreground_cleanup_debt() const {
         return (foreground_debt && !foreground_debt->phase.cleanup_confirmed) ||
-            (held && held->client && held->client->route == InputRoute::primary_foreground && held->phase.retired && !held->phase.cleanup_confirmed);
+            (held && held->route == InputRoute::primary_foreground && held->phase.retired && !held->phase.cleanup_confirmed);
     }
     std::string held_status_fields() const {
         return std::format(R"("held_cleanup_unconfirmed":{},"foreground_cleanup_pending":{},"held_observer":{},"source_guard_version":{},"held_phase_version":{},"held_foreground":{})",
@@ -640,7 +665,18 @@ struct InputExperiment::Impl {
             kProduction && held_logger ? 1 : 0, kProduction && held_logger && !foreground_cleanup_debt());
     }
     bool held_cleanup_pending(InputRoute route) {
+        if (independent_debt && independent_debt->phase.cleanup_confirmed) {
+            detach_held_watchers(independent_debt);
+            independent_debt.reset();
+        }
         return route == InputRoute::primary_foreground ? foreground_cleanup_pending() : held_cleanup_unconfirmed;
+    }
+    void normalize_confirmed_retirement(Client& c) {
+        if (!held_owns_client(c) || !held->phase.retired || !held->phase.cleanup_confirmed) return;
+        // Fresh admission discards completed state, not cleanup obligations.
+        // No release, replay, grant renewal or resource lookup occurs here.
+        detach_held_watchers(held);
+        held.reset();
     }
     static void held_event(void* data, wl_protocol_logger_type direction, const wl_protocol_logger_message* event) noexcept {
         auto& self = *static_cast<Impl*>(data);
@@ -670,16 +706,16 @@ struct InputExperiment::Impl {
                 // event can only upgrade its separately observed cleanup fact.
                 if (value->phase.retired && observed_cleanup(*value)) {
                     value->phase.cleanup_confirmed = true;
-                    if (value->client && value->client->route == InputRoute::independent) self.held_cleanup_unconfirmed = false;
+                    if (value->route == InputRoute::independent) self.held_cleanup_unconfirmed = false;
                 }
                 return;
             }
         };
-        observe(self.held); observe(self.foreground_debt);
+        observe(self.held); observe(self.foreground_debt); observe(self.independent_debt);
     }
     bool capture_held_pointers() {
         if (!held_logger || !held) return false;
-        if (held->client->route == InputRoute::independent) {
+        if (held->route == InputRoute::independent) {
             if (held->independent.empty() || held->independent.size() > kMaxResources) return false;
             held->observed.reserve(held->independent.size());
             for (const auto& p : held->independent) {
@@ -711,7 +747,7 @@ struct InputExperiment::Impl {
         // The captured proxy set is the device. Never discover new resources
         // during cleanup and never release a button to a successor focus.
         if (held->press_attempted) {
-            if (held->client->route == InputRoute::primary_foreground) {
+            if (held->route == InputRoute::primary_foreground) {
                 confirmed = held_logger && !held->observed.empty();
                 for (auto& observed : held->observed) {
                     const auto p = observed.owner.lock();
@@ -742,7 +778,7 @@ struct InputExperiment::Impl {
             }
         }
         held_button = 0;
-        if (!confirmed && held->client->route == InputRoute::independent) held_cleanup_unconfirmed = true;
+        if (!confirmed && held->route == InputRoute::independent) held_cleanup_unconfirmed = true;
         held->phase.retire(confirmed);
     }
     bool primary_conflict(const Client& c) const {
@@ -952,7 +988,7 @@ struct InputExperiment::Impl {
             }
             catch (...) {
                 const bool foreground_partial = c.foreground_attempted;
-                const bool held_partial = self.held && self.held->client == &c && self.held->effects;
+                const bool held_partial = self.held_owns_client(c) && self.held->effects;
                 const bool foreground_drag_reply = foreground_partial && self.drag && self.drag->client == &c;
                 if (kProduction && (self.lease == &c || self.reservation == &c)) self.revoke("invalid_request");
                 if (!foreground_drag_reply) self.send(c, refusal(foreground_partial ? "foreground_partial_unknown" : held_partial ? "held_partial_unknown" : "invalid_request"));
@@ -1205,7 +1241,7 @@ struct InputExperiment::Impl {
         for (std::size_t i = 0; i < foreground_pointers.size(); ++i) {
             const auto& weak = foreground_pointers[i];
             const auto p = weak.lock(); if (!p || !p->good()) throw ForegroundFailure{ForegroundFailureReason::pointer_resources};
-            if (pressed && held && held->client == &c && i < held->observed.size()) held_press_slot = i;
+            if (pressed && held_owns_client(c) && i < held->observed.size()) held_press_slot = i;
             p->sendButton(event_ms(), code, pressed ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED);
             held_press_slot.reset();
             p->sendFrame();
@@ -1342,6 +1378,7 @@ struct InputExperiment::Impl {
         if (command == "TARGET" || (kProduction && command == "FOREGROUND_TARGET")) {
             const auto route = command == "FOREGROUND_TARGET" ? InputRoute::primary_foreground : InputRoute::independent;
             if (held_cleanup_pending(route)) { send(c, refusal("held_cleanup_unconfirmed")); return; }
+            normalize_confirmed_retirement(c);
             if (drag || held) { send(c, refusal("lease_busy")); return; }
             if (!bind_input_route(c.route, route)) { invalidate(c); send(c, refusal("route_mismatch")); return; }
             if (f.size() != (kProduction ? 4u : 3u)) {
@@ -1499,7 +1536,7 @@ struct InputExperiment::Impl {
             // BEGIN's handle ACK may be lost or malformed after pressing. An
             // abort names the original root nonce, on this same accepted owner
             // connection only; it cannot acquire authority or a successor hold.
-            const bool owned = held && held->client == &c &&
+            const bool owned = held_owns_client(c) &&
                 (command == "HOLD_ABORT" ? held->phase.source.root == f[2] :
                  held->phase.owns(reinterpret_cast<std::uintptr_t>(&c), f[2]));
             if (!owned) {
@@ -1514,11 +1551,11 @@ struct InputExperiment::Impl {
                 confirmed, confirmed ? "held_released" : std::ranges::any_of(held->observed, [](const auto& p) {return p.dnd_withheld;}) ? "dnd_release_withheld" : "held_cleanup_unconfirmed",
                 aborted || !confirmed ? "partial" : "unverifiable", held->phase.handle, held->phase.source.root, sequence, confirmed));
             if (confirmed) { detach_held_watchers(held); held.reset(); }
-            else retain_foreground_debt();
+            else relinquish_held_owner();
             return;
         }
         if (command == "HOLD_MOVE") {
-            if (!held || !held->phase.owns(reinterpret_cast<std::uintptr_t>(&c), f[2])) {
+            if (!held_owns_client(c) || !held->phase.owns(reinterpret_cast<std::uintptr_t>(&c), f[2])) {
                 send(c, refusal("held_owner_mismatch")); return;
             }
             if (held->phase.retired || Clock::now() >= held->phase.deadline) {
@@ -1554,8 +1591,9 @@ struct InputExperiment::Impl {
         }
         // BEGIN consumes one original-source reconciled finite drag grant. The
         // new opaque handle never arms TARGET or substitutes a successor device.
-        if (held || drag) { send(c, refusal("lease_busy")); return; }
         if (held_cleanup_pending(c.route)) { send(c, refusal("held_cleanup_unconfirmed")); return; }
+        normalize_confirmed_retirement(c);
+        if (held || drag) { send(c, refusal("lease_busy")); return; }
         if (c.token.empty() || f[2] != c.token || !refresh(c) || !packet_witness(c, f)) {
             send(c, refusal("stale_source")); return;
         }
@@ -1567,7 +1605,7 @@ struct InputExperiment::Impl {
         if (!point(c, x, y) || code < 272 || code > 274) { send(c, refusal("invalid_request")); return; }
         if (!held_logger) { send(c, refusal("held_observer_unavailable")); return; }
         if (!consume_grant(c, 8)) return;
-        held.emplace(Held{&c, HeldPhase{reinterpret_cast<std::uintptr_t>(&c), nonce(), witness(c), expires}, c.surface, static_cast<std::uint32_t>(code), false, false, {}, {}, {}});
+        held.emplace(Held{&c, HeldPhase{reinterpret_cast<std::uintptr_t>(&c), nonce(), witness(c), expires}, c.surface, static_cast<std::uint32_t>(code), false, false, {}, {}, {}, c.route, c.incarnation});
         held->effects = true; // activation/enter/motion are effects before press
         if (c.route == InputRoute::primary_foreground) {
             start_foreground(c, x, y, true, false, {});
@@ -1718,8 +1756,8 @@ struct InputExperiment::Impl {
         }
         if (lease && lease->dead) revoke("disconnected", true);
         if (reservation && reservation->dead) reservation = nullptr;
-        if (held && held->client->dead) {
-            cleanup_held(); retain_foreground_debt(); detach_held_watchers(held); held.reset();
+        if (held && std::ranges::any_of(clients, [&](const auto& c) { return held_owns_client(*c) && c->dead; })) {
+            relinquish_held_owner();
         }
         std::erase_if(clients, [](auto& c) { return c->dead; });
         std::erase_if(pointers, [](auto& p) { return p->dead; });

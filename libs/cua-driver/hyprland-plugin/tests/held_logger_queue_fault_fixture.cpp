@@ -66,6 +66,7 @@ struct Held {
     std::vector<std::shared_ptr<Proxy>> independent;
     struct Observed {std::weak_ptr<Proxy> owner;wl_resource* resource;HeldPointerJournal journal;bool destroyed=false;};
     std::vector<Observed> observed;
+    InputRoute route=InputRoute::independent;
 };
 struct Owner {
     std::optional<Held> held;

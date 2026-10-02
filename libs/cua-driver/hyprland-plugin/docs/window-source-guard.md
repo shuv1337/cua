@@ -142,6 +142,21 @@ are additive. These fields do not change production upgrade safety: the seat's
 lifetime remains the compositor's, unloading retires it one-way, and replacement
 requires a new desktop session, not a hotload under another path.
 
+Before fresh TARGET or HOLD_BEGIN, only the same client incarnation's retired,
+confirmed hold may be normalized: its listeners detach and completed state is
+discarded without an input/release packet. Live, foreign and unconfirmed holds
+are not discarded. Old opaque handles cannot release a new hold.
+
+Suspend, retirement, destruction and the dead-client sweep reconcile held
+ownership before destroying clients. Completed state is detached/reset; unknown
+debt keeps immutable route and exact resource journals with no `Client*` input
+authority. Status and logger callbacks inspect that route, not owner memory.
+Normal suspend may observe later original-resource cleanup; retirement stops the
+logger, so unproved debt remains unknown. A client incarnation token guards all
+held owner comparisons, including address reuse. The ASan ownership fixture
+executes production suspend/retire and timer owner-sweep bodies; it is not a home
+compositor or native-delivery test.
+
 Any module implementing it needs a newly built artifact and disposable matching-
 version compositor qualification before home distribution. Existing trusted
 profile hashes do not trust a new SO merely because its ABI version matches.
