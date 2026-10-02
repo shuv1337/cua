@@ -389,8 +389,7 @@ impl LocalWindowFrame {
 }
 
 pub fn local_window_frame(pid: u32, address: u64) -> Result<LocalWindowFrame> {
-    let ipc = ipc_connection()?;
-    let peer = CompositorPeer::from_ipc(&ipc)?;
+    let peer = with_peer_only_ipc(ipc_connection()?, CompositorPeer::from_ipc)?;
     let conn = wayland_connection()?;
     peer.verify_connection(&conn)?;
     let incarnation = format!("{peer:?}");
@@ -429,6 +428,16 @@ pub fn local_window_frame(pid: u32, address: u64) -> Result<LocalWindowFrame> {
         address,
         peer: Some(peer),
     })
+}
+
+fn with_peer_only_ipc<T>(
+    ipc: UnixStream,
+    attest: impl FnOnce(&UnixStream) -> Result<T>,
+) -> Result<T> {
+    // Hyprland serves accepted IPC streams synchronously, waiting for request
+    // bytes. A credentials-only stream must close before any subsequent
+    // Wayland/barrier/query work, on both attestation success and refusal.
+    attest(&ipc)
 }
 
 pub fn is_session() -> bool {
@@ -2060,6 +2069,75 @@ mod tests {
         let start = Instant::now();
         assert!(read_reply(&mut client, b"j/clients", Duration::from_millis(30)).is_err());
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn peer_only_ipc_closes_without_request_before_serialized_marker_query() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ipc.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            first
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let mut bytes = [0u8; 256];
+            assert_eq!(
+                first.read(&mut bytes).unwrap(),
+                0,
+                "peer-only socket must EOF, not send a request or block the serialized handler"
+            );
+            drop(first);
+            let (mut second, _) = listener.accept().unwrap();
+            second
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let count = second.read(&mut bytes).unwrap();
+            assert_eq!(
+                &bytes[..count],
+                b"dispatch hl.dsp.event(\"cua-authority-1-abcdef\")"
+            );
+            second.write_all(b"ok").unwrap();
+        });
+        let pid = with_peer_only_ipc(UnixStream::connect(&path).unwrap(), |ipc| {
+            peer_pid(ipc.as_raw_fd())
+        })
+        .unwrap();
+        assert_eq!(pid, std::process::id() as libc::pid_t);
+        event_marker_with("cua-authority-1-abcdef", |command| {
+            read_reply(
+                &mut UnixStream::connect(&path)?,
+                command.as_bytes(),
+                Duration::from_millis(200),
+            )
+        })
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn peer_only_ipc_attestation_refusal_closes_without_dispatch() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let result: Result<()> = with_peer_only_ipc(client, |ipc| {
+            let pid = peer_pid(ipc.as_raw_fd())?;
+            anyhow::ensure!(
+                pid != std::process::id() as libc::pid_t,
+                "mismatched compositor peer"
+            );
+            Ok(())
+        });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("mismatched compositor peer"));
+        server
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        assert_eq!(
+            server.read(&mut [0u8; 1]).unwrap(),
+            0,
+            "refused peer socket retained or dispatched bytes"
+        );
     }
 
     fn replying_ipc(bytes: Vec<u8>, delay: Duration) -> UnixStream {
