@@ -23,6 +23,7 @@ struct Client {
     void* source = nullptr;
     int fd = -1;
     std::string token = "old-target";
+    std::string sourceIdentity = "original-root-source";
     std::weak_ptr<Window> window;
     std::weak_ptr<Surface> surface;
     uint64_t approved_deadline = 42, revision = 1;
@@ -135,7 +136,7 @@ int main() {
             if (path == 2) l.action_refusal(*l.lease);
             l.guard_targets(); l.check_inert();
             if (path == 1)
-                check(l.clients.front()->token.empty() && !l.clients.front()->approved_deadline,
+                check(l.clients.front()->token.empty() && l.clients.front()->sourceIdentity.empty() && !l.clients.front()->approved_deadline,
                       "refused TARGET retained old binding authority");
             l.session = true; l.layout = true; l.guard_targets(); l.check_inert();
         }

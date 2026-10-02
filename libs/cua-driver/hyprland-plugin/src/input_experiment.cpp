@@ -167,7 +167,7 @@ struct InputExperiment::Impl {
         bool has_bound_target = false;
         InputRoute route = InputRoute::unbound;
         bool foreground_attempted = false;
-        std::string challenge, token;
+        std::string challenge, token, sourceIdentity;
         WP<Desktop::View::CWindow> window;
         WP<CWLSurfaceResource> surface;
         std::array<double, 6> geometry{};
@@ -599,7 +599,7 @@ struct InputExperiment::Impl {
     void invalidate(Client& c, bool clear_pointer = true) {
         if (lease == &c || (clear_pointer && c.surface.lock() && pointer_target.surface() == c.surface.lock()))
             revoke("stale_target", !clear_pointer);
-        c.token.clear(); c.window.reset(); c.surface.reset();
+        c.token.clear(); c.sourceIdentity.clear(); c.window.reset(); c.surface.reset();
         // Replay high-water belongs to the old target binding. A genuinely
         // new token may receive a shorter grant after Stop or target change.
         c.approved_deadline = 0;
@@ -1092,7 +1092,7 @@ struct InputExperiment::Impl {
             if (f.size() != 1 || c.hello) { send(c, refusal("invalid_request")); return; }
             c.hello = true;
             if (kProduction)
-                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true}})", epoch));
+                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"source_guard_version":1}})", epoch));
             else
                 send(c, std::format(R"({{"ok":true,"protocol":0,"epoch":"{}","challenge":"{}"}})", epoch, c.challenge));
             return;
@@ -1159,7 +1159,7 @@ struct InputExperiment::Impl {
                 // Rebinding authority (including a new socket owner) may reuse
                 // unchanged passive hover. Compare the actual target below.
                 invalidate(c, false); c.unmap.reset(); c.destroy.reset();
-                c.window = window; c.surface = window->resource(); c.token = nonce(); c.revision = 1;
+                c.window = window; c.surface = window->resource(); c.token = nonce(); c.sourceIdentity = nonce(); c.revision = 1;
                 c.unmap = window->m_events.unmap.listen([this, &c] { invalidate(c); });
                 c.destroy = window->m_events.destroy.listen([this, &c] { invalidate(c); });
             }
@@ -1186,11 +1186,13 @@ struct InputExperiment::Impl {
                 if (trace) trace->mark("agent_admitted", lane + 1);
             }
             c.has_bound_target = true;
-            if (route == InputRoute::primary_foreground) {
-                send(c, std::format(R"({{"ok":true,"target":"{}","revision":{},"width":{},"height":{},"route":"primary_foreground"}})",
-                    c.token, c.revision, c.geometry[2], c.geometry[3])); return;
-            }
-            send(c, std::format(R"({{"ok":true,"target":"{}","revision":{},"width":{},"height":{}}})", c.token, c.revision, c.geometry[2], c.geometry[3])); return;
+            // Private, additive observation capability. The operation token is
+            // one-shot; sourceIdentity survives grants only for this exact root
+            // and client connection, and is cleared on every invalidation.
+            send(c, std::format(R"({{"ok":true,"target":"{}","revision":{},"width":{},"height":{},"route":"{}","source_guard_version":1,"source_identity":"{}","source_geometry":[{},{},{},{},{},{}],"desktop_generation":{}}})",
+                c.token, c.revision, c.geometry[2], c.geometry[3],
+                route == InputRoute::primary_foreground ? "primary_foreground" : "independent",
+                c.sourceIdentity, c.geometry[0], c.geometry[1], c.geometry[2], c.geometry[3], c.geometry[4], c.geometry[5], desktop_generation)); return;
         }
         const std::uint64_t cap = command == "CLICK" ? 1 : command == "KEY" ? 2 : command == "SCROLL" ? 4 : command == "DRAG" ? 8 :
             command == "ACTIVATE" && kProduction && c.route == InputRoute::primary_foreground ? 16 : 0;

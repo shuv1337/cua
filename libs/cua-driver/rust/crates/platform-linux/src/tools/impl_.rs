@@ -123,18 +123,22 @@ type PidWindowGuardParts = (
     cua_driver_core::window_target::PidFallbackWindowResolver,
     cua_driver_core::window_target::SnapshotWindowResolver,
     cua_driver_core::window_target::TokenPidResolver,
+    Arc<ToolState>,
 );
 
 fn pid_window_guarded<T: Tool + 'static>(
     tool: T,
-    (candidates, point_resolver, fallback_resolver, snapshot_resolver, token_pid_resolver): &PidWindowGuardParts,
+    (candidates, point_resolver, fallback_resolver, snapshot_resolver, token_pid_resolver, state): &PidWindowGuardParts,
 ) -> Box<dyn Tool> {
     Box::new(
-        PidOnlyWindowTargetGuard::new(Box::new(NativePointerOutcomeTool(tool)), candidates.clone())
-            .with_point_resolver(point_resolver.clone())
-            .with_fallback_resolver(fallback_resolver.clone())
-            .with_snapshot_resolver(snapshot_resolver.clone())
-            .with_token_pid_resolver(token_pid_resolver.clone()),
+        PidOnlyWindowTargetGuard::new(
+            Box::new(NativePointerOutcomeTool(tool, state.clone())),
+            candidates.clone(),
+        )
+        .with_point_resolver(point_resolver.clone())
+        .with_fallback_resolver(fallback_resolver.clone())
+        .with_snapshot_resolver(snapshot_resolver.clone())
+        .with_token_pid_resolver(token_pid_resolver.clone()),
     )
 }
 
@@ -147,11 +151,42 @@ fn token_pid_resolver(state: Arc<ToolState>) -> cua_driver_core::window_target::
 /// Preserve adapter uncertainty through legacy ToolResult error conversion.
 /// These closed prefixes originate only in the native owned-pointer adapter;
 /// ordinary argument/target refusals are not relabeled as delivered input.
-struct NativePointerOutcomeTool<T>(T);
+struct NativePointerOutcomeTool<T>(T, Arc<ToolState>);
+
+use crate::wayland::hyprland_input::INVOCATION_WINDOW_SOURCE as WINDOW_ACTION_SOURCE;
+
+fn window_action_source() -> Option<Arc<crate::wayland::hyprland_input::WindowSource>> {
+    crate::wayland::hyprland_input::current_window_source()
+}
+
+fn window_source_refusal(error: impl std::fmt::Display) -> ToolResult {
+    ToolResult::error(error.to_string()).with_structured(json!({
+        "code": "window_source_guard_unavailable", "effect": "none", "retryable": false,
+        "detail": error.to_string(),
+    }))
+}
 
 #[cfg(test)]
 mod native_pointer_outcome_tests {
     use super::*;
+    #[test]
+    fn contextual_owned_cleanup_errors_survive_input_and_desktop_conversion() {
+        for convert in [input_error_result, desktop_frame_error, linux_input_error] {
+            for (message, confirmed) in [
+                ("cleanup_unconfirmed: stalled original peer", false),
+                (
+                    "held_pointer_partial_unknown: owned cleanup acknowledged",
+                    true,
+                ),
+            ] {
+                let result = convert(anyhow::anyhow!(message).context("outer adapter context"));
+                let outcome = result.structured_content.unwrap();
+                assert_eq!(outcome["effect"], "partial");
+                assert_eq!(outcome["cleanup_confirmed"], confirmed);
+                assert_eq!(outcome["retryable"], false);
+            }
+        }
+    }
     #[test]
     fn revoked_after_press_is_machine_readable_and_never_effect_none() {
         let result = native_pointer_outcome(ToolResult::error(
@@ -212,8 +247,145 @@ impl<T: Tool> Tool for NativePointerOutcomeTool<T> {
             .await
     }
     async fn invoke(&self, args: Value) -> ToolResult {
-        native_pointer_outcome(self.0.invoke(args).await)
+        let tool = self.0.def().name.as_str();
+        let targeted = args.get("pid").is_some_and(|value| !value.is_null())
+            || args.get("window_id").is_some_and(|value| !value.is_null())
+            || args
+                .get("element_token")
+                .is_some_and(|value| !value.is_null());
+        let required = targeted && desktop_frame_requested(&args);
+        let source_tool = matches!(
+            tool,
+            "click"
+                | "double_click"
+                | "right_click"
+                | "drag"
+                | "scroll"
+                | "mouse_button_down"
+                | "mouse_drag"
+                | "set_value"
+                | "type_text"
+                | "press_key"
+                | "hotkey"
+        );
+        let guarded = source_tool
+            && targeted
+            && (required || crate::capture_action_frame::recording_sink().is_some())
+            && crate::wayland::is_wayland()
+            && crate::wayland::hyprland::is_session()
+            && tool != "mouse_button_up";
+        if !guarded {
+            return native_pointer_outcome(self.0.invoke(args).await);
+        }
+        // Native held-device and AT-SPI action routes cannot atomically apply
+        // the retained plugin root grant. Refuse before any focus/input; never
+        // silently replace a semantic action with synthetic foreground input.
+        if matches!(
+            tool,
+            "mouse_button_down" | "mouse_drag" | "move_cursor" | "set_value"
+        ) || args
+            .get("element_token")
+            .is_some_and(|value| !value.is_null())
+        {
+            if !required {
+                return native_pointer_outcome(self.0.invoke(args).await);
+            }
+            return window_source_refusal("window_source_guard_unavailable: this stateful/semantic adapter cannot dispatch the retained root grant; ordinary window-local input and owned release remain available");
+        }
+        if let Some(source) = window_action_source() {
+            // Nested type_text -> click retains the original invocation source.
+            return native_pointer_outcome(
+                WINDOW_ACTION_SOURCE
+                    .scope(source, self.0.invoke(args))
+                    .await,
+            );
+        }
+        let Some(pid) = args
+            .get("pid")
+            .and_then(Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok())
+        else {
+            if !required {
+                return native_pointer_outcome(self.0.invoke(args).await);
+            }
+            return window_source_refusal("window_source_guard_unavailable: exact pid required");
+        };
+        let Some(address) = args.get("window_id").and_then(Value::as_u64) else {
+            if !required {
+                return native_pointer_outcome(self.0.invoke(args).await);
+            }
+            return window_source_refusal(
+                "window_source_guard_unavailable: exact full window address required",
+            );
+        };
+        let binding = match self.1.capture_service.binding_from_args(&args) {
+            Ok(binding) => binding,
+            Err(error) if required => return window_source_refusal(error),
+            Err(_) => return native_pointer_outcome(self.0.invoke(args).await),
+        };
+        let service = self.1.capture_service.clone();
+        let original_args = args.clone();
+        let owner = named_session_cursor_key(&args);
+        let foreground = crate::input::delivery::DeliveryMode::from_args(&args).is_foreground();
+        let (_cancellation, dispatch) = match spawn_isolated_hyprland(&args, move |cancellation| {
+            let frame = crate::wayland::hyprland::desktop_frame()?;
+            if desktop_frame_requested(&original_args) && original_args.get("capture_id").is_none()
+            {
+                service.validate_desktop_observation_source(
+                    &binding,
+                    &frame.identity,
+                    original_args
+                        .get("_native_desktop_observation")
+                        .and_then(Value::as_str),
+                )?;
+            }
+            crate::wayland::hyprland_input::prepare_window_source(
+                owner,
+                pid,
+                address,
+                foreground,
+                frame,
+                binding,
+                original_args
+                    .get("capture_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                cancellation,
+            )
+        }) {
+            Ok(dispatch) => dispatch,
+            Err(refusal) if required => return refusal,
+            Err(_) => return native_pointer_outcome(self.0.invoke(args).await),
+        };
+        let source = match dispatch.await {
+            Ok(Ok(source)) => Arc::new(source),
+            Ok(Err(error)) if required => return window_source_refusal(error),
+            Err(error) if required => return window_source_refusal(error),
+            _ => return native_pointer_outcome(self.0.invoke(args).await),
+        };
+        native_pointer_outcome(
+            WINDOW_ACTION_SOURCE
+                .scope(source, self.0.invoke(args))
+                .await,
+        )
     }
+}
+
+fn owned_pointer_error_result(error: &anyhow::Error) -> Option<ToolResult> {
+    error.chain().find_map(|cause| {
+        let message = cause.to_string();
+        let classified = [
+            "cleanup_unconfirmed:",
+            "held_pointer_partial_unknown:",
+            "cancelled_after_input:",
+            "desktop_frame_changed_after_input:",
+        ]
+        .iter()
+        .any(|prefix| message.starts_with(prefix));
+        classified.then(|| {
+            native_pointer_outcome(ToolResult::error(format!("{message}; context: {error}")))
+        })
+    })
 }
 
 fn native_pointer_outcome(mut result: ToolResult) -> ToolResult {
@@ -2879,8 +3051,17 @@ async fn desktop_to_window_local_for(
 ) -> Result<anyhow::Result<(f64, f64)>, tokio::task::JoinError> {
     let service = state.capture_service.clone();
     let args = args.clone();
+    let source = window_action_source();
     tokio::task::spawn_blocking(move || {
         if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+            if let Some(source) = &source {
+                anyhow::ensure!(
+                    source.pid == pid && source.address == xid,
+                    "window_source_changed: nested target differs from original source"
+                );
+                source.validate_native()?;
+                return source.translate(x, y);
+            }
             let frame = crate::wayland::hyprland::desktop_frame()?;
             if args.get("capture_id").is_none() {
                 service.validate_desktop_observation_source(
@@ -2926,6 +3107,9 @@ async fn spawn_blocking_bounded<T: Send + 'static>(
 /// foreground `code` (`foreground_unavailable` / `foreground_timeout`) when the
 /// message carries one so the caller can branch instead of parsing prose.
 fn input_error_result(e: anyhow::Error) -> ToolResult {
+    if let Some(outcome) = owned_pointer_error_result(&e) {
+        return outcome;
+    }
     if e.downcast_ref::<crate::wayland::hyprland::UnsupportedDisplayTransform>()
         .is_some()
     {
@@ -2962,6 +3146,9 @@ fn input_error_result(e: anyhow::Error) -> ToolResult {
 }
 
 fn desktop_frame_error(error: anyhow::Error) -> ToolResult {
+    if let Some(outcome) = owned_pointer_error_result(&error) {
+        return outcome;
+    }
     let code = if error
         .downcast_ref::<crate::wayland::hyprland::UnsupportedDisplayTransform>()
         .is_some()
@@ -4321,6 +4508,9 @@ fn x11_pixel_click_no_focus_steal(
 /// target, or a real-pointer delivery that did not go through. Everything
 /// else keeps its full error chain in the text.
 fn linux_input_error(error: anyhow::Error) -> ToolResult {
+    if let Some(outcome) = owned_pointer_error_result(&error) {
+        return outcome;
+    }
     if crate::input::is_uinput_unavailable(&error) {
         return ToolResult::error(error.to_string()).with_structured(json!({
             "code": crate::input::UINPUT_UNAVAILABLE_CODE,
@@ -4851,6 +5041,12 @@ fn hyprland_input_result(result: anyhow::Result<Value>, foreground: bool) -> Too
                 .with_structured(value)
                 .with_action_record(outcome)
         }
+        Err(error) if error.is::<crate::wayland::hyprland_input::WindowSourceRefusal>() => {
+            hyprland_input_result(
+                Ok(json!({"ok":false,"code":"window_source_changed","detail":error.to_string()})),
+                foreground,
+            )
+        }
         Err(error) if error.is::<crate::wayland::hyprland_input::LaneBusy>() => {
             hyprland_input_result(
                 Ok(json!({
@@ -4905,15 +5101,15 @@ fn isolated_hyprland_task_error(error: tokio::task::JoinError, acknowledged: boo
     )))
 }
 
-fn spawn_isolated_hyprland(
+fn spawn_isolated_hyprland<T: Send + 'static>(
     args: &Value,
-    work: impl FnOnce(crate::wayland::hyprland_input::ActionCancellation) -> anyhow::Result<Value>
+    work: impl FnOnce(crate::wayland::hyprland_input::ActionCancellation) -> anyhow::Result<T>
         + Send
         + 'static,
 ) -> Result<
     (
         crate::wayland::hyprland_input::CancelOnDrop,
-        tokio::task::JoinHandle<anyhow::Result<Value>>,
+        tokio::task::JoinHandle<anyhow::Result<T>>,
     ),
     ToolResult,
 > {
@@ -4938,9 +5134,13 @@ fn spawn_isolated_hyprland(
     )
     .map_err(isolated_hyprland_refusal)?;
     let (guard, cancellation) = crate::wayland::hyprland_input::ActionCancellation::invocation();
+    let source = window_action_source();
+    let recording_sink = crate::capture_action_frame::recording_sink();
     let dispatch = tokio::task::spawn_blocking(move || {
         let _lifecycle = lifecycle;
-        work(cancellation)
+        crate::capture_action_frame::with_recording_sink(recording_sink, || {
+            crate::wayland::hyprland_input::with_window_source(source, || work(cancellation))
+        })
     });
     Ok((guard, dispatch))
 }
@@ -5944,6 +6144,35 @@ async fn desktop_input_space(
     Ok(space)
 }
 
+fn retain_desktop_action_point(
+    state: &ToolState,
+    args: &Value,
+    space: &crate::wayland::DesktopInputSpace,
+    point: (f64, f64),
+) {
+    // Bound capture actions use the successful consumed admission, never this
+    // unbound path. Missing evidence has no authority over the action outcome.
+    if args.get("capture_id").is_some() {
+        return;
+    }
+    let Some(sink) = crate::capture_action_frame::recording_sink() else {
+        return;
+    };
+    let Some(frame) = space.frame() else {
+        return;
+    };
+    let Ok(binding) = state.capture_service.binding_from_args(args) else {
+        return;
+    };
+    sink.retain_action_point(
+        &binding,
+        Some(&frame.identity),
+        &cua_driver_core::capture_runtime::CaptureTarget::PrimaryDesktop,
+        (frame.width, frame.height),
+        point,
+    );
+}
+
 /// Keep the logical cursor position in sync with every visibly targeted
 /// pointer action. Overlay delivery is intentionally best-effort: registry
 /// state is still updated when no renderer is running or its queue is closed.
@@ -6878,6 +7107,7 @@ impl Tool for ClickTool {
             };
             let sx = action_x.round() as i32;
             let sy = action_y.round() as i32;
+            retain_desktop_action_point(&self.state, &args, &space, (f64::from(sx), f64::from(sy)));
             // Glide the agent-cursor overlay to the click point first (the macOS
             // / Windows desktop paths already do this). Without it the overlay
             // sits idle elsewhere while only the real pointer warps, so a viewer
@@ -10162,6 +10392,7 @@ impl Tool for ScrollTool {
                 )
                 .await;
             }
+            retain_desktop_action_point(&self.state, &args, &space, (f64::from(x), f64::from(y)));
             let result = tokio::task::spawn_blocking(move || {
                 if wayland {
                     crate::wayland::scroll_desktop(&space, x, y, &direction, amount as u32)
@@ -11327,6 +11558,12 @@ impl Tool for DragTool {
             };
             let (overlay_from, overlay_to) =
                 (overlay_point(from_x, from_y), overlay_point(to_x, to_y));
+            retain_desktop_action_point(
+                &self.state,
+                &args,
+                &space,
+                (from_x.round(), from_y.round()),
+            );
             let result = tokio::task::spawn_blocking(move || {
                 if wayland {
                     crate::wayland::drag_desktop(
@@ -11471,6 +11708,7 @@ impl Tool for DragTool {
         if desktop_frame {
             let capture_service = self.state.capture_service.clone();
             let binding = capture_service.binding_from_args(&args);
+            let source = window_action_source();
             let source_id = args
                 .get("_native_desktop_observation")
                 .and_then(Value::as_str)
@@ -11478,6 +11716,17 @@ impl Tool for DragTool {
             let capture_bound = args.get("capture_id").is_some();
             let mapped = tokio::task::spawn_blocking(move || {
                 if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+                    if let Some(source) = &source {
+                        anyhow::ensure!(
+                            source.pid == pid && source.address == xid,
+                            "window_source_changed: drag source differs from original target"
+                        );
+                        source.validate_native()?;
+                        return Ok((
+                            source.translate(from_x, from_y)?,
+                            source.translate(to_x, to_y)?,
+                        ));
+                    }
                     let frame = crate::wayland::hyprland::desktop_frame()?;
                     if !capture_bound {
                         capture_service.validate_desktop_observation_source(
@@ -12455,11 +12704,21 @@ impl Tool for MouseButtonUpTool {
                 }
                 Ok(Err(error)) => {
                     let mut outcome = mouse_hold_json(&cursor_id, Some(&hold));
-                    outcome["code"] = json!("owned_pointer_cleanup_unconfirmed");
-                    outcome["effect"] = json!("partial");
-                    outcome["cleanup_confirmed"] = json!(false);
-                    outcome["retryable"] = json!(false);
-                    ToolResult::error(error.to_string()).with_structured(outcome)
+                    let message = error.to_string();
+                    if message.starts_with("mouse_release_not_owned:") {
+                        outcome["code"] = json!("mouse_release_not_owned");
+                        outcome["effect"] = json!("none");
+                        outcome["retryable"] = json!(false);
+                    } else if message.starts_with("held_pointer_partial_unknown:") {
+                        clear_mouse_hold_after_release(&self.state, &cursor_id);
+                        outcome = mouse_hold_json(&cursor_id, None);
+                    } else if !message.starts_with("cleanup_unconfirmed:") {
+                        outcome["code"] = json!("owned_pointer_owner_outcome_unknown");
+                        outcome["effect"] = json!("partial");
+                        outcome["cleanup_confirmed"] = json!(false);
+                        outcome["retryable"] = json!(false);
+                    }
+                    native_pointer_outcome(ToolResult::error(message).with_structured(outcome))
                 }
                 Err(error) => ToolResult::error(error.to_string()).with_structured(json!({"code":"owned_pointer_cleanup_unconfirmed", "effect":"partial", "cleanup_confirmed":false, "retryable":false})),
             };
@@ -13467,6 +13726,12 @@ impl Tool for MoveCursorTool {
                         return ToolResult::error(error.to_string());
                     }
                 }
+                retain_desktop_action_point(
+                    &self.state,
+                    &args,
+                    &space,
+                    (f64::from(xi), f64::from(yi)),
+                );
                 tokio::task::spawn_blocking(move || {
                     crate::wayland::move_cursor_desktop(&space, xi, yi)
                 })
@@ -15086,6 +15351,7 @@ pub fn build_registry_with_provider(
         pid_fallback_window_resolver(),
         snapshot_window_resolver(state.clone()),
         token_pid_resolver(state.clone()),
+        state.clone(),
     );
     r.register(pid_window_guarded(BringToFrontTool, &pid_window_candidates));
     r.register(Box::new(SetWindowFrameTool));

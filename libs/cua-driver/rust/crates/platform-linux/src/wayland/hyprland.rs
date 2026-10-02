@@ -173,9 +173,9 @@ pub struct DesktopFrame {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CompositorPeer {
-    pid: libc::pid_t,
+    pub(super) pid: libc::pid_t,
     start_time: String,
-    path: PathBuf,
+    pub(super) path: PathBuf,
     device: u64,
     inode: u64,
 }
@@ -196,9 +196,13 @@ impl CompositorPeer {
     }
 
     fn verify_connection(&self, conn: &wayland_client::Connection) -> Result<()> {
+        self.verify_fd(conn.backend().poll_fd().as_raw_fd())
+    }
+
+    fn verify_fd(&self, fd: std::os::fd::RawFd) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
         let metadata = std::fs::metadata(&self.path)?;
-        if peer_pid(conn.backend().poll_fd().as_raw_fd())? != self.pid
+        if peer_pid(fd)? != self.pid
             || process_start_time(self.pid)? != self.start_time
             || metadata.dev() != self.device
             || metadata.ino() != self.inode
@@ -238,15 +242,25 @@ impl DesktopFrame {
         Ok(point)
     }
 
-    fn bind_compositor(mut self, peer: CompositorPeer) -> Result<Self> {
+    fn bind_compositor(self, peer: CompositorPeer) -> Result<Self> {
         let wayland = wayland_connection()?;
         peer.verify_connection(&wayland)?;
         let incarnation = format!("{peer:?}");
-        let events = super::hyprland_events::barrier(&incarnation, &peer.path, peer.pid)?;
+        let events = super::hyprland_events::barrier(&incarnation, &peer)?;
         // v0.56.2 socket2 omits layout/mode/DPMS signals. The already-loaded
         // production v3 plugin exports its monotonic event generations via
         // existing status; socket2 alone cannot certify those ABA transitions.
         let plugin_epoch = topology_plugin_epoch(&peer)?;
+        Ok(self.bind_observed_authority(peer, events, &plugin_epoch))
+    }
+
+    fn bind_observed_authority(
+        mut self,
+        peer: CompositorPeer,
+        events: super::hyprland_events::EventStamp,
+        plugin_epoch: &[(u64, String, u64)],
+    ) -> Self {
+        let incarnation = format!("{peer:?}");
         self.identity =
             cua_driver_core::capture_runtime::CaptureFrameIdentity::from_native_snapshot(
                 format!(
@@ -256,7 +270,7 @@ impl DesktopFrame {
                 .as_bytes(),
             );
         self.peer = Some(peer);
-        Ok(self)
+        self
     }
 
     pub(crate) fn verify_action_connection(&self, conn: &wayland_client::Connection) -> Result<()> {
@@ -264,6 +278,13 @@ impl DesktopFrame {
             .as_ref()
             .context("qualified action frame has no original compositor peer")?
             .verify_connection(conn)
+    }
+
+    pub(crate) fn verify_input_peer_fd(&self, fd: std::os::fd::RawFd) -> Result<()> {
+        self.peer
+            .as_ref()
+            .context("qualified source has no original compositor peer")?
+            .verify_fd(fd)
     }
 
     /// A final freshness check is not an atomic compositor transaction. Refuse
@@ -337,9 +358,23 @@ pub struct LocalWindowFrame {
     pub height: u32,
     pid: u32,
     address: u64,
+    peer: Option<CompositorPeer>,
 }
 
 impl LocalWindowFrame {
+    #[cfg(test)]
+    pub(crate) fn test_frame(pid: u32, address: u64, width: u32, height: u32) -> Self {
+        Self {
+            pid,
+            address,
+            width,
+            height,
+            identity: cua_driver_core::capture_runtime::CaptureFrameIdentity::from_native_snapshot(
+                b"fixture-client",
+            ),
+            peer: None,
+        }
+    }
     pub fn validate_current(&self) -> Result<()> {
         if local_window_frame(self.pid, self.address)?.identity != self.identity {
             bail!(cua_driver_core::capture_runtime::CaptureActionError::NativeActionFrameMismatch);
@@ -354,8 +389,7 @@ pub fn local_window_frame(pid: u32, address: u64) -> Result<LocalWindowFrame> {
     let conn = wayland_connection()?;
     peer.verify_connection(&conn)?;
     let incarnation = format!("{peer:?}");
-    let before =
-        super::hyprland_events::window_barrier(&incarnation, &peer.path, peer.pid, address)?;
+    let before = super::hyprland_events::window_barrier(&incarnation, &peer, address)?;
     let (windows, observed) = list_windows_with_peer()?;
     if observed != peer {
         bail!("native client observation belongs to a successor compositor");
@@ -370,16 +404,17 @@ pub fn local_window_frame(pid: u32, address: u64) -> Result<LocalWindowFrame> {
         .rsplit_once(')')
         .and_then(|(_, fields)| fields.split_whitespace().nth(19))
         .context("client process lifetime unavailable")?;
-    let after =
-        super::hyprland_events::window_barrier(&incarnation, &peer.path, peer.pid, address)?;
-    if before != after {
+    let after = super::hyprland_events::window_barrier(&incarnation, &peer, address)?;
+    if before.client_identity() != after.client_identity() {
         bail!("native client lifetime changed during observation");
     }
     Ok(LocalWindowFrame {
         identity: cua_driver_core::capture_runtime::CaptureFrameIdentity::from_native_snapshot(
             format!(
-                "client:{incarnation}:{pid}:{process_start}:{address}:{before:?}:{}:{}",
-                window.width, window.height
+                "client:{incarnation}:{pid}:{process_start}:{address}:{:?}:{}:{}",
+                before.client_identity(),
+                window.width,
+                window.height
             )
             .as_bytes(),
         ),
@@ -387,6 +422,7 @@ pub fn local_window_frame(pid: u32, address: u64) -> Result<LocalWindowFrame> {
         height: window.height,
         pid,
         address,
+        peer: Some(peer),
     })
 }
 
@@ -402,6 +438,132 @@ fn topology_plugin_epoch(peer: &CompositorPeer) -> Result<Vec<(u64, String, u64)
     }
     topology_plugin_epoch_from_status(&status)
         .context("topology_epoch_unavailable: incomplete production plugin event authority")
+}
+
+/// One bracketing observation for both the retained client and desktop. Idle
+/// pointer revocation and guarded action phases share these TWO barriers, not
+/// nested desktop_snapshot + local_window_frame helpers. No unchecked cache is
+/// substituted for either client lifetime or complete topology authority.
+pub(super) fn validate_window_observation(
+    original_frame: Option<&DesktopFrame>,
+    original_local: &LocalWindowFrame,
+    original_placement: Option<&Window>,
+) -> Result<()> {
+    with_observation_deadline(
+        Instant::now() + remaining_budget(Duration::from_secs(2))?,
+        || {
+            let peer = original_local
+                .peer
+                .as_ref()
+                .context("native client source has no original peer")?;
+            if original_frame.is_some_and(|frame| frame.peer.as_ref() != Some(peer)) {
+                bail!("native client and desktop observation have different original peers");
+            }
+            let incarnation = format!("{peer:?}");
+            let (before, (plugin_before, monitors, window, process_start, plugin_after), after) =
+                bracket_window_observation(
+                    || {
+                        super::hyprland_events::window_barrier(
+                            &incarnation,
+                            peer,
+                            original_local.address,
+                        )
+                    },
+                    || {
+                        let plugin_before = original_frame
+                            .map(|_| topology_plugin_epoch(peer))
+                            .transpose()?;
+                        let (monitors, observed): (serde_json::Value, _) =
+                            query_with_peer("j/monitors")?;
+                        if &observed != peer {
+                            bail!("native observation belongs to a successor compositor");
+                        }
+                        let (clients, observed): (Vec<Client>, _) = query_with_peer("j/clients")?;
+                        if &observed != peer {
+                            bail!("native clients belong to a successor compositor");
+                        }
+                        let monitors_for_windows: Vec<Monitor> =
+                            serde_json::from_value(monitors.clone())?;
+                        let active = monitors_for_windows
+                            .into_iter()
+                            .filter(|monitor| monitor.dpms_status)
+                            .flat_map(|monitor| {
+                                [monitor.active_workspace.id, monitor.special_workspace.id]
+                            })
+                            .filter(|id| *id != 0)
+                            .collect();
+                        let window = windows_from_clients(clients, &active)?
+                            .into_iter()
+                            .find(|window| {
+                                window.pid == original_local.pid
+                                    && window.address == original_local.address
+                            })
+                            .context("native original client no longer exists")?;
+                        let process_start = process_start_time(
+                            i32::try_from(window.pid).context("unrepresentable native pid")?,
+                        )?;
+                        let plugin_after = original_frame
+                            .map(|_| topology_plugin_epoch(peer))
+                            .transpose()?;
+                        Ok((plugin_before, monitors, window, process_start, plugin_after))
+                    },
+                )?;
+            if before.client_identity() != after.client_identity()
+                || (original_frame.is_some()
+                    && (before.topology() != after.topology() || plugin_before != plugin_after))
+            {
+                bail!("native observation changed while bracketing retained client/desktop");
+            }
+            let local_identity =
+                cua_driver_core::capture_runtime::CaptureFrameIdentity::from_native_snapshot(
+                    format!(
+                        "client:{incarnation}:{}:{process_start}:{}:{:?}:{}:{}",
+                        window.pid,
+                        window.address,
+                        before.client_identity(),
+                        window.width,
+                        window.height
+                    )
+                    .as_bytes(),
+                );
+            if local_identity != original_local.identity
+                || original_placement
+                    .is_some_and(|original| !same_held_window_placement(original, &window))
+            {
+                bail!(
+                    cua_driver_core::capture_runtime::CaptureActionError::NativeActionFrameMismatch
+                );
+            }
+            if let Some(original) = original_frame {
+                let current = desktop_frame_from_monitors(serde_json::from_value(monitors)?)?
+                    .bind_observed_authority(
+                        peer.clone(),
+                        before.topology(),
+                        plugin_before
+                            .as_ref()
+                            .expect("frame requires plugin authority"),
+                    );
+                if current.identity != original.identity {
+                    bail!(cua_driver_core::capture_runtime::CaptureActionError::NativeActionFrameMismatch);
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+fn bracket_window_observation<T>(
+    mut barrier: impl FnMut() -> Result<super::hyprland_events::EventStamp>,
+    observe: impl FnOnce() -> Result<T>,
+) -> Result<(
+    super::hyprland_events::EventStamp,
+    T,
+    super::hyprland_events::EventStamp,
+)> {
+    let before = barrier()?;
+    let value = observe()?;
+    let after = barrier()?;
+    Ok((before, value, after))
 }
 
 fn topology_plugin_epoch_from_status(
@@ -687,20 +849,51 @@ fn read_reply(stream: &mut UnixStream, command: &[u8], timeout: Duration) -> Res
 
 // v0.56.2 dispatch event posts an ordered `custom>>...` socket2 event.
 // It changes no desktop/input state; missing markers fail closed.
-pub(super) fn event_marker(marker: &str, peer: libc::pid_t) -> Result<()> {
-    let mut ipc = ipc_connection_with_timeout(remaining_budget(Duration::from_secs(1))?)?;
-    if peer_pid(ipc.as_raw_fd())? != peer {
-        bail!("Hyprland event marker compositor changed");
+pub(super) fn event_marker(marker: &str, peer: &CompositorPeer) -> Result<()> {
+    with_observation_deadline(
+        Instant::now() + remaining_budget(Duration::from_secs(1))?,
+        || {
+            event_marker_with(marker, |command| {
+                let mut ipc =
+                    ipc_connection_with_timeout(remaining_budget(Duration::from_secs(1))?)?;
+                if CompositorPeer::from_ipc(&ipc)? != *peer {
+                    bail!("Hyprland event marker compositor changed");
+                }
+                read_reply(
+                    &mut ipc,
+                    command.as_bytes(),
+                    remaining_budget(Duration::from_secs(1))?,
+                )
+            })
+        },
+    )
+}
+
+fn event_marker_with(marker: &str, mut send: impl FnMut(&str) -> Result<Vec<u8>>) -> Result<()> {
+    // Never interpolate caller text into Lua. All production markers are fixed
+    // prefix + generation + unpredictable lowercase hexadecimal nonce.
+    if !marker.starts_with("cua-authority-")
+        || marker.len() > 128
+        || !marker
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        bail!("invalid private event marker");
     }
-    let reply = read_reply(
-        &mut ipc,
-        format!("dispatch event {marker}").as_bytes(),
-        remaining_budget(Duration::from_secs(1))?,
-    )?;
-    if reply != b"ok" {
-        bail!("Hyprland event barrier marker refused");
+    let lua = format!("dispatch hl.dsp.event(\"{marker}\")");
+    match send(&lua)?.as_slice() {
+        b"ok" => Ok(()),
+        // v0.56.2 Hyprlang cannot resolve this fixed Lua dispatcher spelling.
+        // This exact pre-dispatch refusal is effect-free. No timeout, unknown
+        // reply or Lua evaluation error authorizes replay or another command.
+        b"Invalid dispatcher" => {
+            if send(&format!("dispatch event {marker}"))? != b"ok" {
+                bail!("Hyprland event barrier marker refused");
+            }
+            Ok(())
+        }
+        _ => bail!("Hyprland event barrier marker refused"),
     }
-    Ok(())
 }
 
 fn windows_from_clients(clients: Vec<Client>, active: &HashSet<i64>) -> Result<Vec<Window>> {
@@ -1087,6 +1280,53 @@ pub fn compose_desktop_capture(frame: &DesktopFrame) -> Result<Vec<u8>> {
 }
 
 pub fn compose_desktop_capture_until(frame: &DesktopFrame, deadline: Instant) -> Result<Vec<u8>> {
+    compose_desktop_capture_with(frame, deadline, |output, deadline| {
+        capture_output_png(
+            &output.name,
+            deadline,
+            u64::from(output.native_width) * u64::from(output.native_height) * 5 + 65536,
+        )
+    })
+}
+
+/// Constructible only by the owned in-process screencopy operation. It retains
+/// the original compositor/output plan proof, not a shape-based byte blessing.
+pub(crate) struct NativeDesktopPixels {
+    png: Vec<u8>,
+    identity: cua_driver_core::capture_runtime::CaptureFrameIdentity,
+}
+
+impl NativeDesktopPixels {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<u8>,
+        cua_driver_core::capture_runtime::CaptureFrameIdentity,
+    ) {
+        (self.png, self.identity)
+    }
+}
+
+pub(crate) fn capture_native_desktop_until(
+    frame: &DesktopFrame,
+    deadline: Instant,
+) -> Result<NativeDesktopPixels> {
+    let png = compose_desktop_capture_with(frame, deadline, |output, deadline| {
+        super::qualified_output_capture(frame, output, deadline)
+    })?;
+    Ok(NativeDesktopPixels {
+        png,
+        identity: frame.identity.clone(),
+    })
+}
+
+fn compose_desktop_capture_with(
+    frame: &DesktopFrame,
+    deadline: Instant,
+    mut capture: impl FnMut(&FrameOutput, Instant) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let deadline = CAPTURE_DEADLINE
+        .with(|capture| capture.get().map_or(deadline, |outer| outer.min(deadline)));
     let old = CAPTURE_DEADLINE.with(|capture| capture.replace(Some(deadline)));
     let _deadline = CaptureDeadlineGuard(old);
     capture_memory_budget(frame)?;
@@ -1094,11 +1334,7 @@ pub fn compose_desktop_capture_until(frame: &DesktopFrame, deadline: Instant) ->
     capture_deadline(deadline)?;
     let canvas = compose_frame(frame, |output| {
         capture_deadline(deadline)?;
-        let png = capture_output_png(
-            &output.name,
-            deadline,
-            u64::from(output.native_width) * u64::from(output.native_height) * 5 + 65536,
-        )?;
+        let png = capture(output, deadline)?;
         use image::ImageDecoder;
         let mut limits = image::Limits::default();
         limits.max_image_width = Some(output.native_width);
@@ -1395,6 +1631,18 @@ fn same_window_placement(original: &Window, current: &Window) -> bool {
         && current.workspace == original.workspace
 }
 
+fn same_held_window_placement(original: &Window, current: &Window) -> bool {
+    current.pid == original.pid
+        && current.address == original.address
+        && current.x == original.x
+        && current.y == original.y
+        && current.width == original.width
+        && current.height == original.height
+        && current.workspace == original.workspace
+        && current.hidden == original.hidden
+        && current.visible
+}
+
 fn desktop_point_in_window(
     frame: &DesktopFrame,
     window: &Window,
@@ -1519,6 +1767,123 @@ pub fn capture(address: u64, pid: Option<u32>) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn observation_batch_uses_exactly_two_barriers_and_keeps_local_epoch_separate() {
+        let calls = std::cell::Cell::new(0);
+        let (before, value, after) = bracket_window_observation(
+            || {
+                calls.set(calls.get() + 1);
+                Ok(super::super::hyprland_events::EventStamp::test_stamp(
+                    7,
+                    2,
+                    calls.get(),
+                ))
+            },
+            || {
+                assert_eq!(calls.get(), 1);
+                Ok("one metadata batch")
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(value, "one metadata batch");
+        assert_eq!(before.client_identity(), after.client_identity());
+        assert_ne!(before.topology(), after.topology());
+    }
+    #[test]
+    fn capture_proof_checks_actual_wayland_fd_not_equal_image_geometry() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("original-ipc.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let (client, _server) = UnixStream::pair().unwrap();
+        let conn = wayland_client::Connection::from_socket(client).unwrap();
+        let pid = peer_pid(conn.backend().poll_fd().as_raw_fd()).unwrap();
+        let original = CompositorPeer {
+            pid,
+            start_time: process_start_time(pid).unwrap(),
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        original.verify_connection(&conn).unwrap();
+        let mut wrong = original.clone();
+        wrong.pid += 1;
+        assert!(wrong.verify_connection(&conn).is_err());
+        wrong = original.clone();
+        wrong.start_time.push('0');
+        assert!(wrong.verify_connection(&conn).is_err());
+        wrong = original.clone();
+        wrong.inode += 1;
+        assert!(wrong.verify_connection(&conn).is_err());
+    }
+    #[test]
+    fn event_marker_uses_exact_v0562_lua_dispatcher_expression() {
+        let marker = "cua-authority-7-0123456789abcdef0123456789abcdef";
+        let mut calls = Vec::new();
+        event_marker_with(marker, |command| {
+            calls.push(command.to_owned());
+            assert_eq!(command, format!("dispatch hl.dsp.event(\"{marker}\")"));
+            Ok(b"ok".to_vec())
+        })
+        .unwrap();
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn event_marker_legacy_fallback_requires_exact_predispatch_refusal() {
+        let marker = "cua-authority-7-0123456789abcdef0123456789abcdef";
+        let mut calls = Vec::new();
+        event_marker_with(marker, |command| {
+            calls.push(command.to_owned());
+            Ok(if calls.len() == 1 {
+                b"Invalid dispatcher".to_vec()
+            } else {
+                b"ok".to_vec()
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            calls,
+            vec![
+                format!("dispatch hl.dsp.event(\"{marker}\")"),
+                format!("dispatch event {marker}")
+            ]
+        );
+        for reply in [
+            b"unknown".as_slice(),
+            b"Invalid dispatcher\n",
+            b"lua parse error",
+            b"ok\n",
+        ] {
+            let mut count = 0;
+            assert!(event_marker_with(marker, |_| {
+                count += 1;
+                Ok(reply.to_vec())
+            })
+            .is_err());
+            assert_eq!(count, 1);
+        }
+    }
+
+    #[test]
+    fn event_marker_unknown_io_and_injection_never_fallback() {
+        let mut count = 0;
+        assert!(event_marker_with("cua-authority-1-abcd", |_| {
+            count += 1;
+            bail!("reply deadline exceeded")
+        })
+        .is_err());
+        assert_eq!(count, 1);
+        for marker in [
+            r#"cua-authority-"));hl.dsp.exec("bad"#,
+            "cua-authority-a\n",
+            "other",
+        ] {
+            assert!(event_marker_with(marker, |_| panic!("invalid marker must not send")).is_err());
+        }
+    }
     #[test]
     fn translation_placement_ignores_titles_but_refuses_same_size_moved_client() {
         let original = window(0x100000010, 42);

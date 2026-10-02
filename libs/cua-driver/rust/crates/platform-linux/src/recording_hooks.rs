@@ -178,10 +178,16 @@ impl RecordingTurnContext for HyprlandRecordingTurn {
                 &self.native,
                 self.composite,
                 deadline,
-                || single_output_recording_capture(deadline),
+                || {
+                    recording_native_or_fallback(&self.native, deadline, || {
+                        single_output_recording_capture(deadline)
+                    })
+                },
                 |frame| {
-                    crate::wayland::hyprland::compose_desktop_capture_until(frame, deadline)
-                        .map(RecordingPixels::unqualified)
+                    recording_native_or_fallback(frame, deadline, || {
+                        crate::wayland::hyprland::compose_desktop_capture_until(frame, deadline)
+                            .map(RecordingPixels::unqualified)
+                    })
                 },
             )
             .map_err(|error| {
@@ -332,6 +338,30 @@ fn capture_recording_pixels(
 pub struct RecordingPixels {
     pub png: Vec<u8>,
     pub frame_identity: Option<cua_driver_core::capture_runtime::CaptureFrameIdentity>,
+}
+
+// The only qualification bridge uses the proof returned by the actual owned
+// in-process screencopy operation. All legacy cascades remain unqualified.
+#[cfg(target_os = "linux")]
+fn recording_native_or_fallback(
+    frame: &crate::wayland::hyprland::DesktopFrame,
+    deadline: std::time::Instant,
+    fallback: impl FnOnce() -> anyhow::Result<RecordingPixels>,
+) -> anyhow::Result<RecordingPixels> {
+    match crate::wayland::hyprland::capture_native_desktop_until(frame, deadline) {
+        Ok(proof) => {
+            let (png, identity) = proof.into_parts();
+            Ok(RecordingPixels::qualified(png, identity))
+        }
+        Err(_) => {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "recording capture timeout"
+            );
+            frame.validate_current()?;
+            fallback()
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -529,10 +559,18 @@ pub fn screenshot_for_recording(window_id: Option<u64>, pid: Option<i64>) -> Opt
                         &frame,
                         plan.composite,
                         deadline,
-                        || single_output_recording_capture(deadline),
+                        || {
+                            recording_native_or_fallback(&frame, deadline, || {
+                                single_output_recording_capture(deadline)
+                            })
+                        },
                         |frame| {
-                            crate::wayland::hyprland::compose_desktop_capture_until(frame, deadline)
+                            recording_native_or_fallback(frame, deadline, || {
+                                crate::wayland::hyprland::compose_desktop_capture_until(
+                                    frame, deadline,
+                                )
                                 .map(RecordingPixels::unqualified)
+                            })
                         },
                     )
                     .ok()?;

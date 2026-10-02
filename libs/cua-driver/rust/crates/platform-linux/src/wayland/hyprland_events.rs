@@ -24,6 +24,27 @@ const BARRIER_TIMEOUT: Duration = Duration::from_secs(3);
 pub(super) struct EventStamp {
     generation: u64,
     epoch: u64,
+    topology_epoch: u64,
+}
+
+impl EventStamp {
+    #[cfg(test)]
+    pub(super) fn test_stamp(generation: u64, epoch: u64, topology_epoch: u64) -> Self {
+        Self {
+            generation,
+            epoch,
+            topology_epoch,
+        }
+    }
+    pub(super) fn client_identity(self) -> (u64, u64) {
+        (self.generation, self.epoch)
+    }
+    pub(super) fn topology(self) -> Self {
+        Self {
+            epoch: self.topology_epoch,
+            ..self
+        }
+    }
 }
 
 struct Tracker {
@@ -39,23 +60,24 @@ thread_local! {
 
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-pub(super) fn barrier(incarnation: &str, ipc_path: &Path, peer: libc::pid_t) -> Result<EventStamp> {
-    scoped_barrier(incarnation, ipc_path, peer, None)
+pub(super) fn barrier(
+    incarnation: &str,
+    peer: &super::hyprland::CompositorPeer,
+) -> Result<EventStamp> {
+    scoped_barrier(incarnation, peer, None)
 }
 
 pub(super) fn window_barrier(
     incarnation: &str,
-    ipc_path: &Path,
-    peer: libc::pid_t,
+    peer: &super::hyprland::CompositorPeer,
     address: u64,
 ) -> Result<EventStamp> {
-    scoped_barrier(incarnation, ipc_path, peer, Some(address))
+    scoped_barrier(incarnation, peer, Some(address))
 }
 
 fn scoped_barrier(
     incarnation: &str,
-    ipc_path: &Path,
-    peer: libc::pid_t,
+    peer: &super::hyprland::CompositorPeer,
     address: Option<u64>,
 ) -> Result<EventStamp> {
     static TRACKER: OnceLock<Mutex<Option<Tracker>>> = OnceLock::new();
@@ -78,7 +100,7 @@ fn scoped_barrier(
     }) {
         // A new generation never revives an old frame, even if every monitor
         // has returned to exactly the old dimensions and origins.
-        *slot = Some(connect(incarnation, ipc_path, peer)?);
+        *slot = Some(connect(incarnation, &peer.path, peer.pid)?);
     }
     let tracker = slot
         .as_ref()
@@ -167,6 +189,7 @@ fn read_events(
                     drain_marker(&mut stream, &mut pending, &mut epoch, &marker).map(|()| {
                         EventStamp {
                             generation,
+                            topology_epoch: epoch,
                             epoch: address.map_or(epoch, |address| {
                                 WINDOW_EPOCHS.with(|epochs| {
                                     epochs.borrow().get(&address).copied().unwrap_or(0)

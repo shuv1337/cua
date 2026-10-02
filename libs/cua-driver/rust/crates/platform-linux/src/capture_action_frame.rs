@@ -4,6 +4,31 @@ use cua_driver_core::capture_runtime::{
 };
 use serde_json::Value;
 
+thread_local! {
+    static WORKER_RECORDING_SINK: std::cell::RefCell<Option<cua_driver_core::recording::RecordingAdmissionSink>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn recording_sink() -> Option<cua_driver_core::recording::RecordingAdmissionSink> {
+    cua_driver_core::recording::recording_admission_sink()
+        .or_else(|| WORKER_RECORDING_SINK.with(|slot| slot.borrow().clone()))
+}
+
+pub(crate) fn with_recording_sink<T>(
+    sink: Option<cua_driver_core::recording::RecordingAdmissionSink>,
+    work: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<cua_driver_core::recording::RecordingAdmissionSink>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WORKER_RECORDING_SINK.with(|slot| {
+                slot.replace(self.0.take());
+            });
+        }
+    }
+    let _restore = Restore(WORKER_RECORDING_SINK.with(|slot| slot.replace(sink)));
+    work()
+}
+
 fn window_target(pid: u32, window_id: u64) -> CaptureTarget {
     CaptureTarget::Window { pid, window_id }
 }
@@ -189,7 +214,7 @@ fn admit(
     // This function runs in the invocation future. Any future worker handoff
     // must carry this handle and binding explicitly; neither may be reacquired
     // after observation/consumption under a successor session generation.
-    let recording_sink = cua_driver_core::recording::recording_admission_sink();
+    let recording_sink = recording_sink();
     let source_binding = service.binding_from_args(args)?;
     if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
         let (dimensions, identity, desktop_frame) = match &target {
@@ -225,6 +250,9 @@ fn admit(
                     .is_none_or(|frame| frame.checked_layout_point(x, y).is_ok())
             },
         )?;
+        if let Some(source) = crate::wayland::hyprland_input::current_window_source() {
+            source.retain_admission(&source_binding, &admission);
+        }
         if admission.target == CaptureTarget::PrimaryDesktop {
             if let Some(sink) = &recording_sink {
                 sink.retain(&source_binding, &admission);
@@ -379,7 +407,7 @@ pub fn admit_desktop_click_in(
     let Some(frame) = space.frame() else {
         return admit_desktop_click(service, args, capture_id, screenshot_x, screenshot_y);
     };
-    let recording_sink = cua_driver_core::recording::recording_admission_sink();
+    let recording_sink = recording_sink();
     let source_binding = service.binding_from_args(args)?;
     frame.validate_current()?;
     let request = CaptureActionRequest {
@@ -393,6 +421,9 @@ pub fn admit_desktop_click_in(
     let admission = service.admit_action_checked(request, Some(&frame.identity), |x, y| {
         frame.checked_layout_point(x, y).is_ok()
     })?;
+    if let Some(source) = crate::wayland::hyprland_input::current_window_source() {
+        source.retain_admission(&source_binding, &admission);
+    }
     if let Some(sink) = &recording_sink {
         sink.retain(&source_binding, &admission);
     }

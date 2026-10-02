@@ -335,6 +335,7 @@ struct Client {
     cancellation: ActionCancellation,
     protocol: InputProtocol,
     foreground_supported: bool,
+    source_guard_supported: bool,
     delivery_route: Option<DeliveryRoute>,
     // Assigned by the compositor to this connection, never by the local pool.
     lane: Option<usize>,
@@ -345,6 +346,243 @@ struct Client {
     epoch: String,
     challenge: String,
     sequence: u64,
+}
+
+/// Invocation-owned source, not a reusable operation grant. Every new v3
+/// one-shot grant must reconcile with this original root/revision/geometry.
+#[derive(Debug)]
+pub(crate) struct WindowSource {
+    pub frame: super::hyprland::DesktopFrame,
+    pub local: super::hyprland::LocalWindowFrame,
+    pub binding: cua_driver_core::capture_runtime::CaptureBinding,
+    pub pid: u32,
+    pub address: u64,
+    owner: String,
+    path: PathBuf,
+    epoch: String,
+    pub original_token: String,
+    pub requested_capture_id: Option<String>,
+    revision: u64,
+    identity: String,
+    pub geometry: [f64; 6],
+    desktop_generation: u64,
+    admission: Mutex<Option<SourceAdmission>>,
+    #[cfg(test)]
+    native_validator: Option<fn() -> Result<()>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SourceAdmission {
+    pub capture_id: cua_driver_core::capture_runtime::CaptureId,
+    pub target: cua_driver_core::capture_runtime::CaptureTarget,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SourceMetadata {
+    identity: String,
+    revision: u64,
+    geometry: [f64; 6],
+    desktop_generation: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct WindowSourceRefusal(String);
+impl std::fmt::Display for WindowSourceRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for WindowSourceRefusal {}
+fn source_refusal(error: impl std::fmt::Display) -> anyhow::Error {
+    WindowSourceRefusal(error.to_string()).into()
+}
+
+fn source_metadata(target: &Value) -> Result<SourceMetadata> {
+    ensure!(target["source_guard_version"] == 1, "window_source_guard_unavailable: loaded v3 module lacks private fractional root-source capability; no hotload assumed");
+    let geometry = target["source_geometry"]
+        .as_array()
+        .context("window_source_guard_unavailable: missing source geometry")?;
+    ensure!(
+        geometry.len() == 6,
+        "window_source_guard_unavailable: invalid source geometry"
+    );
+    let mut values = [0.0; 6];
+    for (out, value) in values.iter_mut().zip(geometry) {
+        *out = value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .context("window_source_guard_unavailable: invalid fractional geometry")?;
+    }
+    ensure!(
+        values[2] > 0.0
+            && values[3] > 0.0
+            && target["width"].as_f64() == Some(values[2])
+            && target["height"].as_f64() == Some(values[3]),
+        "window_source_guard_unavailable: inconsistent source dimensions"
+    );
+    Ok(SourceMetadata {
+        identity: hex_field(target, "source_identity")?,
+        revision: target["revision"]
+            .as_u64()
+            .filter(|revision| *revision > 0)
+            .context("window_source_guard_unavailable: missing source revision")?,
+        geometry: values,
+        desktop_generation: target["desktop_generation"]
+            .as_u64()
+            .filter(|generation| *generation > 0)
+            .context("window_source_guard_unavailable: missing source generation")?,
+    })
+}
+
+impl WindowSource {
+    fn retain_action_point(&self, point: (f64, f64)) {
+        let Some(sink) = crate::capture_action_frame::recording_sink() else {
+            return;
+        };
+        let admission = self.admission();
+        if admission.as_ref().is_some_and(|admission| {
+            admission.target == cua_driver_core::capture_runtime::CaptureTarget::PrimaryDesktop
+        }) {
+            return; // Consumed desktop admission was already handed off once.
+        }
+        // Carry the original successful admission's ID, never rediscover or
+        // reconsume it. Requested-but-unconsumed is not genuinely unbound.
+        if self.requested_capture_id.is_some() && admission.is_none() {
+            return;
+        }
+        if admission.as_ref().is_some_and(|admission| {
+            admission.target
+                != (cua_driver_core::capture_runtime::CaptureTarget::Window {
+                    pid: self.pid,
+                    window_id: self.address,
+                })
+        }) {
+            return;
+        }
+        if self.geometry[0].fract() != 0.0
+            || self.geometry[1].fract() != 0.0
+            || self.geometry[0] < f64::from(i32::MIN)
+            || self.geometry[0] > f64::from(i32::MAX)
+            || self.geometry[1] < f64::from(i32::MIN)
+            || self.geometry[1] > f64::from(i32::MAX)
+            || self.geometry[2] != f64::from(self.local.width)
+            || self.geometry[3] != f64::from(self.local.height)
+        {
+            return;
+        }
+        let window = cua_driver_core::recording_frame::RecordingWindow {
+            pid: self.pid,
+            window_id: self.address,
+            origin: (self.geometry[0] as i32, self.geometry[1] as i32),
+            dimensions: (self.local.width, self.local.height),
+        };
+        sink.retain_window_action_point_with_capture_id(
+            &self.binding,
+            Some(&self.frame.identity),
+            &window,
+            point,
+            admission.as_ref().map(|admission| &admission.capture_id),
+        );
+    }
+    pub fn retain_admission(
+        &self,
+        binding: &cua_driver_core::capture_runtime::CaptureBinding,
+        admission: &cua_driver_core::capture_runtime::CaptureActionAdmission,
+    ) {
+        if binding != &self.binding {
+            return;
+        }
+        let mut slot = self
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if slot.is_none() {
+            *slot = Some(SourceAdmission {
+                capture_id: admission.capture_id.clone(),
+                target: admission.target.clone(),
+            });
+        }
+    }
+
+    pub fn admission(&self) -> Option<SourceAdmission> {
+        self.admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+    pub fn validate_native(&self) -> Result<()> {
+        #[cfg(test)]
+        if let Some(validate) = self.native_validator {
+            return validate();
+        }
+        super::hyprland::validate_window_observation(Some(&self.frame), &self.local, None)
+    }
+
+    pub fn translate(&self, x: f64, y: f64) -> Result<(f64, f64)> {
+        let (x, y) = self.frame.checked_layout_point(x, y)?;
+        let point = (x - self.geometry[0], y - self.geometry[1]);
+        ensure!(
+            point.0 >= 0.0
+                && point.1 >= 0.0
+                && point.0 < self.geometry[2]
+                && point.1 < self.geometry[3],
+            "desktop_coordinate_invalid: point outside original exact source client"
+        );
+        Ok(point)
+    }
+
+    fn reconcile(&self, client: &Client, target: &Value) -> Result<()> {
+        ensure!(
+            !self.original_token.is_empty(),
+            "window_source_changed: missing original operation grant"
+        );
+        #[cfg(test)]
+        let verify_peer = self.native_validator.is_none();
+        #[cfg(not(test))]
+        let verify_peer = true;
+        if verify_peer {
+            self.frame.verify_input_peer_fd(client.socket.as_raw_fd())?;
+        }
+        ensure!(client.pid == self.pid && client.address == self.address && client.owner == self.owner
+            && client.path == self.path && client.epoch == self.epoch,
+            "window_source_changed: original plugin connection/root authority changed; do not replay");
+        let metadata = source_metadata(target)?;
+        ensure!(metadata == SourceMetadata { identity: self.identity.clone(), revision: self.revision,
+            geometry: self.geometry, desktop_generation: self.desktop_generation },
+            "window_source_changed: original root/revision/origin changed; do not reinterpret coordinates");
+        Ok(())
+    }
+}
+
+thread_local! {
+    static WORKER_WINDOW_SOURCE: std::cell::RefCell<Option<Arc<WindowSource>>> = const { std::cell::RefCell::new(None) };
+}
+
+tokio::task_local! {
+    pub(crate) static INVOCATION_WINDOW_SOURCE: Arc<WindowSource>;
+}
+
+pub(crate) fn current_window_source() -> Option<Arc<WindowSource>> {
+    INVOCATION_WINDOW_SOURCE
+        .try_with(Arc::clone)
+        .ok()
+        .or_else(|| WORKER_WINDOW_SOURCE.with(|slot| slot.borrow().clone()))
+}
+
+pub(crate) fn with_window_source<T>(
+    source: Option<Arc<WindowSource>>,
+    work: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Arc<WindowSource>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WORKER_WINDOW_SOURCE.with(|slot| {
+                slot.replace(self.0.take());
+            });
+        }
+    }
+    let _restore = Restore(WORKER_WINDOW_SOURCE.with(|slot| slot.replace(source)));
+    work()
 }
 
 fn socket_path(lane: usize) -> Result<PathBuf> {
@@ -490,6 +728,7 @@ impl Client {
             cancellation,
             protocol: protocol(),
             foreground_supported: false,
+            source_guard_supported: false,
             delivery_route: None,
             lane: None,
             owner,
@@ -528,6 +767,8 @@ impl Client {
         self.epoch = hex_field(&hello, "epoch")?;
         self.foreground_supported =
             self.protocol == InputProtocol::Production && hello["foreground_target"] == true;
+        self.source_guard_supported =
+            self.protocol == InputProtocol::Production && hello["source_guard_version"] == 1;
         if self.protocol == InputProtocol::Experiment {
             self.challenge = hex_field(&hello, "challenge")?;
         } else {
@@ -651,6 +892,7 @@ impl Client {
             "input route is immutable"
         );
         self.delivery_route = Some(route);
+        let source = WORKER_WINDOW_SOURCE.with(|slot| slot.borrow().clone());
         let is_drag = matches!(&action, Action::Drag { .. });
         let mut started = started;
         for attempt in 0..=MAX_STALE_GEOMETRY_RETRIES {
@@ -665,6 +907,9 @@ impl Client {
             if target["ok"] == false {
                 return Ok(target);
             }
+            if let Some(source) = &source {
+                source.reconcile(self, &target).map_err(source_refusal)?;
+            }
             let token = hex_field(&target, "target")?;
             let revision = target["revision"]
                 .as_u64()
@@ -677,6 +922,23 @@ impl Client {
             );
             self.sequence = self.sequence.checked_add(1).context("sequence exhausted")?;
             let packet = action.packet(self.sequence, &token, revision, width, height)?;
+            if let Some(source) = &source {
+                let point = match &action {
+                    Action::Click { x, y, .. } => Some((*x, *y)),
+                    Action::Scroll { point, .. } => *point,
+                    Action::Drag { from, .. } => Some(*from),
+                    _ => None,
+                };
+                if let Some(point) = point {
+                    source.retain_action_point(point);
+                }
+            }
+            if let Some(source) = &source {
+                // One qualified observation after value-only recording work,
+                // immediately before dispatch; no unchecked observation cache.
+                source.validate_native().map_err(source_refusal)?;
+                source.reconcile(self, &target).map_err(source_refusal)?;
+            }
             let mut reply =
                 self.dispatch_routed_with_started(&packet, is_drag, &mut started, route)?;
             if self.protocol == InputProtocol::Production
@@ -686,6 +948,7 @@ impl Client {
                 && reply.get("effect").is_none()
                 && reply.get("delivery").is_none()
                 && attempt < MAX_STALE_GEOMETRY_RETRIES
+                && source.is_none()
             {
                 std::thread::sleep(STALE_GEOMETRY_BACKOFF * (attempt as u32 + 1));
                 continue;
@@ -998,6 +1261,102 @@ pub fn cleanup_runtime(prefix: &str) {
     }
 }
 
+pub(crate) fn prepare_window_source(
+    owner: Option<String>,
+    pid: u32,
+    address: u64,
+    foreground: bool,
+    frame: super::hyprland::DesktopFrame,
+    binding: cua_driver_core::capture_runtime::CaptureBinding,
+    requested_capture_id: Option<String>,
+    cancellation: ActionCancellation,
+) -> Result<WindowSource> {
+    ensure!(
+        enabled() && protocol() == InputProtocol::Production,
+        "window_source_guard_unavailable: production v3 input authority required"
+    );
+    let owner =
+        owner.context("window_source_guard_unavailable: authenticated lifecycle required")?;
+    let route = if foreground {
+        DeliveryRoute::Foreground
+    } else {
+        DeliveryRoute::Background
+    };
+    if route == DeliveryRoute::Background {
+        super::hyprland_compatibility::qualify(pid).map_err(|reason| anyhow::anyhow!(reason))?;
+    }
+    frame.validate_current()?;
+    let local = super::hyprland::local_window_frame(pid, address)?;
+    let client = session_client(&owner)?;
+    let mut slot = client.lock(&cancellation)?;
+    if let Some(client) = slot.as_ref() {
+        if client.pid != pid
+            || client.address != address
+            || client.path != socket_path(client.lane.context("missing claimed lane")?)?
+            || client.protocol != InputProtocol::Production
+            || client.delivery_route.is_some_and(|bound| bound != route)
+        {
+            *slot = None;
+        }
+    }
+    if slot.is_none() {
+        *slot = Some(claim_available(|lane| {
+            Client::connect(
+                socket_path(lane)?,
+                owner.clone(),
+                pid,
+                address,
+                lane,
+                cancellation.clone(),
+            )
+        })?);
+    }
+    let client = slot.as_mut().context("missing claimed source connection")?;
+    ensure!(client.source_guard_supported, "window_source_guard_unavailable: loaded module lacks private source_guard_version=1; no hotload assumed");
+    client.cancellation = cancellation;
+    client.attest()?;
+    frame.verify_input_peer_fd(client.socket.as_raw_fd())?;
+    client.check_route(route)?;
+    client.delivery_route = Some(route);
+    let target = client.bind_target(
+        &Action::Click {
+            x: 0.0,
+            y: 0.0,
+            button: 1,
+            count: 1,
+        },
+        route,
+    )?;
+    ensure!(
+        target["ok"] != false,
+        "window_source_guard_unavailable: target source refused: {}",
+        target["code"]
+    );
+    let metadata = source_metadata(&target)?;
+    let source = WindowSource {
+        frame,
+        local,
+        binding,
+        pid,
+        address,
+        owner,
+        path: client.path.clone(),
+        epoch: client.epoch.clone(),
+        original_token: hex_field(&target, "target")?,
+        requested_capture_id,
+        revision: metadata.revision,
+        identity: metadata.identity,
+        geometry: metadata.geometry,
+        desktop_generation: metadata.desktop_generation,
+        admission: Mutex::new(None),
+        #[cfg(test)]
+        native_validator: None,
+    };
+    source.reconcile(client, &target)?;
+    source.validate_native()?;
+    Ok(source)
+}
+
 /// Only same-lifecycle actions serialize. Independent authenticated sessions
 /// use independent sockets/seats and may overlap. Never retry unknown effects.
 pub(crate) fn execute(
@@ -1208,6 +1567,17 @@ fn execute_actions_routed(
     text: bool,
 ) -> Result<Value> {
     let (pid, address) = target;
+    let source = current_window_source();
+    if let Some(source) = &source {
+        if source.pid != pid
+            || source.address != address
+            || owner.as_deref() != Some(source.owner.as_str())
+        {
+            return Err(source_refusal(
+                "window_source_changed: original input target/lifecycle differs",
+            ));
+        }
+    }
     cancellation.check()?;
     ensure!(enabled(), "Hyprland isolated input is unavailable");
     ensure!(
@@ -1226,6 +1596,21 @@ fn execute_actions_routed(
     }
     let client = session_client(&owner)?;
     let mut slot = client.lock(&cancellation)?;
+    if let Some(source) = &source {
+        let client = slot.as_ref().ok_or_else(|| source_refusal("window_source_changed: original source connection was retired; no replacement permitted"))?;
+        if client.path != source.path
+            || client.epoch != source.epoch
+            || client.pid != source.pid
+            || client.address != source.address
+            || client.delivery_route != Some(route)
+            || client.protocol != protocol()
+            || client.path != socket_path(client.lane.context("missing claimed input lane")?)?
+        {
+            return Err(source_refusal(
+                "window_source_changed: source lane/root authority changed; no reconnect permitted",
+            ));
+        }
+    }
     if let Some(client) = slot.as_ref() {
         let lane = client.lane.context("missing claimed input lane")?;
         if client.pid != pid
@@ -1381,6 +1766,225 @@ fn terminal_connection_result(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    fn guarded_target() -> Value {
+        json!({"ok":true,"target":"11111111111111111111111111111111","revision":7,"width":100.0,"height":100.0,
+            "route":"primary_foreground","source_guard_version":1,"source_identity":"22222222222222222222222222222222",
+            "source_geometry":[2560.25,10.5,100.0,100.0,2562.25,12.5],"desktop_generation":3})
+    }
+
+    fn fixture_window_source(client: &Client) -> Arc<WindowSource> {
+        let metadata = source_metadata(&guarded_target()).unwrap();
+        Arc::new(WindowSource {
+            frame: super::super::hyprland::DesktopFrame {
+                x: 0,
+                y: 0,
+                width: 5120,
+                height: 1440,
+                scale: 1.5,
+                outputs: vec![super::super::hyprland::FrameOutput {
+                    name: "fixture".into(),
+                    x: 0,
+                    y: 0,
+                    width: 5120,
+                    height: 1440,
+                    native_width: 7680,
+                    native_height: 2160,
+                }],
+                identity:
+                    cua_driver_core::capture_runtime::CaptureFrameIdentity::from_native_snapshot(
+                        b"fixture-desktop",
+                    ),
+                peer: None,
+            },
+            local: super::super::hyprland::LocalWindowFrame::test_frame(
+                client.pid,
+                client.address,
+                100,
+                100,
+            ),
+            binding: cua_driver_core::capture_runtime::CaptureService::default()
+                .binding_from_args(&json!({"_session_id":"guard-fixture"}))
+                .unwrap(),
+            pid: client.pid,
+            address: client.address,
+            owner: client.owner.clone(),
+            path: client.path.clone(),
+            epoch: client.epoch.clone(),
+            original_token: "33333333333333333333333333333333".into(),
+            requested_capture_id: None,
+            revision: metadata.revision,
+            identity: metadata.identity,
+            geometry: metadata.geometry,
+            desktop_generation: metadata.desktop_generation,
+            admission: Mutex::new(None),
+            native_validator: Some(|| Ok(())),
+        })
+    }
+
+    #[test]
+    fn source_metadata_requires_private_capability_and_exact_fractional_root() {
+        let original = source_metadata(&guarded_target()).unwrap();
+        for field in [
+            "source_guard_version",
+            "source_identity",
+            "source_geometry",
+            "desktop_generation",
+            "revision",
+        ] {
+            let mut reply = guarded_target();
+            reply.as_object_mut().unwrap().remove(field);
+            assert!(source_metadata(&reply).is_err());
+        }
+        let mut moved = guarded_target();
+        moved["source_geometry"][0] = json!(2560.75);
+        assert_ne!(original, source_metadata(&moved).unwrap());
+        let mut root = guarded_target();
+        root["source_identity"] = json!("44444444444444444444444444444444");
+        assert_ne!(original, source_metadata(&root).unwrap());
+        let mut revision = guarded_target();
+        revision["revision"] = json!(8);
+        assert_ne!(original, source_metadata(&revision).unwrap());
+    }
+
+    #[test]
+    fn guarded_dispatch_retains_original_revision_and_refuses_fresh_stale_retry() {
+        let (mut client, peer) = production_test_client();
+        let source = fixture_window_source(&client);
+        assert_eq!(source.translate(2570.5, 20.75).unwrap(), (10.25, 10.25));
+        let server = std::thread::spawn(move || {
+            assert!(read_packet(&peer).starts_with("FOREGROUND_TARGET "));
+            peer.send(guarded_target().to_string().as_bytes()).unwrap();
+            let action = read_packet(&peer);
+            assert!(
+                action.starts_with("CLICK 1 11111111111111111111111111111111 7 "),
+                "{action}"
+            );
+            peer.send(
+                json!({"ok":false,"code":"stale_geometry","detail":"stale_geometry"})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+            let mut byte = [0u8];
+            assert_eq!(
+                unsafe { libc::recv(peer.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
+                0
+            );
+        });
+        let result = with_window_source(Some(source), || {
+            client.execute_routed_with_attest(
+                Action::Click {
+                    x: 10.25,
+                    y: 10.25,
+                    button: 1,
+                    count: 1,
+                },
+                None,
+                DeliveryRoute::Foreground,
+                record_test_attestation,
+            )
+        })
+        .unwrap();
+        assert_eq!(result["code"], "stale_geometry");
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn changed_same_size_origin_root_or_revision_sends_zero_action_packets() {
+        for change in ["origin", "root", "revision", "generation"] {
+            let (mut client, peer) = production_test_client();
+            let source = fixture_window_source(&client);
+            let server = std::thread::spawn(move || {
+                assert!(read_packet(&peer).starts_with("FOREGROUND_TARGET "));
+                let mut target = guarded_target();
+                match change {
+                    "origin" => target["source_geometry"][0] = json!(2561.25),
+                    "root" => target["source_identity"] = json!("44444444444444444444444444444444"),
+                    "revision" => target["revision"] = json!(8),
+                    _ => target["desktop_generation"] = json!(4),
+                }
+                peer.send(target.to_string().as_bytes()).unwrap();
+                let mut byte = [0u8];
+                assert_eq!(
+                    unsafe { libc::recv(peer.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
+                    0
+                );
+            });
+            let error = with_window_source(Some(source), || {
+                client.execute_routed_with_attest(
+                    Action::Click {
+                        x: 10.0,
+                        y: 10.0,
+                        button: 1,
+                        count: 1,
+                    },
+                    None,
+                    DeliveryRoute::Foreground,
+                    record_test_attestation,
+                )
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("window_source_changed"));
+            drop(client);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn text_phase_keeps_original_source_after_first_acknowledged_key() {
+        let (mut client, peer) = production_test_client();
+        let source = fixture_window_source(&client);
+        let server = std::thread::spawn(move || {
+            assert!(read_packet(&peer).starts_with("FOREGROUND_TARGET "));
+            peer.send(guarded_target().to_string().as_bytes()).unwrap();
+            assert!(read_packet(&peer).starts_with("KEY 1 11111111111111111111111111111111 7 "));
+            peer.send(
+                json!({"ok":true,"effect":"unverifiable","route":"primary_foreground"})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+            assert!(read_packet(&peer).starts_with("FOREGROUND_TARGET "));
+            let mut successor = guarded_target();
+            successor["revision"] = json!(8);
+            peer.send(successor.to_string().as_bytes()).unwrap();
+            let mut byte = [0u8];
+            assert_eq!(
+                unsafe { libc::recv(peer.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
+                0
+            );
+        });
+        let result = with_window_source(Some(source), || {
+            execute_text_actions(
+                vec![
+                    Action::TextKey {
+                        keycode: 30,
+                        shift: false,
+                    },
+                    Action::TextKey {
+                        keycode: 48,
+                        shift: false,
+                    },
+                ],
+                DeliveryRoute::Foreground,
+                |action| {
+                    client.execute_routed_with_attest(
+                        action,
+                        None,
+                        DeliveryRoute::Foreground,
+                        record_test_attestation,
+                    )
+                },
+            )
+        })
+        .unwrap();
+        assert_eq!(result["code"], "text_interrupted");
+        assert_eq!(result["effect"], "partial");
+        assert_eq!(result["delivery"]["delivered_count"], 1);
+        drop(client);
+        server.join().unwrap();
+    }
     use super::*;
     use std::cell::Cell;
     use std::os::fd::FromRawFd;
@@ -2719,6 +3323,7 @@ mod tests {
                 cancellation: ActionCancellation::default(),
                 protocol: InputProtocol::Experiment,
                 foreground_supported: false,
+                source_guard_supported: false,
                 delivery_route: None,
                 lane: None,
                 owner: "input-unregistered-test-client".into(),

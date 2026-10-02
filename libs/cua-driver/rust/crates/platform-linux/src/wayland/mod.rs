@@ -10,6 +10,7 @@
 //! compositor-attested surfaces and return a typed identity error otherwise.
 
 pub mod ext_screencopy;
+use anyhow::Context as _;
 pub mod ext_toplevel;
 pub mod hyprland;
 pub mod hyprland_capture;
@@ -395,6 +396,8 @@ struct State {
     // button press at the output centre (over the just-activated window).
     vptr_manager: Option<ZwlrVirtualPointerManagerV1>,
     output: Option<WlOutput>,
+    outputs: Vec<WlOutput>,
+    output_names: HashMap<String, Vec<WlOutput>>,
     // Logical (post-transform) output size: virtual-pointer absolute motion
     // maps onto the output's logical box, so rotated outputs swap axes.
     output_w: u32,
@@ -441,8 +444,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             } else if interface == WlOutput::interface().name {
                 let out = registry.bind::<WlOutput, _, _>(name, version.min(4), qh, ());
                 if state.output.is_none() {
-                    state.output = Some(out);
+                    state.output = Some(out.clone());
                 }
+                state.outputs.push(out);
             } else if interface == ZwlrScreencopyManagerV1::interface().name {
                 state.scrcopy_manager = Some(registry.bind::<ZwlrScreencopyManagerV1, _, _>(
                     name,
@@ -475,7 +479,7 @@ impl Dispatch<WlSeat, ()> for State {
 impl Dispatch<WlOutput, ()> for State {
     fn event(
         state: &mut Self,
-        _: &WlOutput,
+        output: &WlOutput,
         event: wl_output::Event,
         _: &(),
         _: &Connection,
@@ -485,14 +489,23 @@ impl Dispatch<WlOutput, ()> for State {
         // Modes are reported in the panel's native orientation; the geometry
         // transform turns them into the logical frame input coordinates use.
         match event {
-            wl_output::Event::Mode { width, height, .. } => {
+            wl_output::Event::Mode { width, height, .. }
+                if state.output.as_ref() == Some(output) =>
+            {
                 state.output_mode = (width.max(0) as u32, height.max(0) as u32);
             }
             wl_output::Event::Geometry {
                 transform: WEnum::Value(transform),
                 ..
-            } => {
+            } if state.output.as_ref() == Some(output) => {
                 state.output_transform = transform as u32;
+            }
+            wl_output::Event::Name { name } => {
+                state
+                    .output_names
+                    .entry(name)
+                    .or_default()
+                    .push(output.clone());
             }
             _ => return,
         }
@@ -770,14 +783,54 @@ fn capture_via_grim() -> anyhow::Result<Vec<u8>> {
 /// request a copy, wait for Ready, swap channels, encode PNG. Returns an error
 /// if any global is missing or the compositor flags the capture as failed.
 fn capture_via_screencopy() -> anyhow::Result<Vec<u8>> {
-    let conn = Connection::connect_to_env()?;
+    capture_via_screencopy_in(
+        None,
+        None,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+}
+
+pub(crate) fn qualified_output_capture(
+    native: &hyprland::DesktopFrame,
+    output: &hyprland::FrameOutput,
+    deadline: std::time::Instant,
+) -> anyhow::Result<Vec<u8>> {
+    hyprland::with_observation_deadline(deadline, || {
+        capture_via_screencopy_in(Some(native), Some(output), deadline)
+    })
+}
+
+struct ScreencopyMemory {
+    pointer: *mut libc::c_void,
+    len: usize,
+    fd: i32,
+}
+impl Drop for ScreencopyMemory {
+    fn drop(&mut self) {
+        cleanup_mmap(self.pointer, self.len, self.fd);
+    }
+}
+
+fn capture_via_screencopy_in(
+    native: Option<&hyprland::DesktopFrame>,
+    selected: Option<&hyprland::FrameOutput>,
+    deadline: std::time::Instant,
+) -> anyhow::Result<Vec<u8>> {
+    let conn = if native.is_some() {
+        hyprland::wayland_connection()?
+    } else {
+        Connection::connect_to_env()?
+    };
+    if let Some(native) = native {
+        native.verify_action_connection(&conn)?;
+    }
     let mut queue = conn.new_event_queue::<State>();
     let qh = queue.handle();
     conn.display().get_registry(&qh, ());
 
     let mut state = State::default();
-    queue.roundtrip(&mut state)?;
-    queue.roundtrip(&mut state)?; // outputs report their Mode
+    bounded_roundtrip(&conn, &mut queue, &mut state)?;
+    bounded_roundtrip(&conn, &mut queue, &mut state)?;
 
     let manager = state
         .scrcopy_manager
@@ -787,22 +840,21 @@ fn capture_via_screencopy() -> anyhow::Result<Vec<u8>> {
         .shm
         .clone()
         .ok_or_else(|| anyhow::anyhow!("compositor does not expose wl_shm"))?;
-    let output = state
-        .output
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("compositor exposed no wl_output to capture"))?;
+    let output = select_capture_output(&state, selected.map(|output| output.name.as_str()))?;
 
     let frame = manager.capture_output(0, &output, &qh, ());
     // Drain Buffer / Flags events; spin until Ready or Failed (or timeout).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut buffer: Option<WlBuffer> = None;
     let mut pool: Option<WlShmPool> = None;
-    let mut mmap_ptr: *mut libc::c_void = std::ptr::null_mut();
-    let mut mmap_len: usize = 0;
-    let mut fd: i32 = -1;
+    let mut memory = ScreencopyMemory {
+        pointer: std::ptr::null_mut(),
+        len: 0,
+        fd: -1,
+    };
+    let mut buffer_spec = None;
 
     loop {
-        queue.roundtrip(&mut state)?;
+        bounded_roundtrip(&conn, &mut queue, &mut state)?;
         if state.capture.failed {
             anyhow::bail!("compositor signalled screencopy failure");
         }
@@ -815,23 +867,26 @@ fn capture_via_screencopy() -> anyhow::Result<Vec<u8>> {
             .format
             .filter(|_| buffer.is_none() && state.capture.stride > 0 && state.capture.height > 0)
         {
-            let size = (state.capture.stride as usize)
-                .checked_mul(state.capture.height as usize)
-                .ok_or_else(|| anyhow::anyhow!("screencopy buffer size overflow"))?;
+            let (size, fmt) = native_screencopy_buffer_plan(
+                &state.capture,
+                fmt_raw,
+                selected.map(|output| (output.native_width, output.native_height)),
+            )?;
             let (anon_fd, p) = anon_shm(size)?;
-            fd = anon_fd;
-            mmap_ptr = p;
-            mmap_len = size;
-            use std::os::fd::AsFd as _;
-            let pool_fd = unsafe { borrowed_fd(fd) };
-            let p = shm.create_pool(pool_fd.as_fd(), size as i32, &qh, ());
-            let fmt: wl_shm::Format = match wl_shm::Format::try_from(fmt_raw) {
-                Ok(f) => f,
-                Err(_) => {
-                    cleanup_mmap(mmap_ptr, mmap_len, fd);
-                    anyhow::bail!("compositor advertised unsupported wl_shm format {fmt_raw:#x}");
-                }
+            memory = ScreencopyMemory {
+                pointer: p,
+                len: size,
+                fd: anon_fd,
             };
+            use std::os::fd::AsFd as _;
+            let pool_fd = unsafe { borrowed_fd(memory.fd) };
+            let p = shm.create_pool(pool_fd.as_fd(), size as i32, &qh, ());
+            buffer_spec = Some((
+                state.capture.width,
+                state.capture.height,
+                state.capture.stride,
+                fmt_raw,
+            ));
             let b = p.create_buffer(
                 0,
                 state.capture.width as i32,
@@ -846,7 +901,6 @@ fn capture_via_screencopy() -> anyhow::Result<Vec<u8>> {
             pool = Some(p);
         }
         if std::time::Instant::now() >= deadline {
-            cleanup_mmap(mmap_ptr, mmap_len, fd);
             anyhow::bail!("screencopy timed out waiting for frame");
         }
     }
@@ -856,12 +910,20 @@ fn capture_via_screencopy() -> anyhow::Result<Vec<u8>> {
         let h = state.capture.height;
         let stride = state.capture.stride as usize;
         let format = state.capture.format.unwrap_or(0);
-        if mmap_ptr.is_null() || mmap_len == 0 {
+        anyhow::ensure!(
+            buffer_spec == Some((w, h, state.capture.stride, format)),
+            "native screencopy buffer parameters changed after allocation"
+        );
+        if memory.pointer.is_null() || memory.len == 0 {
             anyhow::bail!("screencopy ready without a backing buffer");
         }
-        let raw = unsafe { std::slice::from_raw_parts(mmap_ptr as *const u8, mmap_len) };
+        let raw = unsafe { std::slice::from_raw_parts(memory.pointer as *const u8, memory.len) };
         let mut rgba = Vec::with_capacity((w as usize) * (h as usize) * 4);
         for row in 0..(h as usize) {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "native screencopy conversion deadline exceeded"
+            );
             let src_row = if state.capture.y_invert {
                 (h as usize) - 1 - row
             } else {
@@ -881,7 +943,16 @@ fn capture_via_screencopy() -> anyhow::Result<Vec<u8>> {
                 rgba.extend_from_slice(&[r, g, b, a]);
             }
         }
-        cua_driver_core::image_utils::encode_rgba_to_png(&rgba, w, h)
+        let png = cua_driver_core::image_utils::encode_rgba_to_png(&rgba, w, h)?;
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "native screencopy encode deadline exceeded"
+        );
+        if let Some(native) = native {
+            native.verify_action_connection(&conn)?;
+            native.validate_current()?;
+        }
+        Ok(png)
     })();
 
     // Always tear down regardless of result.
@@ -892,10 +963,65 @@ fn capture_via_screencopy() -> anyhow::Result<Vec<u8>> {
         p.destroy();
     }
     frame.destroy();
-    let _ = queue.roundtrip(&mut state);
-    cleanup_mmap(mmap_ptr, mmap_len, fd);
+    let _ = conn.flush();
 
     result
+}
+
+fn select_capture_output(state: &State, selected: Option<&str>) -> anyhow::Result<WlOutput> {
+    if let Some(name) = selected {
+        let outputs = state
+            .output_names
+            .get(name)
+            .context("qualified native capture output name unavailable")?;
+        anyhow::ensure!(
+            outputs.len() == 1,
+            "qualified native capture output name ambiguous"
+        );
+        Ok(outputs[0].clone())
+    } else {
+        state
+            .output
+            .clone()
+            .context("compositor exposed no wl_output to capture")
+    }
+}
+
+fn native_screencopy_buffer_plan(
+    capture: &CaptureState,
+    format: u32,
+    native_mode: Option<(u32, u32)>,
+) -> anyhow::Result<(usize, wl_shm::Format)> {
+    let size = (capture.stride as usize)
+        .checked_mul(capture.height as usize)
+        .ok_or_else(|| anyhow::anyhow!("screencopy buffer size overflow"))?;
+    anyhow::ensure!(
+        capture.width > 0
+            && capture.height > 0
+            && size <= 256 * 1024 * 1024
+            && size <= i32::MAX as usize
+            && capture.width <= i32::MAX as u32
+            && capture.height <= i32::MAX as u32
+            && u64::from(capture.stride) >= u64::from(capture.width) * 4,
+        "screencopy buffer budget/stride invalid"
+    );
+    anyhow::ensure!(
+        native_mode.is_none_or(|mode| mode == (capture.width, capture.height)),
+        "qualified native capture buffer does not match original output mode"
+    );
+    let format = wl_shm::Format::try_from(format)
+        .map_err(|_| anyhow::anyhow!("unsupported native screencopy pixel format"))?;
+    anyhow::ensure!(
+        matches!(
+            format,
+            wl_shm::Format::Argb8888
+                | wl_shm::Format::Xrgb8888
+                | wl_shm::Format::Abgr8888
+                | wl_shm::Format::Xbgr8888
+        ),
+        "unsupported native screencopy pixel format"
+    );
+    Ok((size, format))
 }
 
 /// Allocate an anonymous shared-memory file of `size` bytes and mmap it RW.
@@ -1355,7 +1481,9 @@ impl VptrSession {
     fn sync(&mut self) -> anyhow::Result<()> {
         if let Err(error) = bounded_roundtrip(&self.conn, &mut self.queue, &mut self.state) {
             if self.effect_started {
-                self.cleanup_owned()?;
+                if let Err(cleanup) = self.cleanup_owned() {
+                    anyhow::bail!("{cleanup}; original acknowledgment failure: {error}");
+                }
                 anyhow::bail!("held_pointer_partial_unknown: acknowledgment failed after input; owned cleanup acknowledged; do not replay: {error}");
             }
             return Err(error);
@@ -1364,8 +1492,10 @@ impl VptrSession {
     }
     fn validate_frame(&mut self) -> anyhow::Result<()> {
         if let Some(frame) = &self.frame {
-            if frame.validate_current().is_err() {
-                self.cleanup_owned()?;
+            if let Err(error) = frame.validate_current() {
+                if let Err(cleanup) = self.cleanup_owned() {
+                    anyhow::bail!("{cleanup}; original frame validation failure: {error}");
+                }
                 if self.effect_started {
                     anyhow::bail!(
                         "desktop_frame_changed_after_input: partial/unknown effect; do not replay"
@@ -4181,6 +4311,130 @@ mod output_transform_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dropped_session_sends_owned_release_before_destroy_on_original_wire() {
+        use std::io::Read;
+        let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            peer.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let pointer_id;
+        {
+            let conn = Connection::from_socket(socket).unwrap();
+            let queue = conn.new_event_queue::<State>();
+            let qh = queue.handle();
+            let registry = conn.display().get_registry(&qh, ());
+            let seat = registry.bind::<WlSeat, _, _>(1, 7, &qh, ());
+            let manager = registry.bind::<ZwlrVirtualPointerManagerV1, _, _>(2, 2, &qh, ());
+            let vptr = manager.create_virtual_pointer(Some(&seat), &qh, ());
+            pointer_id = vptr.id().protocol_id();
+            let session = VptrSession {
+                conn,
+                queue,
+                state: State::default(),
+                seat,
+                vptr,
+                output_w: 5120,
+                output_h: 1440,
+                origin_x: 0,
+                origin_y: 0,
+                frame: None,
+                effect_started: true,
+                held_buttons: std::collections::HashSet::from([272]),
+                owns_pointer: true,
+            };
+            drop(session);
+        }
+        let bytes = reader.join().unwrap();
+        let mut offset = 0;
+        let mut names = Vec::new();
+        while offset < bytes.len() {
+            let id = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            let header = u32::from_ne_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+            let size = (header >> 16) as usize;
+            assert!(size >= 8 && offset + size <= bytes.len());
+            if id == pointer_id {
+                let name =
+                    ZwlrVirtualPointerV1::interface().requests[(header & 0xffff) as usize].name;
+                if name == "button" {
+                    assert_eq!(
+                        u32::from_ne_bytes(bytes[offset + 12..offset + 16].try_into().unwrap()),
+                        272
+                    );
+                    assert_eq!(
+                        u32::from_ne_bytes(bytes[offset + 16..offset + 20].try_into().unwrap()),
+                        0
+                    );
+                }
+                names.push(name);
+            }
+            offset += size;
+        }
+        assert_eq!(names, vec!["button", "frame", "destroy"]);
+    }
+    #[test]
+    fn native_screencopy_plan_refuses_wrong_mode_stride_budget_and_format_before_allocation() {
+        let mut capture = CaptureState {
+            width: 3840,
+            height: 2160,
+            stride: 15360,
+            ..CaptureState::default()
+        };
+        assert_eq!(
+            native_screencopy_buffer_plan(&capture, 0, Some((3840, 2160)))
+                .unwrap()
+                .0,
+            33_177_600
+        );
+        assert!(native_screencopy_buffer_plan(&capture, 0, Some((2560, 1440))).is_err());
+        assert!(native_screencopy_buffer_plan(&capture, u32::MAX, Some((3840, 2160))).is_err());
+        capture.stride = 15359;
+        assert!(native_screencopy_buffer_plan(&capture, 0, None).is_err());
+        capture.stride = u32::MAX;
+        assert!(native_screencopy_buffer_plan(&capture, 0, None).is_err());
+        capture.width = 0;
+        assert!(native_screencopy_buffer_plan(&capture, 0, None).is_err());
+    }
+    #[test]
+    fn qualified_native_capture_selects_named_wire_output_not_equal_geometry_or_first_output() {
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let conn = Connection::from_socket(socket).unwrap();
+        let queue = conn.new_event_queue::<State>();
+        let qh = queue.handle();
+        let registry = conn.display().get_registry(&qh, ());
+        let first = registry.bind::<WlOutput, _, _>(1, 4, &qh, ());
+        let second = registry.bind::<WlOutput, _, _>(2, 4, &qh, ());
+        let mut state = State {
+            output: Some(first.clone()),
+            ..State::default()
+        };
+        <State as Dispatch<WlOutput, ()>>::event(
+            &mut state,
+            &first,
+            wl_output::Event::Name {
+                name: "DP-2".into(),
+            },
+            &(),
+            &conn,
+            &qh,
+        );
+        <State as Dispatch<WlOutput, ()>>::event(
+            &mut state,
+            &second,
+            wl_output::Event::Name {
+                name: "DP-1".into(),
+            },
+            &(),
+            &conn,
+            &qh,
+        );
+        assert_eq!(select_capture_output(&state, Some("DP-1")).unwrap(), second);
+        assert!(select_capture_output(&state, Some("missing")).is_err());
+        state.output_names.get_mut("DP-1").unwrap().push(first);
+        assert!(select_capture_output(&state, Some("DP-1")).is_err());
+    }
     #[test]
     fn positive_layout_checkbox_is_not_translated_twice_under_negative_union_origin() {
         let space = super::DesktopInputSpace {

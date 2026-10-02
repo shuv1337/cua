@@ -75,6 +75,7 @@ struct ActivePointer {
     /// evdev codes of buttons currently held down. When this set becomes
     /// empty the vptr is destroyed and the entry dropped from the map.
     held: HashSet<u32>,
+    queued_releases: HashSet<u32>,
     /// Pointer-space extent and layout origin at session open time — needed
     /// for motion_absolute.
     out_w: u32,
@@ -88,6 +89,10 @@ struct ActivePointer {
 /// Process-global command channel into the owner thread. Lazily started on
 /// first use.
 type Request = (Cmd, Arc<AtomicBool>);
+// Socket2 custom markers are visible to every subscriber. Idle revocation is
+// bounded to two observations/sec; command phases perform their own qualified
+// validation rather than redundantly running the whole idle observation first.
+const OWNER_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 static TX: OnceLock<Sender<Request>> = OnceLock::new();
 
 fn tx() -> &'static Sender<Request> {
@@ -106,7 +111,7 @@ fn owner_thread(rx: Receiver<Request>) {
     let mut cleanup_failures: HashMap<String, String> = HashMap::new();
     let mut revoked_releases: HashMap<String, HashSet<u32>> = HashMap::new();
     loop {
-        let command = rx.recv_timeout(std::time::Duration::from_millis(100));
+        let command = rx.recv_timeout(OWNER_IDLE_POLL);
         // Keep cancellation observable even if send succeeded just before the
         // caller's bounded receive timed out. Completed callers drop their Arc;
         // only unresolved replies remain; motion refuses at the explicit cap.
@@ -124,27 +129,17 @@ fn owner_thread(rx: Receiver<Request>) {
         // Poll even while the caller is idle. Metadata failures revoke the
         // originally owned device; never open a new connection to release into
         // a successor compositor. Polling does not prove unseen ABA transitions.
-        if active
-            .values()
-            .any(|p| p.frame.is_some() || p.target.is_some())
+        if matches!(&command, Err(crossbeam_channel::RecvTimeoutError::Timeout))
+            && active
+                .values()
+                .any(|p| p.frame.is_some() || p.target.is_some())
         {
             let observed = super::hyprland::with_observation_deadline(
                 std::time::Instant::now() + std::time::Duration::from_secs(2),
                 || {
-                    let current = if active.values().any(|p| p.frame.is_some()) {
-                        Some(super::hyprland::desktop_frame()?)
-                    } else {
-                        None
-                    };
                     let revoked: Vec<_> = active
                         .iter()
-                        .filter(|(_, p)| {
-                            p.frame.as_ref().is_some_and(|frame| {
-                                current
-                                    .as_ref()
-                                    .is_none_or(|now| now.identity != frame.identity)
-                            }) || validate_owned_target(p).is_err()
-                        })
+                        .filter(|(_, pointer)| validate_owned_target(pointer).is_err())
                         .map(|(key, _)| key.clone())
                         .collect();
                     Ok(revoked)
@@ -181,6 +176,9 @@ fn owner_thread(rx: Receiver<Request>) {
             | Cmd::Forget { cursor_id, reply } => (cursor_id, reply),
         };
         if cancelled.load(Ordering::Acquire) {
+            if matches!(&cmd, Cmd::Press { .. }) {
+                continue;
+            }
             let result = destroy_owned(&mut active, cursor_id);
             retain_cleanup_failure(&mut cleanup_failures, cursor_id, &result);
             continue;
@@ -203,6 +201,7 @@ fn owner_thread(rx: Receiver<Request>) {
                     continue;
                 }
                 revoked_releases.remove(&cursor_id);
+                let previously_owned = active.contains_key(&cursor_id);
                 let r = super::hyprland::with_observation_deadline(
                     std::time::Instant::now() + std::time::Duration::from_secs(2),
                     || handle_press(&mut active, &cursor_id, window_id, x, y, button, &cancelled),
@@ -211,20 +210,24 @@ fn owner_thread(rx: Receiver<Request>) {
                     .as_ref()
                     .err()
                     .is_some_and(|error| error.to_string().starts_with("cleanup_unconfirmed:"));
-                let r = if cancelled.load(Ordering::Acquire) && !cleanup_unconfirmed {
-                    destroy_owned(&mut active, &cursor_id).and_then(|()| {
-                        Err(anyhow::anyhow!(
-                            "cancelled_after_input: partial/unknown effect"
-                        ))
-                    })
-                } else {
-                    r
-                };
+                let created_entry = !previously_owned && active.contains_key(&cursor_id);
+                let r =
+                    if cancelled.load(Ordering::Acquire) && !cleanup_unconfirmed && created_entry {
+                        destroy_owned(&mut active, &cursor_id).and_then(|()| {
+                            Err(anyhow::anyhow!(
+                                "cancelled_after_input: partial/unknown effect"
+                            ))
+                        })
+                    } else {
+                        r
+                    };
                 retain_cleanup_failure(&mut cleanup_failures, &cursor_id, &r);
-                if let Some(pointer) = active.get_mut(&cursor_id) {
-                    pointer.pending_replies.push(cancelled.clone());
+                if created_entry {
+                    if let Some(pointer) = active.get_mut(&cursor_id) {
+                        pointer.pending_replies.push(cancelled.clone());
+                    }
                 }
-                if reply.send(r).is_err() {
+                if reply.send(r).is_err() && created_entry {
                     let cleanup = destroy_owned(&mut active, &cursor_id);
                     retain_cleanup_failure(&mut cleanup_failures, &cursor_id, &cleanup);
                 }
@@ -301,9 +304,85 @@ fn revoke_cancelled_replies(pending: &mut Vec<Arc<AtomicBool>>) -> bool {
     revoked
 }
 
+fn queue_owned_release(
+    held: &HashSet<u32>,
+    queued: &mut HashSet<u32>,
+    button: u32,
+    release: impl FnOnce(u32),
+) -> anyhow::Result<()> {
+    if !held.contains(&button) {
+        anyhow::bail!("mouse_release_not_owned: no matching held button");
+    }
+    if !queued.insert(button) {
+        anyhow::bail!("cleanup_unconfirmed: original release already queued, no replay permitted");
+    }
+    release(button);
+    Ok(())
+}
+
 #[cfg(test)]
 mod reply_cancellation_tests {
     use super::*;
+
+    #[test]
+    fn queued_cancelled_press_never_opens_a_native_session_or_dispatches() {
+        let (tx, rx) = bounded(2);
+        let (reply, receive) = bounded(1);
+        tx.send((
+            Cmd::Press {
+                cursor_id: "cancelled-fixture".into(),
+                window_id: 1,
+                x: 1,
+                y: 1,
+                button: 1,
+                reply,
+            },
+            Arc::new(AtomicBool::new(true)),
+        ))
+        .unwrap();
+        drop(tx);
+        // The real owner processes cancellation before attempting any native
+        // open. An uncancelled request would return an unavailable-session error
+        // in this hermetic environment; this one never dispatches or replies.
+        owner_thread(rx);
+        assert!(matches!(
+            receive.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn idle_poll_cadence_is_bounded_to_two_batches_per_second() {
+        assert_eq!(OWNER_IDLE_POLL, std::time::Duration::from_millis(500));
+    }
+
+    #[test]
+    fn release_ack_failure_does_not_queue_second_release_during_cleanup() {
+        let held = HashSet::from([272]);
+        let mut queued = HashSet::new();
+        let wire = std::cell::RefCell::new(Vec::new());
+        queue_owned_release(&held, &mut queued, 272, |button| {
+            wire.borrow_mut().push(format!("release:{button}"))
+        })
+        .unwrap();
+        let cleanup = super::super::release_before_destroy(
+            held.difference(&queued).copied(),
+            |button| wire.borrow_mut().push(format!("release:{button}")),
+            || {
+                wire.borrow_mut().push("ack-failed".into());
+                anyhow::bail!("stalled original peer")
+            },
+            || wire.borrow_mut().push("destroy-original".into()),
+        );
+        assert!(cleanup.is_err());
+        assert_eq!(
+            *wire.borrow(),
+            vec!["release:272", "ack-failed", "destroy-original"]
+        );
+        assert!(
+            queue_owned_release(&held, &mut queued, 272, |_| panic!("duplicate release")).is_err()
+        );
+    }
 
     #[test]
     fn delivered_reply_then_receive_timeout_still_revokes_owned_pointer() {
@@ -336,7 +415,7 @@ fn destroy_owned(
         // seat buttons. Release only this device's tracked buttons, with no
         // motion, focus change, fresh connection or successor target.
         result = super::release_before_destroy(
-            pointer.held,
+            pointer.held.difference(&pointer.queued_releases).copied(),
             |button| pointer.vptr.button(0, button, ButtonState::Released),
             || { pointer.vptr.frame(); roundtrip_on_persistent(cursor_id) },
             || pointer.vptr.destroy(),
@@ -359,7 +438,14 @@ fn finish_command(
     match result {
         Ok(()) => Ok(()),
         Err(error) => {
-            destroy_owned(active, cursor_id)?;
+            if error.to_string().starts_with("mouse_release_not_owned:") {
+                return Err(error);
+            }
+            destroy_owned(active, cursor_id)
+                .map_err(|cleanup| anyhow::anyhow!("{cleanup}; original failure: {error}"))?;
+            if error.to_string().starts_with("cleanup_unconfirmed:") {
+                return Err(error);
+            }
             Err(anyhow::anyhow!(
                 "held_pointer_partial_unknown: owned cleanup acknowledged; do not replay: {error}"
             ))
@@ -447,6 +533,7 @@ fn handle_press(
             pending_replies: Vec::new(),
             vptr,
             held,
+            queued_releases: HashSet::new(),
             out_w: w,
             out_h: h,
             origin_x: sess.origin_x,
@@ -472,9 +559,6 @@ fn handle_move(
     })?;
     if entry.pending_replies.len() >= 32 {
         anyhow::bail!("persistent pointer unresolved reply budget exceeded");
-    }
-    if let Some(frame) = &entry.frame {
-        frame.validate_current()?;
     }
     validate_owned_target(entry)?;
     if cancelled.load(Ordering::Acquire) {
@@ -516,12 +600,9 @@ fn native_geometry_matches(original: &super::hyprland::Window) -> bool {
 
 fn validate_owned_target(pointer: &ActivePointer) -> anyhow::Result<()> {
     if let Some((window, frame)) = &pointer.target {
+        super::hyprland::validate_window_observation(pointer.frame.as_ref(), frame, Some(window))?;
+    } else if let Some(frame) = &pointer.frame {
         frame.validate_current()?;
-        if !native_geometry_matches(window) {
-            anyhow::bail!(
-                "native held-pointer target geometry changed; do not replay old local coordinates"
-            );
-        }
     }
     Ok(())
 }
@@ -533,16 +614,22 @@ fn handle_release(
 ) -> anyhow::Result<()> {
     let btn = evdev_pointer_button(button);
     let drop_entry = {
-        let entry = active
-            .get_mut(cursor_id)
-            .ok_or_else(|| anyhow::anyhow!("no held mouse button for cursor '{cursor_id}'"))?;
-        if !entry.held.contains(&btn) {
-            anyhow::bail!("mouse_release_not_owned: no matching held button");
-        }
-        entry.vptr.button(0, btn, ButtonState::Released);
+        let entry = active.get_mut(cursor_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "mouse_release_not_owned: no held mouse button for cursor '{cursor_id}'"
+            )
+        })?;
+        // Queue exactly one release. A failed acknowledgment must drain/close
+        // the original connection, not emit the same Released a second time.
+        queue_owned_release(&entry.held, &mut entry.queued_releases, btn, |button| {
+            entry.vptr.button(0, button, ButtonState::Released)
+        })?;
         entry.vptr.frame();
-        roundtrip_on_persistent(cursor_id)?;
+        roundtrip_on_persistent(cursor_id).map_err(|error| {
+            anyhow::anyhow!("cleanup_unconfirmed: original release acknowledgment failed: {error}")
+        })?;
         entry.held.remove(&btn);
+        entry.queued_releases.remove(&btn);
         entry.held.is_empty()
     };
     if drop_entry {
