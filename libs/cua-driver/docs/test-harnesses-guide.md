@@ -150,23 +150,45 @@ and does not waive the affected CI, native evidence, or release gates in
 
 ## Supplemental native dual-display acceptance
 
-`hyprland_dual_display_test` is a **manual supporting** row, not a new CI
+`hyprland_dual_display_test` contains two **manual supporting** rows, not a new CI
 requirement or a replacement for any complete canonical/native Hyprland gate.
 It tests the public `primary` aggregate desktop alias; it does not introduce
 per-output `display_id` targeting. The read-only preflight requires exactly:
 
 - DP-2: 3840×2160, scale 1.5, transform 0, powered, origin (0,0).
 - DP-1: 3840×2160, scale 1.5, transform 0, powered, origin (2560,0).
-- Native Hyprland/Wayland, no `DISPLAY` fallback, and an **empty isolated desktop**
-  (no existing clients). GTK3/PyGObject, `grim`, and GNU `timeout` must already be
-  available. The candidate's native foreground plugin route must already be
-  configured/attested; the test never installs, reloads or enables it.
-  Independent compositor/capture commands have ten-second deadlines.
+- Native Hyprland **0.56.2**/Wayland, no `DISPLAY` fallback; GTK3/PyGObject,
+  `grim`, and GNU `timeout` must already be available.
+- DP-2 must already show **workspace 91**, DP-1 **workspace 92**; both special
+  workspaces must be closed (`specialWorkspace.id == 0`). Workspace records must
+  match their exact monitor, with `windows:0` and `hasfullscreen:false` before
+  launch, and one exact native fullscreen fixture each after launch.
+- No client may belong to 91/92 before launch, regardless of `mapped`, `hidden`
+  or newer `visible` fields. No pinned client may be on either monitor. Ordinary
+  inactive and closed-special-workspace user clients remain allowed, including
+  `mapped:true, hidden:false, visible:true` and inactive fullscreen clients.
+- No overlay-level layer surface may be present on either output. The parent
+  prepares do-not-disturb; the test logs layer counts and refuses notifications
+  or other overlay surfaces rather than dismissing them.
 
-Do not run this against the user's working desktop. Do not close their windows,
-unlock the session, reconfigure monitors, install or enable a plugin, or change
-global window rules to pass preflight. Prepare the isolated session separately
-with explicit authorization. GTK's fullscreen-on-monitor hint must place both
+The workspace predicate is qualified against Hyprland 0.56.2: unmanaged
+XWayland surfaces are assigned a workspace on map/configure, so active-workspace
+membership catches them without inventing an `overrideRedirect` JSON field.
+Missing/ambiguous workspace or monitor identity fails closed. Re-review this
+guarantee before changing the compositor-version precondition.
+
+The **separate foreground-plugin row** additionally requires an already
+configured/attested candidate native foreground route and
+`CUA_TEST_DUAL_DISPLAY_FOREGROUND_PLUGIN=1`. An absent gate fails, never silently
+passes or skips. The test never installs, reloads or enables the plugin.
+Independent compositor/capture commands time out after ten seconds, with a
+one-second hard-kill backstop for only their own subprocesses.
+
+Do not run this on occupied active workspaces. Do not close or move user windows,
+unlock the session, reconfigure monitors, reboot, or change global rules to pass
+preflight. The parent prepares the disposable workspaces with explicit
+authorization; the test itself performs no workspace switching. GTK's
+fullscreen-on-monitor hint must place both
 disposable fixtures at the exact compositor-reported bounds; refusal to honor
 that hint is a fixture/environment failure, not permission to weaken assertions.
 
@@ -180,7 +202,7 @@ CARGO_TARGET_DIR=/tmp/shuvcode/cua-dual-display-tests-target \
   cargo test --locked -p cua-driver-e2e --test hyprland_dual_display_test
 ```
 
-Later, in the already prepared isolated native session, build the Driver from
+Later, on the already prepared 91/92 workspaces, build the Driver from
 the integrated stable candidate, record the checkout SHA and binary hash, and
 run explicitly (absolute binary path, replace the SHA/path below):
 
@@ -190,10 +212,26 @@ env -u DISPLAY CUA_TEST_DUAL_DISPLAY_PREPARED=1 \
   CUA_TEST_DRIVER_BIN=/absolute/path/to/candidate/cua-driver \
   CUA_E2E_SOURCE_SHA=FULL_40_CHARACTER_CANDIDATE_SHA \
   cargo test --locked -p cua-driver-e2e --test hyprland_dual_display_test \
-  -- --ignored --nocapture --test-threads=1
+   -- --ignored --exact native_dual_output_capture_and_desktop_input \
+   --nocapture --test-threads=1
 ```
 
-The row checks 5120×1440 screen and per-output metadata, compositor-addressed
+Run the foreground-plugin row separately with the same environment plus
+`CUA_TEST_DUAL_DISPLAY_FOREGROUND_PLUGIN=1`, replacing the exact test name with
+`native_dual_output_window_foreground_plugin_input`. Selecting the whole ignored
+binary requires that gate and serial execution; it is not the plugin-free
+desktop command.
+
+Before and after every capture/action boundary, the guard reads **monitors →
+clients/workspaces → monitors**, requiring 91/92 to stay active and no special
+workspace to appear. It verifies exact fixture PID/full-address/workspace/output
+and bounds, expected workspace window counts, no foreign active/pinned clients,
+and every pre-existing client's private snapshot unchanged. Inactive clients
+are not misclassified by `hidden` or `visible`. Overlay-layer checks repeat at
+these boundaries. This is fail-closed observation, not an atomic compositor
+transaction; no concurrent agent/human input is allowed.
+
+The desktop row checks 5120×1440 screen and per-output metadata, compositor-addressed
 window-bounds offsets, both composed capture halves against independently
 captured `grim -s 1 -o` logical pixels with color/position tolerances, and
 2560×720 capped pixels. Visible white fixture markers independently match each
@@ -205,31 +243,72 @@ Primary-seat desktop clicks cover both centers, first/last-pixel corners, and th
 seam-adjacent pixels. Separate GTK raw press/release journals and incremented
 click counters establish actual delivery/effects; `hyprctl cursorpos` and Driver
 live readback establish landing rather than commanded/synthetic bookkeeping.
-Scroll reaches each output; a seam-crossing drag verifies the original GTK
-surface's implicit-grab release and final primary position. Legacy capped-image
+Scroll journals direction, deltas and stop flags: exactly one discrete **down**
+tick must increment the fixture counter; optional downward smooth/stop packets
+are allowed but never qualify alone. A seam-crossing drag verifies the original
+GTK surface's implicit-grab release, no peer button delivery, and final primary
+position. Legacy capped-image
 and capture-bound clicks must each map once. Reusing a consumed capture must
 return exactly `capture_not_found`/`effect:refused` without another button event.
 Actions are never replayed to make the test pass.
 
-Window-addressed foreground click/double/right-click, scroll and drag use
+The foreground-plugin row's window-addressed click/double/right-click, scroll and drag use
 `coordinate_frame:desktop` on DP-1 with `DISPLAY` absent and real fixture event
-coordinates/counters. Window-addressed held down/up exercise both desktop-frame
+coordinates/counters, with a separate window-local foreground click checking
+no second `/1.5`. The desktop row's window-addressed held down/up exercise both desktop-frame
 translation paths at the same press/release point using the persistent primary
 seat, not raw background plugin delivery. Desktop hover observes raw GTK motion
 and independent pointer readback. Logs pin `hyprctl version`, source-SHA claim,
 the existing testkit `OracleKind` tags, and tool elapsed times (no unagreed
 latency threshold or canonical v2 report claim).
 
+The held-button row runs last. Its owned-Driver RAII guard is armed before down,
+uses raw down/up responses without a panicking wrapper/check between them, and
+attempts an owned-target release on failure/unwind before reaping the Driver.
+An explicit owned release is the only permitted cleanup retry; no input action
+is replayed. Actual release events must still pass the external oracle.
+
 The testkit reaper terminates only the two fixture processes on success or
-failure. Private temporary fixture journals/screenshots are removed by RAII;
+failure. Afterwards, including during assertion unwind, the guard verifies
+all pre-existing clients unchanged (all client fields except volatile
+`focusHistoryID`/`fullscreenClient`) and active workspaces still 91/92, with the
+fixtures gone and workspace window counts zero. Failure cannot become a pass;
+an unwind cleanup failure emits a clear parent-restoration warning.
+Private temporary fixture journals/screenshots are removed by RAII;
 this supporting row does not start a recording or publish desktop captures.
 Keep any explicitly enabled testkit artifacts private. Foreground pointer/focus
 movement is intentional and has no restoration promise; closing the disposable
 fixtures restores their occupied surfaces, not prior primary-seat state. The
-row must not run concurrently with another GUI test or human input.
+rows must not run concurrently with another GUI test or human input. Journals
+have a 2 Hz heartbeat, 20,000-event/3 MiB fixture cap, and a bounded 4 MiB reader;
+overflow is a failure, never truncated/recycled evidence.
+RAII covers normal completion and assertion unwind, not abrupt `SIGKILL` or
+power loss; the parent must inspect owned targets and workspace state if the
+process was forcibly terminated.
 
-Limits: this row does not certify raw background exact-client plugin routing,
-overlay artwork/high-DPI fidelity, semantic cross-client drag-and-drop,
+**Parent-only preparation/restoration checklist:**
+
+1. Privately record both monitors' original active/special workspace IDs and all
+   client snapshots. Ensure 91/92 are unused/empty and on the intended outputs;
+   if occupied, stop rather than moving/closing user apps. Record notification
+   suppression state before changing it, if needed.
+2. Using the parent's verified native workspace controls, focus DP-2 and select
+   91, then DP-1 and select 92. Close only special-workspace *visibility*, if
+   authorized, never its app windows. Confirm the read-only prerequisites above.
+   No persistent workspace rule, monitor change, reboot or app closure is needed.
+3. Run the exact supplemental rows serially, without other agent/human input.
+   Tests leave 91/92 active; success or failure must reap only disposable targets.
+4. Inspect cleanup output even after failure. Verify the parent's client snapshot
+   and monitor layout, restore the recorded active workspaces on each original
+   monitor, then restore special-workspace visibility and notification state.
+   If preservation verification failed, inspect first; never blindly close,
+   relocate or recreate user clients to force a match.
+
+Limits: agent overlay is **disabled** by `spawn_named`; placement/artwork/high-DPI
+fidelity is not covered. GTK3 is an integer-backing-scale client at output scale
+1.5; logical input is covered, but fractional-scale-aware GTK4/Chromium clients
+are not qualified by these rows. They do not certify raw background exact-client
+plugin routing, semantic cross-client drag-and-drop,
 negative/mixed/rotated layouts, held-gesture
 topology transitions or actual same-size topology changes. The existing
 qualified Inkscape/LibreOffice background proofs remain separate; GTK is not

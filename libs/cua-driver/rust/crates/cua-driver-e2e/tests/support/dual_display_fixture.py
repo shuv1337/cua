@@ -2,6 +2,7 @@
 """Disposable native fullscreen color/event oracle; never changes output configuration."""
 import argparse
 import json
+import os
 import time
 
 import gi
@@ -21,10 +22,20 @@ if len(matches) != 1:
     raise RuntimeError("exact GDK output identity unavailable: " + args.output)
 
 state = {"clicks": 0, "scrolls": 0}
+written = 0
+records = 0
 
 
 def record(kind, **values):
-    journal.write(json.dumps({"kind": kind, "time": time.monotonic_ns(), **values}) + "\n")
+    global written, records
+    line = json.dumps({"kind": kind, "time": time.monotonic_ns(), **values}) + "\n"
+    if records >= 20000 or written + len(line.encode()) > 3 * 1024 * 1024:
+        journal.write('{"kind":"journal-resource-cap"}\n')
+        journal.flush()
+        os._exit(75)  # Only this disposable fixture exits; never truncate/recycle evidence.
+    journal.write(line)
+    written += len(line.encode())
+    records += 1
 
 
 window = Gtk.Window(title="Cua Dual Display " + args.output)
@@ -56,11 +67,20 @@ def event(widget, e):
                   Gdk.EventType.MOTION_NOTIFY, Gdk.EventType.SCROLL):
         if e.type == Gdk.EventType.BUTTON_RELEASE:
             state["clicks"] += 1
+        scroll = {}
         if e.type == Gdk.EventType.SCROLL:
-            state["scrolls"] += 1
+            direction = e.direction.value_nick
+            _ok, dx, dy = e.get_scroll_deltas()
+            if not _ok:  # Discrete directions have no smooth-delta payload.
+                dx, dy = 0.0, 0.0
+            is_stop = bool(e.is_scroll_stop_event())
+            scroll = dict(direction=direction, delta_x=dx, delta_y=dy,
+                          delta_available=bool(_ok), is_stop=is_stop)
+            if direction != "smooth" and not is_stop:
+                state["scrolls"] += 1  # Meaningful discrete ticks, not smooth/stop packets.
         button = int(e.button) if e.type in (Gdk.EventType.BUTTON_PRESS,
                                              Gdk.EventType.BUTTON_RELEASE) else None
-        record(e.type.value_nick, x=e.x, y=e.y, button=button, **state)
+        record(e.type.value_nick, x=e.x, y=e.y, button=button, **scroll, **state)
     return False
 
 
@@ -77,6 +97,6 @@ def heartbeat():
     return True
 
 
-GLib.timeout_add(100, heartbeat)
+GLib.timeout_add(500, heartbeat)
 Gtk.main()
 journal.close()
