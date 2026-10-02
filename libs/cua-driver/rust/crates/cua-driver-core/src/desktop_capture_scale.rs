@@ -11,13 +11,15 @@
 //! had read them off the full-size capture. `capture_id` actions are left
 //! alone: their capture binding already maps the exact published image.
 
+use crate::capture_runtime::CaptureBinding;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 /// Per-session `(x, y)` factors from capped-image pixels to uncapped pixels.
-fn scales() -> &'static Mutex<HashMap<String, (f64, f64)>> {
-    static SCALES: OnceLock<Mutex<HashMap<String, (f64, f64)>>> = OnceLock::new();
+type Owner = (u64, u64, String);
+fn scales() -> &'static Mutex<HashMap<Owner, (f64, f64)>> {
+    static SCALES: OnceLock<Mutex<HashMap<Owner, (f64, f64)>>> = OnceLock::new();
     SCALES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -30,9 +32,24 @@ fn session_key(args: &Value) -> Option<&str> {
 /// `get_desktop_state`: the latest capture defines the frame of the pixels
 /// the caller reads next.
 pub fn record_desktop_state(args: &Value, structured: Option<&Value>) {
+    record_desktop_state_for_binding(args, structured, None);
+}
+
+pub fn record_desktop_state_for_binding(
+    args: &Value,
+    structured: Option<&Value>,
+    binding: Option<&CaptureBinding>,
+) {
     let Some(key) = session_key(args) else {
         return;
     };
+    let owner = binding.map_or((0, 0, key.to_owned()), |binding| {
+        (
+            binding.runtime_generation(),
+            binding.session_generation(),
+            key.to_owned(),
+        )
+    });
     let factor = structured.and_then(|s| {
         let axis = |delivered: &str, original: &str| {
             let delivered = s.get(delivered)?.as_f64()?;
@@ -47,17 +64,28 @@ pub fn record_desktop_state(args: &Value, structured: Option<&Value>) {
     let mut scales = scales().lock().unwrap();
     match factor {
         Some(factor) if factor != (1.0, 1.0) => {
-            scales.insert(key.to_owned(), factor);
+            scales.insert(owner, factor);
         }
         _ => {
-            scales.remove(key);
+            scales.remove(&owner);
         }
     }
 }
 
 /// Forget a session's cap (the session ended).
 pub fn forget_session(session: &str) {
-    scales().lock().unwrap().remove(session);
+    scales()
+        .lock()
+        .unwrap()
+        .retain(|owner, _| owner.2 != session);
+}
+
+pub fn forget_binding(binding: &CaptureBinding) {
+    scales().lock().unwrap().remove(&(
+        binding.runtime_generation(),
+        binding.session_generation(),
+        binding.session_id().to_owned(),
+    ));
 }
 
 const X_KEYS: [&str; 3] = ["x", "from_x", "to_x"];
@@ -67,6 +95,10 @@ const Y_KEYS: [&str; 3] = ["y", "from_y", "to_y"];
 /// desktop image back to the uncapped one. No-op without a recorded cap, for
 /// window-scoped pixels, and for `capture_id` actions.
 pub fn map_desktop_args(args: &mut Value) {
+    map_desktop_args_for_binding(args, None);
+}
+
+pub fn map_desktop_args_for_binding(args: &mut Value, binding: Option<&CaptureBinding>) {
     let desktop = args.get("scope").and_then(Value::as_str) == Some("desktop")
         || args.get("coordinate_frame").and_then(Value::as_str) == Some("desktop");
     if !desktop || args.get("capture_id").is_some() {
@@ -75,7 +107,14 @@ pub fn map_desktop_args(args: &mut Value) {
     let Some(key) = session_key(args) else {
         return;
     };
-    let Some((fx, fy)) = scales().lock().unwrap().get(key).copied() else {
+    let owner = binding.map_or((0, 0, key.to_owned()), |binding| {
+        (
+            binding.runtime_generation(),
+            binding.session_generation(),
+            key.to_owned(),
+        )
+    });
+    let Some((fx, fy)) = scales().lock().unwrap().get(&owner).copied() else {
         return;
     };
     for (keys, factor) in [(X_KEYS, fx), (Y_KEYS, fy)] {
@@ -125,6 +164,30 @@ mod tests {
         let mut other = json!({"_session_id": "cap-test-b", "scope": "desktop", "x": 100});
         map_desktop_args(&mut other);
         assert_eq!(other["x"], 100);
+    }
+
+    #[test]
+    fn caps_are_isolated_by_runtime_and_session_generation() {
+        let args = json!({"_session_id":"cap-lifetime", "scope":"desktop", "x":100.0, "y":50.0});
+        let old = CaptureBinding::new(10, "cap-lifetime", 1).unwrap();
+        let successor = CaptureBinding::new(10, "cap-lifetime", 2).unwrap();
+        let runtime = CaptureBinding::new(11, "cap-lifetime", 1).unwrap();
+        record_desktop_state_for_binding(
+            &args,
+            Some(
+                &json!({"screenshot_width":2560,"screenshot_height":720,"screenshot_original_width":5120,"screenshot_original_height":1440}),
+            ),
+            Some(&old),
+        );
+        let mut old_point = args.clone();
+        map_desktop_args_for_binding(&mut old_point, Some(&old));
+        assert_eq!(old_point["x"], 200.0);
+        for binding in [&successor, &runtime] {
+            let mut point = args.clone();
+            map_desktop_args_for_binding(&mut point, Some(binding));
+            assert_eq!(point["x"], 100.0);
+        }
+        forget_binding(&old);
     }
 
     #[test]

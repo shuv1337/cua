@@ -74,6 +74,12 @@ fn app_state_json_for_blocking(
 #[cfg(target_os = "linux")]
 pub fn screenshot_for_recording(window_id: Option<u64>, pid: Option<i64>) -> Option<Vec<u8>> {
     if crate::wayland::is_wayland() {
+        if crate::wayland::hyprland::is_session() {
+            // Recording uses the same qualified logical canvas even with one
+            // scaled output. Raw physical pixels cannot share logical markers.
+            let frame = crate::wayland::hyprland::desktop_frame().ok()?;
+            return crate::wayland::hyprland::compose_desktop_capture(&frame).ok();
+        }
         // Wayland surface ids are connection-scoped, so a later recording hook
         // cannot safely re-attest the action call's per-window crop. Preserve
         // ownership by recording the compositor's complete rendered output.
@@ -126,13 +132,16 @@ fn element_window_local_xy_blocking(
         crate::atspi::get_element_bounds_for_window(pid, window_id, element_index as usize).ok()?;
     let window = resolve_window_for_recording(pid, Some(window_id))?;
     if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
-        let (display_width, display_height, _) = crate::wayland::hyprland::screen_size().ok()?;
+        let frame = crate::wayland::hyprland::desktop_frame().ok()?;
         // This hook retains the whole output, not the window-local tool image.
-        return hyprland_recording_point(
+        let point = hyprland_recording_point(
             (screen_x, screen_y, width, height),
             (window.x, window.y, window.width, window.height),
-            (display_width, display_height),
-        );
+            (frame.x, frame.y, frame.width, frame.height),
+        )?;
+        frame.checked_layout_point(point.0, point.1).ok()?;
+        frame.validate_current().ok()?;
+        return Some(point);
     }
     Some((
         f64::from(screen_x) - f64::from(window.x) + f64::from(width) / 2.0,
@@ -144,7 +153,7 @@ fn element_window_local_xy_blocking(
 fn hyprland_recording_point(
     element: (i32, i32, u32, u32),
     window: (i32, i32, u32, u32),
-    display: (u32, u32),
+    display: (i32, i32, u32, u32),
 ) -> Option<(f64, f64)> {
     let (x, y, width, height) = element;
     if width == 0 || height == 0 || window.2 == 0 || window.3 == 0 {
@@ -159,15 +168,17 @@ fn hyprland_recording_point(
 fn hyprland_output_point(
     (cx, cy): (f64, f64),
     window: (i32, i32, u32, u32),
-    display: (u32, u32),
+    display: (i32, i32, u32, u32),
 ) -> Option<(f64, f64)> {
     let in_window = cx >= f64::from(window.0)
         && cy >= f64::from(window.1)
         && cx < f64::from(window.0) + f64::from(window.2)
         && cy < f64::from(window.1) + f64::from(window.3);
+    let fx = cx - f64::from(display.0);
+    let fy = cy - f64::from(display.1);
     let in_display =
-        cx >= 0.0 && cy >= 0.0 && cx < f64::from(display.0) && cy < f64::from(display.1);
-    (in_window && in_display).then_some((cx, cy))
+        fx >= 0.0 && fy >= 0.0 && fx < f64::from(display.2) && fy < f64::from(display.3);
+    (in_window && in_display).then_some((fx, fy))
 }
 
 #[cfg(target_os = "linux")]
@@ -180,24 +191,26 @@ pub fn hyprland_pixel_recording_point(
     // The recorded image is the desktop frame. Window geometry is in layout
     // coordinates, so move a window point into the frame before placing it.
     let frame = crate::wayland::hyprland::desktop_frame().ok()?;
-    let (width, height) = (frame.width, frame.height);
-    match (window_id, pid) {
+    let display = (frame.x, frame.y, frame.width, frame.height);
+    let point = match (window_id, pid) {
         (Some(window_id), Some(pid)) => {
             let pid = u32::try_from(pid).ok()?;
             let window = resolve_window_for_recording(pid, Some(window_id))?;
             if window.pid != Some(pid) {
                 return None;
             }
-            let (frame_x, frame_y) = frame.from_layout(window.x, window.y);
             hyprland_output_point(
-                (f64::from(frame_x) + x, f64::from(frame_y) + y),
-                (frame_x, frame_y, window.width, window.height),
-                (width, height),
+                (f64::from(window.x) + x, f64::from(window.y) + y),
+                (window.x, window.y, window.width, window.height),
+                display,
             )
         }
-        (None, None) => hyprland_output_point((x, y), (0, 0, width, height), (width, height)),
+        (None, None) => frame.checked_layout_point(x, y).ok().map(|_| (x, y)),
         _ => None,
-    }
+    }?;
+    frame.checked_layout_point(point.0, point.1).ok()?;
+    frame.validate_current().ok()?;
+    Some(point)
 }
 
 #[cfg(target_os = "linux")]
@@ -296,9 +309,25 @@ mod tests {
     }
 
     #[test]
+    fn recording_marker_rebases_negative_and_positive_frame_origins() {
+        assert_eq!(
+            hyprland_output_point(
+                (-2250.0, 270.0),
+                (-2500, 20, 800, 600),
+                (-2560, 0, 5120, 1440)
+            ),
+            Some((310.0, 270.0))
+        );
+        assert_eq!(
+            hyprland_output_point((2810.0, 270.0), (2560, 20, 800, 600), (2560, 0, 2560, 1440)),
+            Some((250.0, 270.0))
+        );
+    }
+
+    #[test]
     fn hyprland_marker_uses_retained_output_coordinates() {
         assert_eq!(
-            hyprland_recording_point((130, 250, 20, 30), (100, 200, 940, 780), (1920, 1080)),
+            hyprland_recording_point((130, 250, 20, 30), (100, 200, 940, 780), (0, 0, 1920, 1080)),
             Some((140.0, 265.0))
         );
     }
@@ -307,12 +336,12 @@ mod tests {
     fn hyprland_marker_does_not_invent_an_offscreen_point() {
         for element in [(10, 800, 20, 20), (-30, 10, 20, 20), (10, 10, 0, 20)] {
             assert_eq!(
-                hyprland_recording_point(element, (0, 0, 940, 780), (1920, 1080)),
+                hyprland_recording_point(element, (0, 0, 940, 780), (0, 0, 1920, 1080)),
                 None
             );
         }
         assert_eq!(
-            hyprland_recording_point((1900, 10, 80, 20), (1800, 0, 940, 780), (1920, 1080)),
+            hyprland_recording_point((1900, 10, 80, 20), (1800, 0, 940, 780), (0, 0, 1920, 1080)),
             None
         );
     }
@@ -320,12 +349,12 @@ mod tests {
     #[test]
     fn hyprland_pixel_marker_keeps_fractional_output_coordinates() {
         assert_eq!(
-            hyprland_output_point((130.5, 250.25), (100, 200, 940, 780), (1920, 1080)),
+            hyprland_output_point((130.5, 250.25), (100, 200, 940, 780), (0, 0, 1920, 1080)),
             Some((130.5, 250.25))
         );
         for point in [(f64::NAN, 200.0), (100.0, f64::INFINITY), (99.0, 200.0)] {
             assert_eq!(
-                hyprland_output_point(point, (100, 200, 940, 780), (1920, 1080)),
+                hyprland_output_point(point, (100, 200, 940, 780), (0, 0, 1920, 1080)),
                 None
             );
         }

@@ -2312,7 +2312,11 @@ impl ToolRegistry {
 
         // Desktop pixels read off a capped get_desktop_state image are mapped
         // back to the uncapped capture before any platform interprets them.
-        crate::desktop_capture_scale::map_desktop_args(&mut args);
+        let desktop_binding = self.capture_service.binding_from_args(&args).ok();
+        crate::desktop_capture_scale::map_desktop_args_for_binding(
+            &mut args,
+            desktop_binding.as_ref(),
+        );
         crate::tool_activity::note_tool_activity();
         let mut result = crate::recording::scope_dispatch_click_capture(
             pending_turn.as_ref(),
@@ -2321,14 +2325,19 @@ impl ToolRegistry {
         .await;
         match resolved_name {
             "get_desktop_state" if result.is_error != Some(true) => {
-                crate::desktop_capture_scale::record_desktop_state(
-                    &args,
-                    result.structured_content.as_ref(),
-                );
+                if desktop_binding.as_ref()
+                    == self.capture_service.binding_from_args(&args).ok().as_ref()
+                {
+                    crate::desktop_capture_scale::record_desktop_state_for_binding(
+                        &args,
+                        result.structured_content.as_ref(),
+                        desktop_binding.as_ref(),
+                    );
+                }
             }
             "end_session" => {
-                if let Some(session) = args.get("_session_id").and_then(Value::as_str) {
-                    crate::desktop_capture_scale::forget_session(session);
+                if let Some(binding) = &desktop_binding {
+                    crate::desktop_capture_scale::forget_binding(binding);
                 }
             }
             _ => {}

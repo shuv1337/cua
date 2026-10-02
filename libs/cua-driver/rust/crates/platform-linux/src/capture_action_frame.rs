@@ -1,5 +1,5 @@
 use cua_driver_core::capture_runtime::{
-    CaptureActionRequest, CapturePublication, CaptureService, CaptureTarget,
+    CaptureActionRequest, CaptureFrameIdentity, CapturePublication, CaptureService, CaptureTarget,
     EncodedScreenshotDimensions, NativeActionDimensions, ScreenshotToActionTransform,
 };
 use serde_json::Value;
@@ -8,6 +8,7 @@ fn window_target(pid: u32, window_id: u64) -> CaptureTarget {
     CaptureTarget::Window { pid, window_id }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publish(
     service: &CaptureService,
     args: &Value,
@@ -16,26 +17,31 @@ fn publish(
     encoded_dimensions: (u32, u32),
     native_action_dimensions: (u32, u32),
     screenshot_to_action: ScreenshotToActionTransform,
+    frame_identity: Option<CaptureFrameIdentity>,
 ) -> anyhow::Result<String> {
     let binding = service.binding_from_args(args)?;
-    let capture_id = service.publish(CapturePublication {
-        png_bytes: png_bytes.to_vec(),
-        target,
-        encoded_dimensions: EncodedScreenshotDimensions::new(
-            encoded_dimensions.0,
-            encoded_dimensions.1,
-        )?,
-        native_action_dimensions: NativeActionDimensions::new(
-            native_action_dimensions.0,
-            native_action_dimensions.1,
-        )?,
-        screenshot_to_action,
-        session_id: binding.session_id().into(),
-        session_generation: binding.session_generation(),
-    })?;
+    let capture_id = service.publish_in_frame(
+        CapturePublication {
+            png_bytes: png_bytes.to_vec(),
+            target,
+            encoded_dimensions: EncodedScreenshotDimensions::new(
+                encoded_dimensions.0,
+                encoded_dimensions.1,
+            )?,
+            native_action_dimensions: NativeActionDimensions::new(
+                native_action_dimensions.0,
+                native_action_dimensions.1,
+            )?,
+            screenshot_to_action,
+            session_id: binding.session_id().into(),
+            session_generation: binding.session_generation(),
+        },
+        frame_identity,
+    )?;
     Ok(capture_id.to_string())
 }
 
+#[cfg(test)]
 pub fn publish_window(
     service: &CaptureService,
     args: &Value,
@@ -45,6 +51,29 @@ pub fn publish_window(
     encoded_dimensions: (u32, u32),
     native_action_dimensions: (u32, u32),
 ) -> anyhow::Result<String> {
+    publish_window_in_frame(
+        service,
+        args,
+        png_bytes,
+        pid,
+        window_id,
+        encoded_dimensions,
+        native_action_dimensions,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn publish_window_in_frame(
+    service: &CaptureService,
+    args: &Value,
+    png_bytes: &[u8],
+    pid: u32,
+    window_id: u64,
+    encoded_dimensions: (u32, u32),
+    native_action_dimensions: (u32, u32),
+    frame_identity: Option<CaptureFrameIdentity>,
+) -> anyhow::Result<String> {
     publish(
         service,
         args,
@@ -53,15 +82,35 @@ pub fn publish_window(
         encoded_dimensions,
         native_action_dimensions,
         scaled_transform(encoded_dimensions, native_action_dimensions)?,
+        frame_identity,
     )
 }
 
+#[cfg(test)]
 pub fn publish_desktop(
     service: &CaptureService,
     args: &Value,
     png_bytes: &[u8],
     encoded_dimensions: (u32, u32),
     native_action_dimensions: (u32, u32),
+) -> anyhow::Result<String> {
+    publish_desktop_in_frame(
+        service,
+        args,
+        png_bytes,
+        encoded_dimensions,
+        native_action_dimensions,
+        None,
+    )
+}
+
+pub fn publish_desktop_in_frame(
+    service: &CaptureService,
+    args: &Value,
+    png_bytes: &[u8],
+    encoded_dimensions: (u32, u32),
+    native_action_dimensions: (u32, u32),
+    frame_identity: Option<CaptureFrameIdentity>,
 ) -> anyhow::Result<String> {
     // The desktop screenshot can be downsized below the action frame.
     publish(
@@ -72,6 +121,7 @@ pub fn publish_desktop(
         encoded_dimensions,
         native_action_dimensions,
         scaled_transform(encoded_dimensions, native_action_dimensions)?,
+        frame_identity,
     )
 }
 
@@ -104,6 +154,36 @@ fn admit(
     screenshot_x: f64,
     screenshot_y: f64,
 ) -> anyhow::Result<(f64, f64)> {
+    if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+        let frame = crate::wayland::hyprland::desktop_frame()?;
+        let dimensions = match &target {
+            CaptureTarget::Window { pid, window_id } => {
+                let window = crate::wayland::hyprland::window_for_address(*window_id)
+                    .filter(|window| window.pid == *pid)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("native window identity changed after capture")
+                    })?;
+                (window.width, window.height)
+            }
+            CaptureTarget::PrimaryDesktop => (frame.width, frame.height),
+        };
+        let admission = service.admit_action_in_frame(
+            CaptureActionRequest {
+                capture_id: service.parse_capture_id(capture_id)?,
+                binding: service.binding_from_args(args)?,
+                target,
+                current_native_action_dimensions: NativeActionDimensions::new(
+                    dimensions.0,
+                    dimensions.1,
+                )?,
+                screenshot_x,
+                screenshot_y,
+            },
+            Some(&frame.identity),
+        )?;
+        frame.validate_current()?;
+        return Ok((admission.action_x, admission.action_y));
+    }
     let current_native_action_dimensions = live_action_dimensions(&target)?;
     admit_with_live_dimensions(
         service,
@@ -155,6 +235,10 @@ fn live_action_dimensions(target: &CaptureTarget) -> anyhow::Result<NativeAction
             crate::capture::png_dimensions_pub(&png)?
         }
         CaptureTarget::PrimaryDesktop => {
+            if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+                let frame = crate::wayland::hyprland::desktop_frame()?;
+                return Ok(NativeActionDimensions::new(frame.width, frame.height)?);
+            }
             let png = crate::capture::screenshot_display_bytes()?;
             let native = crate::capture::png_dimensions_pub(&png)?;
             desktop_action_dimensions(native)?
@@ -226,6 +310,31 @@ pub fn admit_desktop_click(
         screenshot_x,
         screenshot_y,
     )
+}
+
+pub fn admit_desktop_click_in(
+    service: &CaptureService,
+    args: &Value,
+    capture_id: &str,
+    screenshot_x: f64,
+    screenshot_y: f64,
+    space: &crate::wayland::DesktopInputSpace,
+) -> anyhow::Result<(f64, f64)> {
+    let Some(frame) = space.frame() else {
+        return admit_desktop_click(service, args, capture_id, screenshot_x, screenshot_y);
+    };
+    frame.validate_current()?;
+    let request = CaptureActionRequest {
+        capture_id: service.parse_capture_id(capture_id)?,
+        binding: service.binding_from_args(args)?,
+        target: CaptureTarget::PrimaryDesktop,
+        current_native_action_dimensions: NativeActionDimensions::new(frame.width, frame.height)?,
+        screenshot_x,
+        screenshot_y,
+    };
+    let admission = service.admit_action_in_frame(request, Some(&frame.identity))?;
+    frame.checked_layout_point(admission.action_x, admission.action_y)?;
+    Ok((admission.action_x, admission.action_y))
 }
 
 pub fn retire_runtime(service: &CaptureService) {

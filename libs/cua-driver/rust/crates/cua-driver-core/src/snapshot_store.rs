@@ -30,6 +30,8 @@ struct Snapshot<S> {
     /// Window size in points when the screenshot was taken. A tree-only read
     /// keeps the screenshot frame only while the window still has this size.
     screenshot_window_size: Option<(f64, f64)>,
+    screenshot_frame: Option<crate::capture_runtime::CaptureFrameIdentity>,
+    screenshot_stale: bool,
     zoom: Option<ZoomContext>,
     semantic: bool,
     payload: S,
@@ -296,7 +298,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             window_id,
             payload,
             session,
-            (screenshot_scale, None),
+            (screenshot_scale, None, None),
             true,
         )
     }
@@ -326,7 +328,28 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             window_id,
             payload,
             session,
-            (screenshot_scale, window_size),
+            (screenshot_scale, window_size, None),
+            true,
+        )
+    }
+
+    /// Publish a screenshot bound to an immutable native desktop frame while
+    /// retaining the newer semantic/capture-only publication distinction.
+    pub fn publish_for_session_in_frame(
+        &self,
+        pid: i32,
+        window_id: u64,
+        payload: S,
+        session: Option<&str>,
+        screenshot_scale: Option<f64>,
+        screenshot_frame: Option<crate::capture_runtime::CaptureFrameIdentity>,
+    ) -> Option<(u32, Vec<u32>)> {
+        self.publish_snapshot(
+            pid,
+            window_id,
+            payload,
+            session,
+            (screenshot_scale, None, screenshot_frame),
             true,
         )
     }
@@ -345,6 +368,25 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         screenshot_scale: f64,
         window_size: Option<(f64, f64)>,
     ) -> Option<u32> {
+        self.refresh_screenshot_for_session_in_frame(
+            pid,
+            window_id,
+            session,
+            screenshot_scale,
+            window_size,
+            None,
+        )
+    }
+
+    pub fn refresh_screenshot_for_session_in_frame(
+        &self,
+        pid: i32,
+        window_id: u64,
+        session: Option<&str>,
+        screenshot_scale: f64,
+        window_size: Option<(f64, f64)>,
+        screenshot_frame: Option<crate::capture_runtime::CaptureFrameIdentity>,
+    ) -> Option<u32> {
         let mut inner = self.inner.lock().unwrap();
         if session.is_some_and(crate::session::is_session_ended) {
             return None;
@@ -357,6 +399,8 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         snapshot.screenshot_owner = session.map(str::to_owned);
         snapshot.screenshot_scale = Some(screenshot_scale);
         snapshot.screenshot_window_size = window_size;
+        snapshot.screenshot_frame = screenshot_frame;
+        snapshot.screenshot_stale = false;
         snapshot.zoom = None;
         Some(snapshot.id)
     }
@@ -371,12 +415,31 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         session: Option<&str>,
         screenshot_scale: Option<f64>,
     ) -> Option<(u32, Vec<u32>)> {
+        self.publish_capture_for_session_in_frame(
+            pid,
+            window_id,
+            payload,
+            session,
+            screenshot_scale,
+            None,
+        )
+    }
+
+    pub fn publish_capture_for_session_in_frame(
+        &self,
+        pid: i32,
+        window_id: u64,
+        payload: S,
+        session: Option<&str>,
+        screenshot_scale: Option<f64>,
+        screenshot_frame: Option<crate::capture_runtime::CaptureFrameIdentity>,
+    ) -> Option<(u32, Vec<u32>)> {
         self.publish_snapshot(
             pid,
             window_id,
             payload,
             session,
-            (screenshot_scale, None),
+            (screenshot_scale, None, screenshot_frame),
             false,
         )
     }
@@ -389,7 +452,11 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         session: Option<&str>,
         // The new screenshot's scale, if any, and the window size in points
         // at this read.
-        (screenshot_scale, window_size): (Option<f64>, Option<(f64, f64)>),
+        (screenshot_scale, window_size, screenshot_frame): (
+            Option<f64>,
+            Option<(f64, f64)>,
+            Option<crate::capture_runtime::CaptureFrameIdentity>,
+        ),
         semantic: bool,
     ) -> Option<(u32, Vec<u32>)> {
         let (id, retired) = {
@@ -404,18 +471,28 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             }
             // A new screenshot brings its own frame. A tree-only read keeps the
             // replaced snapshot's frame while the window keeps its size.
-            let (scale, frame_size) = match (screenshot_scale, window_size) {
-                (Some(scale), size) => (Some(scale), size),
+            let (scale, frame_size, frame) = match (screenshot_scale, window_size) {
+                (Some(scale), size) => (Some(scale), size, screenshot_frame),
                 (None, Some(now)) => retired
                     .first()
                     .filter(|previous| previous.screenshot_owner.as_deref() == session)
+                    .filter(|previous| !previous.screenshot_stale)
+                    .filter(|previous| {
+                        screenshot_frame.is_none() || previous.screenshot_frame == screenshot_frame
+                    })
                     .and_then(|previous| {
                         let then = previous.screenshot_window_size?;
                         let same = (then.0 - now.0).abs() < 0.5 && (then.1 - now.1).abs() < 0.5;
-                        same.then_some((previous.screenshot_scale?, then))
+                        same.then_some((
+                            previous.screenshot_scale?,
+                            then,
+                            previous.screenshot_frame.clone(),
+                        ))
                     })
-                    .map_or((None, None), |(scale, size)| (Some(scale), Some(size))),
-                (None, None) => (None, None),
+                    .map_or((None, None, None), |(scale, size, frame)| {
+                        (Some(scale), Some(size), frame)
+                    }),
+                (None, None) => (None, None, None),
             };
             if lane.len() == LRU_CAP_PER_PID {
                 retired.push(lane.remove(0));
@@ -427,6 +504,8 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 screenshot_owner: session.map(str::to_owned),
                 screenshot_scale: scale,
                 screenshot_window_size: frame_size,
+                screenshot_frame: frame,
+                screenshot_stale: false,
                 zoom: None,
                 semantic,
                 payload,
@@ -510,6 +589,33 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             args.get("_session_id").and_then(serde_json::Value::as_str),
         )
         .map(|context| context.scale)
+    }
+
+    pub fn validate_screenshot_frame(
+        &self,
+        pid: i32,
+        context: ScreenshotContext,
+        current: Option<&crate::capture_runtime::CaptureFrameIdentity>,
+    ) -> Result<(), ToolResult> {
+        let mismatch = || {
+            ToolResult::error("Screenshot/zoom frame changed; refresh get_window_state and zoom.")
+                .with_structured(serde_json::json!({"code": "capture_frame_mismatch"}))
+        };
+        let mut inner = self.inner.lock().unwrap();
+        let snapshot = inner
+            .get_mut(&pid)
+            .and_then(|lane| {
+                lane.iter_mut()
+                    .find(|snapshot| snapshot.id == context.snapshot_id)
+            })
+            .ok_or_else(mismatch)?;
+        if snapshot.screenshot_frame.as_ref() != current {
+            snapshot.screenshot_stale = true;
+        }
+        if snapshot.screenshot_stale {
+            return Err(mismatch());
+        }
+        Ok(())
     }
 
     pub fn screenshot_context_for_zoom(
@@ -792,6 +898,62 @@ mod tests {
         assert_eq!(cache.pid_for_token(&serde_json::json!({})), None);
         let unknown = serde_json::json!({ "element_token": token_for(id + 1000, 0) });
         assert_eq!(cache.pid_for_token(&unknown), None);
+    }
+
+    #[test]
+    fn observed_screenshot_frame_change_retires_zoom_until_new_publication() {
+        let cache = SnapshotStore::new();
+        let frame = crate::capture_runtime::CaptureFrameIdentity::from_native_snapshot(b"A");
+        let other = crate::capture_runtime::CaptureFrameIdentity::from_native_snapshot(b"B");
+        cache
+            .publish_for_session_in_frame(
+                42,
+                7,
+                Payload(vec![1]),
+                None,
+                Some(1.0),
+                Some(frame.clone()),
+            )
+            .unwrap();
+        let context = cache.screenshot_context(42, Some(7), None).unwrap();
+        cache
+            .set_zoom(
+                42,
+                None,
+                ZoomContext {
+                    screenshot: context,
+                    origin_x: 0.0,
+                    origin_y: 0.0,
+                    scale_inv: 1.0,
+                },
+            )
+            .unwrap();
+        assert!(cache
+            .validate_screenshot_frame(42, context, Some(&frame))
+            .is_ok());
+        for current in [&other, &frame] {
+            let refusal = cache
+                .validate_screenshot_frame(42, context, Some(current))
+                .unwrap_err();
+            assert_eq!(
+                refusal.structured_content.unwrap()["code"],
+                "capture_frame_mismatch"
+            );
+        }
+        cache
+            .publish_for_session_in_frame(
+                42,
+                7,
+                Payload(vec![1]),
+                None,
+                Some(1.0),
+                Some(frame.clone()),
+            )
+            .unwrap();
+        let fresh = cache.screenshot_context(42, Some(7), None).unwrap();
+        assert!(cache
+            .validate_screenshot_frame(42, fresh, Some(&frame))
+            .is_ok());
     }
 
     #[test]

@@ -455,6 +455,20 @@ pub struct CapturePublication {
     pub session_generation: u64,
 }
 
+/// Internal identity of an adapter-qualified native capture frame. Dimensions
+/// alone cannot identify a desktop: origins, output membership/order, scale,
+/// power state and compositor lifetime also determine what a pixel addresses.
+/// Adapters supply a deterministic, complete snapshot; this never comes from
+/// caller arguments and does not add a public display selector.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureFrameIdentity([u8; 32]);
+
+impl CaptureFrameIdentity {
+    pub fn from_native_snapshot(snapshot: &[u8]) -> Self {
+        Self(Sha256::digest(snapshot).into())
+    }
+}
+
 pub struct CaptureActionRequest {
     pub capture_id: CaptureId,
     pub binding: CaptureBinding,
@@ -474,6 +488,7 @@ pub struct CaptureActionAdmission {
     pub action_y: f64,
     pub native_action_dimensions: NativeActionDimensions,
     pub digest: ContentDigest,
+    pub frame_identity: Option<CaptureFrameIdentity>,
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq)]
@@ -546,6 +561,7 @@ struct StoredCapture {
     encoded_dimensions: EncodedScreenshotDimensions,
     native_action_dimensions: NativeActionDimensions,
     screenshot_to_action: ScreenshotToActionTransform,
+    frame_identity: Option<CaptureFrameIdentity>,
     binding: CaptureBinding,
     created_at: Duration,
     expires_at: Duration,
@@ -697,6 +713,14 @@ impl CaptureRegistry {
     }
 
     pub fn store(&self, registration: CaptureRegistration) -> Result<CaptureId, CaptureStoreError> {
+        self.store_in_frame(registration, None)
+    }
+
+    fn store_in_frame(
+        &self,
+        registration: CaptureRegistration,
+        frame_identity: Option<CaptureFrameIdentity>,
+    ) -> Result<CaptureId, CaptureStoreError> {
         registration.target.validate()?;
         if registration.png_bytes.len() > self.config.max_total_bytes {
             return Err(CaptureStoreError::CaptureTooLarge);
@@ -761,6 +785,7 @@ impl CaptureRegistry {
             encoded_dimensions: registration.encoded_dimensions,
             native_action_dimensions: registration.native_action_dimensions,
             screenshot_to_action: registration.screenshot_to_action,
+            frame_identity,
             binding: registration.binding,
             created_at,
             expires_at,
@@ -818,6 +843,14 @@ impl CaptureRegistry {
         &self,
         request: CaptureActionRequest,
     ) -> Result<CaptureActionAdmission, CaptureActionError> {
+        self.admit_action_in_frame(request, None)
+    }
+
+    fn admit_action_in_frame(
+        &self,
+        request: CaptureActionRequest,
+        current_frame_identity: Option<&CaptureFrameIdentity>,
+    ) -> Result<CaptureActionAdmission, CaptureActionError> {
         let now = self.clock.now();
         let mut inner = self
             .inner
@@ -848,6 +881,9 @@ impl CaptureRegistry {
         if capture.native_action_dimensions != request.current_native_action_dimensions {
             return Err(CaptureActionError::NativeActionFrameMismatch);
         }
+        if capture.frame_identity.as_ref() != current_frame_identity {
+            return Err(CaptureActionError::NativeActionFrameMismatch);
+        }
         let max_x = f64::from(capture.encoded_dimensions.width);
         let max_y = f64::from(capture.encoded_dimensions.height);
         if !request.screenshot_x.is_finite()
@@ -872,6 +908,7 @@ impl CaptureRegistry {
             action_y,
             native_action_dimensions: capture.native_action_dimensions,
             digest: capture.digest,
+            frame_identity: capture.frame_identity.clone(),
         };
         self.remove_capture(&mut inner, request.capture_id);
         Ok(admission)
@@ -1085,6 +1122,7 @@ pub struct CaptureService {
     runtime_generation: u64,
     registry: CaptureRegistry,
     session_generations: Mutex<HashMap<Arc<str>, u64>>,
+    desktop_observations: Mutex<HashMap<Arc<str>, (CaptureBinding, CaptureFrameIdentity, bool)>>,
 }
 
 impl CaptureService {
@@ -1105,6 +1143,7 @@ impl CaptureService {
             runtime_generation,
             registry: CaptureRegistry::with_clock(config, clock)?,
             session_generations: Mutex::new(HashMap::new()),
+            desktop_observations: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1153,15 +1192,73 @@ impl CaptureService {
     }
 
     pub fn publish(&self, publication: CapturePublication) -> Result<CaptureId, CaptureStoreError> {
+        self.publish_in_frame(publication, None)
+    }
+
+    pub fn publish_in_frame(
+        &self,
+        publication: CapturePublication,
+        frame_identity: Option<CaptureFrameIdentity>,
+    ) -> Result<CaptureId, CaptureStoreError> {
         let binding = self.binding(publication.session_id, publication.session_generation)?;
-        self.registry.store(CaptureRegistration {
-            png_bytes: publication.png_bytes,
-            target: publication.target,
-            encoded_dimensions: publication.encoded_dimensions,
-            native_action_dimensions: publication.native_action_dimensions,
-            screenshot_to_action: publication.screenshot_to_action,
-            binding,
-        })
+        // Hold the generation lock through publication/observation update so a
+        // late capture cannot resurrect an observation after session retirement.
+        let generations = self
+            .session_generations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if frame_identity.is_some()
+            && generations.get(binding.session_id()).copied().unwrap_or(1)
+                != binding.session_generation()
+        {
+            return Err(CaptureStoreError::InvalidBinding);
+        }
+        let desktop_identity = (publication.target == CaptureTarget::PrimaryDesktop)
+            .then(|| frame_identity.clone())
+            .flatten();
+        let id = self.registry.store_in_frame(
+            CaptureRegistration {
+                png_bytes: publication.png_bytes,
+                target: publication.target,
+                encoded_dimensions: publication.encoded_dimensions,
+                native_action_dimensions: publication.native_action_dimensions,
+                screenshot_to_action: publication.screenshot_to_action,
+                binding: binding.clone(),
+            },
+            frame_identity,
+        )?;
+        if let Some(identity) = desktop_identity {
+            self.desktop_observations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(binding.session_id.clone(), (binding, identity, false));
+        }
+        Ok(id)
+    }
+
+    /// Validate the last delivered desktop image, including uncapped ratio-one
+    /// images. Once observed stale, it stays stale even if the layout returns;
+    /// only a new successful publication restores coordinate authority.
+    pub fn validate_desktop_observation(
+        &self,
+        binding: &CaptureBinding,
+        current: &CaptureFrameIdentity,
+    ) -> Result<(), CaptureActionError> {
+        let mut observations = self
+            .desktop_observations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let Some((observed_binding, identity, stale)) = observations.get_mut(binding.session_id())
+        else {
+            return Ok(());
+        };
+        if observed_binding != binding || identity != current {
+            *stale = true;
+        }
+        if *stale {
+            return Err(CaptureActionError::NativeActionFrameMismatch);
+        }
+        Ok(())
     }
 
     pub fn parse_capture_id(&self, value: &str) -> Result<CaptureId, CaptureIdParseError> {
@@ -1180,7 +1277,16 @@ impl CaptureService {
         &self,
         request: CaptureActionRequest,
     ) -> Result<CaptureActionAdmission, CaptureActionError> {
-        self.registry.admit_action(request)
+        self.admit_action_in_frame(request, None)
+    }
+
+    pub fn admit_action_in_frame(
+        &self,
+        request: CaptureActionRequest,
+        current_frame_identity: Option<&CaptureFrameIdentity>,
+    ) -> Result<CaptureActionAdmission, CaptureActionError> {
+        self.registry
+            .admit_action_in_frame(request, current_frame_identity)
     }
 
     /// Predict, without consuming anything, whether a capture-bound action
@@ -1222,6 +1328,14 @@ impl CaptureService {
                 .or_insert(binding.session_generation);
             if *generation == binding.session_generation {
                 *generation = generation.saturating_add(1).max(1);
+                if let Some(observation) = self
+                    .desktop_observations
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(binding.session_id())
+                {
+                    observation.2 = true;
+                }
             }
         }
         removed
@@ -1244,6 +1358,21 @@ impl CaptureService {
     }
 
     pub fn retire_runtime(&self) -> usize {
+        let mut generations = self
+            .session_generations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for generation in generations.values_mut() {
+            *generation = generation.saturating_add(1).max(1);
+        }
+        for observation in self
+            .desktop_observations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values_mut()
+        {
+            observation.2 = true;
+        }
         self.registry.retire_runtime(self.runtime_generation)
     }
 
@@ -1350,6 +1479,106 @@ mod tests {
             screenshot_x: 0.5,
             screenshot_y: 0.5,
         }
+    }
+
+    #[test]
+    fn frame_identity_is_required_at_atomic_one_shot_admission() {
+        let registry = CaptureRegistry::new(config(2, 10_000)).unwrap();
+        let owner = binding(1, "frame-owner", 1);
+        let frame = CaptureFrameIdentity::from_native_snapshot(b"two-output-frame-A");
+        let other = CaptureFrameIdentity::from_native_snapshot(b"same-size-frame-B");
+        let id = registry
+            .store_in_frame(
+                registration(png(2, 2, 1), CaptureTarget::PrimaryDesktop, owner.clone()),
+                Some(frame.clone()),
+            )
+            .unwrap();
+        for current in [None, Some(&other)] {
+            assert_eq!(
+                registry
+                    .admit_action_in_frame(
+                        action_request(id, owner.clone(), CaptureTarget::PrimaryDesktop, (2, 2)),
+                        current
+                    )
+                    .unwrap_err(),
+                CaptureActionError::NativeActionFrameMismatch
+            );
+        }
+        assert!(registry
+            .admit_action_in_frame(
+                action_request(id, owner.clone(), CaptureTarget::PrimaryDesktop, (2, 2)),
+                Some(&frame)
+            )
+            .is_ok());
+        assert_eq!(
+            registry
+                .admit_action_in_frame(
+                    action_request(id, owner, CaptureTarget::PrimaryDesktop, (2, 2)),
+                    Some(&frame)
+                )
+                .unwrap_err(),
+            CaptureActionError::Lookup(CaptureLookupError::Unknown)
+        );
+    }
+
+    #[test]
+    fn desktop_observation_stays_stale_until_refresh_and_cannot_resurrect_after_retirement() {
+        let service = CaptureService::default();
+        let owner = service.current_binding("observed").unwrap();
+        let frame = CaptureFrameIdentity::from_native_snapshot(b"A");
+        let other = CaptureFrameIdentity::from_native_snapshot(b"B");
+        let publish = |binding: &CaptureBinding| {
+            service.publish_in_frame(
+                CapturePublication {
+                    png_bytes: png(2, 2, 1),
+                    target: CaptureTarget::PrimaryDesktop,
+                    encoded_dimensions: EncodedScreenshotDimensions::new(2, 2).unwrap(),
+                    native_action_dimensions: NativeActionDimensions::new(2, 2).unwrap(),
+                    screenshot_to_action: ScreenshotToActionTransform::identity(),
+                    session_id: binding.session_id.clone(),
+                    session_generation: binding.session_generation,
+                },
+                Some(frame.clone()),
+            )
+        };
+        publish(&owner).unwrap();
+        assert!(service.validate_desktop_observation(&owner, &frame).is_ok());
+        assert_eq!(
+            service
+                .validate_desktop_observation(&owner, &other)
+                .unwrap_err(),
+            CaptureActionError::NativeActionFrameMismatch
+        );
+        assert_eq!(
+            service
+                .validate_desktop_observation(&owner, &frame)
+                .unwrap_err(),
+            CaptureActionError::NativeActionFrameMismatch
+        );
+        let independent = service.current_binding("independent").unwrap();
+        assert!(service
+            .validate_desktop_observation(&independent, &other)
+            .is_ok());
+        publish(&owner).unwrap();
+        assert!(service.validate_desktop_observation(&owner, &frame).is_ok());
+        service.retire_session(&owner);
+        assert_eq!(
+            publish(&owner).unwrap_err(),
+            CaptureStoreError::InvalidBinding
+        );
+        let successor = service.current_binding("observed").unwrap();
+        assert_eq!(
+            service
+                .validate_desktop_observation(&successor, &frame)
+                .unwrap_err(),
+            CaptureActionError::NativeActionFrameMismatch
+        );
+        publish(&successor).unwrap();
+        service.retire_runtime();
+        assert_eq!(
+            publish(&successor).unwrap_err(),
+            CaptureStoreError::InvalidBinding
+        );
     }
 
     #[test]

@@ -245,11 +245,29 @@ impl ToolState {
         pid: u32,
         window_id: Option<u64>,
     ) -> Result<ZoomContext, ToolResult> {
-        self.snapshots.zoom(
+        let zoom = self.snapshots.zoom(
             pid as i32,
             window_id,
             args.get("_session_id").and_then(Value::as_str),
-        )
+        )?;
+        self.validate_screenshot_frame(pid, zoom.screenshot)?;
+        Ok(zoom)
+    }
+
+    fn validate_screenshot_frame(
+        &self,
+        pid: u32,
+        context: cua_driver_core::snapshot_store::ScreenshotContext,
+    ) -> Result<(), ToolResult> {
+        if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+            let frame = crate::wayland::hyprland::desktop_frame().map_err(|error| {
+                ToolResult::error(error.to_string())
+                    .with_structured(json!({"code":"capture_frame_mismatch"}))
+            })?;
+            self.snapshots
+                .validate_screenshot_frame(pid as i32, context, Some(&frame.identity))?;
+        }
+        Ok(())
     }
 }
 
@@ -259,6 +277,16 @@ fn screenshot_scale(
     pid: u32,
     window_id: Option<u64>,
 ) -> Result<f64, ToolResult> {
+    if args.get(cua_driver_core::snapshot_store::NATIVE_WINDOW_PIXELS_ARG)
+        != Some(&Value::Bool(true))
+    {
+        let context = state.snapshots.screenshot_context(
+            pid as i32,
+            window_id,
+            args.get("_session_id").and_then(Value::as_str),
+        )?;
+        state.validate_screenshot_frame(pid, context)?;
+    }
     state
         .snapshots
         .screenshot_scale(pid as i32, window_id, args)
@@ -1347,6 +1375,9 @@ impl Tool for GetWindowStateTool {
         let query_for_walk = query.clone();
 
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let capture_frame = if should_capture && crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+                Some(crate::wayland::hyprland::desktop_frame()?)
+            } else { None };
             // Skip the AT-SPI walk on the capture-only path
             // (include_accessibility_tree:false).
             let tree_result = if want_tree {
@@ -1414,6 +1445,7 @@ impl Tool for GetWindowStateTool {
                 };
                 match captured {
                     Ok((raw, original_size)) => {
+                        if let Some(frame) = &capture_frame { frame.validate_current()?; }
                         let (orig_w, orig_h) = match original_size {
                             Some(size) => size,
                             None => crate::capture::png_dimensions_pub(&raw)?,
@@ -1443,7 +1475,7 @@ impl Tool for GetWindowStateTool {
                         let capture_id = if observation_only {
                             None
                         } else {
-                            Some(crate::capture_action_frame::publish_window(
+                            Some(crate::capture_action_frame::publish_window_in_frame(
                                 &state_for_capture.capture_service,
                                 &args,
                                 &png,
@@ -1451,6 +1483,7 @@ impl Tool for GetWindowStateTool {
                                 xid,
                                 (w, h),
                                 (orig_w, orig_h),
+                                capture_frame.as_ref().map(|frame| frame.identity.clone()),
                             )?)
                         };
                         Some((b64, file_path, w, h, original_w, capture_id))
@@ -1477,6 +1510,7 @@ impl Tool for GetWindowStateTool {
             } else {
                 None
             };
+            if let Some(frame) = &capture_frame { frame.validate_current()?; }
             Ok((
                 tree_result,
                 screenshot,
@@ -1484,12 +1518,21 @@ impl Tool for GetWindowStateTool {
                 screenshot_error,
                 overlays,
                 binds_window,
+                capture_frame.map(|frame| frame.identity),
             ))
         })
         .await;
 
         match result {
-            Ok(Ok((tree_opt, shot_opt, bounds, screenshot_error, overlays, binds_window))) => {
+            Ok(Ok((
+                tree_opt,
+                shot_opt,
+                bounds,
+                screenshot_error,
+                overlays,
+                binds_window,
+                screenshot_frame,
+            ))) => {
                 let mut content = Vec::new();
                 let mut structured = json!({ "window_id": xid, "pid": pid });
                 let screenshot_scale = shot_opt.as_ref().map(|(_, _, w, _, original_w, _)| {
@@ -1555,7 +1598,7 @@ impl Tool for GetWindowStateTool {
                     }
                     let (snapshot_id, replaced) = (!observation_only && target_scoped)
                         .then(|| {
-                            state.snapshots.publish_for_session(
+                            state.snapshots.publish_for_session_in_frame(
                                 pid as i32,
                                 xid,
                                 crate::atspi::snapshot::update_snapshot(
@@ -1563,6 +1606,7 @@ impl Tool for GetWindowStateTool {
                                 ),
                                 session_id.as_deref(),
                                 screenshot_scale,
+                                screenshot_frame.clone(),
                             )
                         })
                         .flatten()
@@ -1713,21 +1757,25 @@ impl Tool for GetWindowStateTool {
                 if let (false, false, Some(scale)) =
                     (observation_only, published_snapshot, screenshot_scale)
                 {
-                    refreshed = state.snapshots.refresh_screenshot_for_session(
+                    refreshed = state.snapshots.refresh_screenshot_for_session_in_frame(
                         pid as i32,
                         xid,
                         session_id.as_deref(),
                         scale,
                         None,
+                        screenshot_frame.clone(),
                     );
                     if refreshed.is_none() {
-                        if let Some((_, replaced)) = state.snapshots.publish_capture_for_session(
-                            pid as i32,
-                            xid,
-                            crate::atspi::snapshot::AtspiSnapshot::from_nodes(&[]),
-                            session_id.as_deref(),
-                            screenshot_scale,
-                        ) {
+                        if let Some((_, replaced)) =
+                            state.snapshots.publish_capture_for_session_in_frame(
+                                pid as i32,
+                                xid,
+                                crate::atspi::snapshot::AtspiSnapshot::from_nodes(&[]),
+                                session_id.as_deref(),
+                                screenshot_scale,
+                                screenshot_frame.clone(),
+                            )
+                        {
                             invalidated.extend(replaced);
                         }
                     }
@@ -2693,9 +2741,38 @@ fn desktop_frame_requested(args: &Value) -> bool {
 
 /// Convert desktop (screen) coordinates to `xid`'s window-local frame so the
 /// rest of the pointer pipeline (which is window-local by contract) is reused.
-fn desktop_to_window_local(xid: u64, x: f64, y: f64) -> anyhow::Result<(f64, f64)> {
+fn desktop_to_window_local(pid: u32, xid: u64, x: f64, y: f64) -> anyhow::Result<(f64, f64)> {
+    if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+        return crate::wayland::hyprland::desktop_to_window_local(pid, xid, x, y);
+    }
     let (ox, oy) = window_local_to_screen(xid, 0.0, 0.0)?;
     Ok((x - ox, y - oy))
+}
+
+async fn desktop_to_window_local_for(
+    state: &ToolState,
+    args: &Value,
+    pid: u32,
+    xid: u64,
+    x: f64,
+    y: f64,
+) -> Result<anyhow::Result<(f64, f64)>, tokio::task::JoinError> {
+    let service = state.capture_service.clone();
+    let args = args.clone();
+    tokio::task::spawn_blocking(move || {
+        if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+            let frame = crate::wayland::hyprland::desktop_frame()?;
+            if args.get("capture_id").is_none() {
+                service.validate_desktop_observation(
+                    &service.binding_from_args(&args)?,
+                    &frame.identity,
+                )?;
+            }
+            return crate::wayland::hyprland::desktop_to_window_local_in(&frame, pid, xid, x, y);
+        }
+        desktop_to_window_local(pid, xid, x, y)
+    })
+    .await
 }
 
 /// Upper bound for one foreground input transaction: focus confirmation plus
@@ -2727,6 +2804,12 @@ async fn spawn_blocking_bounded<T: Send + 'static>(
 /// foreground `code` (`foreground_unavailable` / `foreground_timeout`) when the
 /// message carries one so the caller can branch instead of parsing prose.
 fn input_error_result(e: anyhow::Error) -> ToolResult {
+    if e.downcast_ref::<crate::wayland::hyprland::UnsupportedDisplayTransform>()
+        .is_some()
+    {
+        return ToolResult::error(e.to_string())
+            .with_structured(json!({"code":"unsupported_display_transform"}));
+    }
     let text = e.to_string();
     if crate::input::is_uinput_unavailable(&e) {
         // The focus-free real-input route exists but this process cannot open
@@ -2753,6 +2836,29 @@ fn input_error_result(e: anyhow::Error) -> ToolResult {
             },
         })),
         None => linux_input_error(e),
+    }
+}
+
+fn desktop_frame_error(error: anyhow::Error) -> ToolResult {
+    let code = if error
+        .downcast_ref::<crate::wayland::hyprland::UnsupportedDisplayTransform>()
+        .is_some()
+    {
+        Some("unsupported_display_transform")
+    } else if error
+        .downcast_ref::<cua_driver_core::capture_runtime::CaptureActionError>()
+        .is_some()
+    {
+        Some(cua_driver_core::capture_runtime::admission_error_code(
+            &error,
+        ))
+    } else {
+        None
+    };
+    let result = ToolResult::error(error.to_string());
+    match code {
+        Some(code) => result.with_structured(json!({"code":code})),
+        None => result,
     }
 }
 
@@ -5675,13 +5781,25 @@ async fn overlay_glide_to_target_for(cursor_id: &str, sx: f64, sy: f64, target: 
 /// The compositor snapshot a desktop-scope action is addressed in. One
 /// snapshot converts the action's points, places the overlay and sizes the
 /// virtual pointer, so they cannot disagree about the monitor layout.
-async fn desktop_input_space() -> anyhow::Result<crate::wayland::DesktopInputSpace> {
+async fn desktop_input_space(
+    state: &ToolState,
+    args: &Value,
+) -> anyhow::Result<crate::wayland::DesktopInputSpace> {
     if !crate::wayland::wayland_input_enabled() {
         return Ok(crate::wayland::DesktopInputSpace::default());
     }
-    tokio::task::spawn_blocking(crate::wayland::DesktopInputSpace::current)
+    let space = tokio::task::spawn_blocking(crate::wayland::DesktopInputSpace::current)
         .await
-        .map_err(|error| anyhow::anyhow!("task error: {error}"))?
+        .map_err(|error| anyhow::anyhow!("task error: {error}"))??;
+    if args.get("capture_id").is_none() {
+        if let Some(frame) = space.frame() {
+            state.capture_service.validate_desktop_observation(
+                &state.capture_service.binding_from_args(args)?,
+                &frame.identity,
+            )?;
+        }
+    }
+    Ok(space)
 }
 
 /// Keep the logical cursor position in sync with every visibly targeted
@@ -6597,19 +6715,18 @@ impl Tool for ClickTool {
                 return ToolResult::error("click.count must be at least 1.")
                     .with_structured(json!({ "code": "invalid_arguments" }));
             }
-            let space = match desktop_input_space().await {
+            let space = match desktop_input_space(&self.state, &args).await {
                 Ok(space) => space,
-                Err(error) => {
-                    return ToolResult::error(format!("desktop-scope click failed: {error}"))
-                }
+                Err(error) => return desktop_frame_error(error),
             };
             let (action_x, action_y) = if let Some(capture_id) = args.opt_str("capture_id") {
-                match crate::capture_action_frame::admit_desktop_click(
+                match crate::capture_action_frame::admit_desktop_click_in(
                     &self.state.capture_service,
                     &args,
                     &capture_id,
                     input.x,
                     input.y,
+                    &space,
                 ) {
                     Ok(point) => point,
                     Err(error) => return capture_admission_error(error),
@@ -6663,7 +6780,7 @@ impl Tool for ClickTool {
                 .with_structured(
                     json!({ "path": if crate::wayland::wayland_input_enabled() { "wayland_desktop" } else { "xtest_desktop" }, "verified": false, "effect": "unverifiable" }),
                 ),
-                Ok(Err(e)) => ToolResult::error(format!("desktop-scope click failed: {e}")),
+                Ok(Err(e)) => desktop_frame_error(e),
                 Err(e) => ToolResult::error(format!("task error: {e}")),
             };
         }
@@ -7164,7 +7281,7 @@ impl Tool for ClickTool {
             }
         }
         if desktop_frame {
-            match tokio::task::spawn_blocking(move || desktop_to_window_local(xid, x, y)).await {
+            match desktop_to_window_local_for(&self.state, &args, pid, xid, x, y).await {
                 Ok(Ok((lx, ly))) => {
                     x = lx;
                     y = ly;
@@ -9888,7 +10005,7 @@ impl Tool for ScrollTool {
             let display = direction.clone();
             let wayland = crate::wayland::wayland_input_enabled();
             let path = if wayland { "wayland_desktop" } else { "xtest" };
-            let space = match desktop_input_space().await {
+            let space = match desktop_input_space(&self.state, &args).await {
                 Ok(space) => space,
                 Err(error) => return ToolResult::error(error.to_string()),
             };
@@ -10013,8 +10130,7 @@ impl Tool for ScrollTool {
             (Some(x), Some(y)) if desktop_frame_requested(&args) => {
                 // Desktop-frame pixels (from get_desktop_state) against a named
                 // window: map into the window-local frame the pipeline expects.
-                match tokio::task::spawn_blocking(move || desktop_to_window_local(xid, x, y)).await
-                {
+                match desktop_to_window_local_for(&self.state, &args, pid, xid, x, y).await {
                     Ok(Ok(local)) => Some(local),
                     Ok(Err(e)) => {
                         return ToolResult::error(format!(
@@ -10586,7 +10702,7 @@ impl Tool for DoubleClickTool {
             y *= ratio;
         }
         if desktop_frame {
-            match tokio::task::spawn_blocking(move || desktop_to_window_local(xid, x, y)).await {
+            match desktop_to_window_local_for(&self.state, &args, pid, xid, x, y).await {
                 Ok(Ok((lx, ly))) => {
                     x = lx;
                     y = ly;
@@ -10873,7 +10989,7 @@ impl Tool for RightClickTool {
             y *= ratio;
         }
         if desktop_frame {
-            match tokio::task::spawn_blocking(move || desktop_to_window_local(xid, x, y)).await {
+            match desktop_to_window_local_for(&self.state, &args, pid, xid, x, y).await {
                 Ok(Ok((lx, ly))) => {
                     x = lx;
                     y = ly;
@@ -11058,7 +11174,7 @@ impl Tool for DragTool {
                 return wayland_modified_drag_refusal();
             }
             let path = if wayland { "wayland_desktop" } else { "xtest" };
-            let space = match desktop_input_space().await {
+            let space = match desktop_input_space(&self.state, &args).await {
                 Ok(space) => space,
                 Err(error) => return ToolResult::error(error.to_string()),
             };
@@ -11211,10 +11327,24 @@ impl Tool for DragTool {
             }
         }
         if desktop_frame {
+            let capture_service = self.state.capture_service.clone();
+            let binding = capture_service.binding_from_args(&args);
             let mapped = tokio::task::spawn_blocking(move || {
+                if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+                    let frame = crate::wayland::hyprland::desktop_frame()?;
+                    capture_service.validate_desktop_observation(&binding?, &frame.identity)?;
+                    return Ok((
+                        crate::wayland::hyprland::desktop_to_window_local_in(
+                            &frame, pid, xid, from_x, from_y,
+                        )?,
+                        crate::wayland::hyprland::desktop_to_window_local_in(
+                            &frame, pid, xid, to_x, to_y,
+                        )?,
+                    ));
+                }
                 Ok::<_, anyhow::Error>((
-                    desktop_to_window_local(xid, from_x, from_y)?,
-                    desktop_to_window_local(xid, to_x, to_y)?,
+                    desktop_to_window_local(pid, xid, from_x, from_y)?,
+                    desktop_to_window_local(pid, xid, to_x, to_y)?,
                 ))
             })
             .await;
@@ -11793,7 +11923,7 @@ impl Tool for MouseButtonDownTool {
             y *= ratio;
         }
         if desktop_frame {
-            match tokio::task::spawn_blocking(move || desktop_to_window_local(xid, x, y)).await {
+            match desktop_to_window_local_for(&self.state, &args, pid, xid, x, y).await {
                 Ok(Ok((lx, ly))) => {
                     x = lx;
                     y = ly;
@@ -12149,6 +12279,7 @@ impl Tool for MouseButtonUpTool {
         }
 
         let xid = hold.xid;
+        let pid = hold.pid;
 
         let desktop_frame = args.opt_f64("x").is_some()
             && args.opt_f64("y").is_some()
@@ -12163,7 +12294,7 @@ impl Tool for MouseButtonUpTool {
             }
         };
         if desktop_frame {
-            match tokio::task::spawn_blocking(move || desktop_to_window_local(xid, x, y)).await {
+            match desktop_to_window_local_for(&self.state, &args, pid, xid, x, y).await {
                 Ok(Ok((lx, ly))) => {
                     x = lx;
                     y = ly;
@@ -12659,7 +12790,7 @@ impl Tool for GetScreenSizeTool {
                 ToolResult::text(format!("✅ Main display: {w}x{h} points @ {scale}x"))
                     .with_structured(json!({ "width": w, "height": h, "scale_factor": scale }))
             }
-            Ok(Err(e)) => ToolResult::error(e.to_string()),
+            Ok(Err(e)) => desktop_frame_error(e),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }
@@ -12860,12 +12991,13 @@ impl Tool for GetDesktopStateTool {
                 );
                 frame.rebase_windows(&mut windows);
             }
-            let capture_id = crate::capture_action_frame::publish_desktop(
+            let capture_id = crate::capture_action_frame::publish_desktop_in_frame(
                 &capture_service,
                 &capture_args,
                 &png,
                 (shot_w, shot_h),
                 (screen_w, screen_h),
+                hyprland_frame.as_ref().map(|frame| frame.identity.clone()),
             )?;
             Ok((
                 b64,
@@ -12953,7 +13085,7 @@ impl Tool for GetDesktopStateTool {
                     action_record: None,
                 }
             }
-            Ok(Err(e)) => ToolResult::error(format!("Capture error: {e}")),
+            Ok(Err(e)) => desktop_frame_error(e),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }
@@ -13027,10 +13159,11 @@ impl Tool for GetCursorPositionTool {
         // Hyprland reports the real pointer over IPC; return it in the
         // desktop-frame coordinates that get_desktop_state and desktop actions use.
         if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
-            let position = tokio::task::spawn_blocking(|| -> anyhow::Result<(i32, i32)> {
+            let position = tokio::task::spawn_blocking(|| -> anyhow::Result<(f64, f64)> {
+                let frame = crate::wayland::hyprland::desktop_frame()?;
                 let (x, y) = crate::wayland::hyprland::cursor_position()?;
-                Ok(crate::wayland::hyprland::desktop_frame()?
-                    .from_layout(x.round() as i32, y.round() as i32))
+                frame.validate_current()?;
+                Ok((x - f64::from(frame.x), y - f64::from(frame.y)))
             })
             .await;
             // The synthetic registry below holds layout coordinates, not the
@@ -13773,6 +13906,9 @@ impl Tool for ZoomTool {
             Ok(context) => context,
             Err(refusal) => return refusal,
         };
+        if let Err(refusal) = self.state.validate_screenshot_frame(pid as u32, screenshot) {
+            return refusal;
+        }
         let x1 = match args.opt_f64("x1") {
             Some(v) => v,
             None => return ToolResult::error("Missing x1"),
@@ -13812,6 +13948,9 @@ impl Tool for ZoomTool {
 
         match result {
             Ok(Ok(crop)) => {
+                if let Err(refusal) = state.validate_screenshot_frame(pid as u32, screenshot) {
+                    return refusal;
+                }
                 if let Err(refusal) = state.snapshots.set_zoom(
                     pid,
                     session_id.as_deref(),
@@ -14609,6 +14748,26 @@ pub fn build_registry_with_provider(
         r.recording
             .set_pixel_point_fn(move |args, window_id, pid, mut x, mut y| {
                 let state = recording_state.upgrade()?;
+                // This legacy recording hook has no consumed capture transform.
+                // Omit rather than invent a marker for capture-bound pixels.
+                if args.get("capture_id").is_some() {
+                    return None;
+                }
+                if desktop_frame_requested(args) {
+                    // Desktop pixels are already frame-relative; do not apply
+                    // a window preview/zoom multiplier or add its origin again.
+                    let frame = crate::wayland::hyprland::desktop_frame().ok()?;
+                    state
+                        .capture_service
+                        .validate_desktop_observation(
+                            &state.capture_service.binding_from_args(args).ok()?,
+                            &frame.identity,
+                        )
+                        .ok()?;
+                    frame.checked_layout_point(x, y).ok()?;
+                    frame.validate_current().ok()?;
+                    return Some((x, y));
+                }
                 if let Some(pid) = pid {
                     let pid = u32::try_from(pid).ok()?;
                     // Match ClickTool's screenshot and zoom conversion before

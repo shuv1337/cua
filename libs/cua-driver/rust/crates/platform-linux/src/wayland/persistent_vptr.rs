@@ -78,6 +78,7 @@ struct ActivePointer {
     out_h: u32,
     origin_x: i32,
     origin_y: i32,
+    frame: Option<super::hyprland::DesktopFrame>,
 }
 
 /// Process-global command channel into the owner thread. Lazily started on
@@ -97,7 +98,33 @@ fn tx() -> &'static Sender<Cmd> {
 
 fn owner_thread(rx: Receiver<Cmd>) {
     let mut active: HashMap<String, ActivePointer> = HashMap::new();
-    while let Ok(cmd) = rx.recv() {
+    loop {
+        let command = rx.recv_timeout(std::time::Duration::from_millis(100));
+        // Poll even while the caller is idle. Metadata failures revoke the
+        // originally owned device; never open a new connection to release into
+        // a successor compositor. Polling does not prove unseen ABA transitions.
+        if active.values().any(|p| p.frame.is_some()) {
+            let current = super::hyprland::desktop_frame().ok();
+            let revoked: Vec<_> = active
+                .iter()
+                .filter(|(_, p)| {
+                    p.frame.as_ref().is_some_and(|frame| {
+                        current
+                            .as_ref()
+                            .is_none_or(|now| now.identity != frame.identity)
+                    })
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in revoked {
+                destroy_owned(&mut active, &key);
+            }
+        }
+        let cmd = match command {
+            Ok(cmd) => cmd,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
         match cmd {
             Cmd::Press {
                 cursor_id,
@@ -128,13 +155,27 @@ fn owner_thread(rx: Receiver<Cmd>) {
                 let _ = reply.send(r);
             }
             Cmd::Forget { cursor_id, reply } => {
-                if let Some(p) = active.remove(&cursor_id) {
-                    p.vptr.destroy();
-                }
+                destroy_owned(&mut active, &cursor_id);
                 let _ = reply.send(Ok(()));
             }
         }
     }
+    let keys: Vec<_> = active.keys().cloned().collect();
+    for key in keys {
+        destroy_owned(&mut active, &key);
+    }
+}
+
+fn destroy_owned(active: &mut HashMap<String, ActivePointer>, cursor_id: &str) {
+    if let Some(pointer) = active.remove(cursor_id) {
+        pointer.vptr.destroy();
+        CONNS.with(|connections| {
+            if let Some((connection, _)) = connections.borrow().get(cursor_id) {
+                let _ = connection.flush();
+            }
+        });
+    }
+    forget_conn(cursor_id);
 }
 
 fn handle_press(
@@ -145,6 +186,9 @@ fn handle_press(
     y: i32,
     button: u8,
 ) -> anyhow::Result<()> {
+    if active.contains_key(cursor_id) {
+        anyhow::bail!("mouse_hold_conflict: cursor already owns a held device");
+    }
     // Open a fresh session for this press — this binds the seat, the foreign-
     // toplevel manager, activates the target window, and creates a new vptr.
     // Keep the (out_w, out_h) but drop the queue + state at end of scope; the
@@ -152,6 +196,7 @@ fn handle_press(
     // as long as the Connection is alive).
     let mut sess = open_vptr_session(Some(window_id))?;
     let (w, h) = (sess.output_w, sess.output_h);
+    sess.validate_layout_point(x, y)?;
     let (px, py) = sess.abs(x, y);
     let btn = evdev_pointer_button(button);
 
@@ -182,6 +227,7 @@ fn handle_press(
             out_h: h,
             origin_x: sess.origin_x,
             origin_y: sess.origin_y,
+            frame: sess.frame.clone(),
         },
     );
     Ok(())
@@ -198,6 +244,13 @@ fn handle_move(
             "no held mouse button for cursor '{cursor_id}'; call mouse_button_down first"
         )
     })?;
+    if entry
+        .frame
+        .as_ref()
+        .is_some_and(|frame| !frame.contains_layout_point(f64::from(x), f64::from(y)))
+    {
+        anyhow::bail!("desktop_coordinate_invalid: held motion outside powered coverage");
+    }
     let (px, py) = super::pointer_abs(
         entry.origin_x,
         entry.origin_y,

@@ -2274,6 +2274,46 @@ mod backing_scale_tests {
     }
 
     #[test]
+    fn placed_negative_layout_positions_reveal_and_paint_like_origin_zero() {
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        core.visible = true;
+        core.idle_alpha = 1.0;
+        let mut unplaced = tiny_skia::Pixmap::new(64, 64).unwrap();
+        paint_cursor(&mut unplaced, &core, -2560.0, -1440.0, None, 1.0);
+        assert_eq!(visible_pixel_count(&unplaced), 0);
+        assert!(!core.is_revealed());
+        core.pos = (32.0, 32.0);
+        core.placed = true;
+        let mut reference = tiny_skia::Pixmap::new(64, 64).unwrap();
+        paint_cursor(&mut reference, &core, 0.0, 0.0, None, 1.0);
+        assert!(visible_pixel_count(&reference) > 0);
+        for position in [
+            (-2528.0, -1408.0),
+            (-200.0, 32.0),
+            (-100.0, 32.0),
+            (-50.0, 32.0),
+            (0.0, 32.0),
+        ] {
+            core.pos = position;
+            assert!(core.is_revealed(), "placed cursor {position:?} must reveal");
+            let mut pixmap = tiny_skia::Pixmap::new(64, 64).unwrap();
+            paint_cursor(
+                &mut pixmap,
+                &core,
+                position.0 - 32.0,
+                position.1 - 32.0,
+                None,
+                1.0,
+            );
+            assert_eq!(
+                pixmap.data(),
+                reference.data(),
+                "origin translation must preserve cursor pixels at {position:?}"
+            );
+        }
+    }
+
+    #[test]
     fn cursor_pinned_to_an_off_workspace_window_paints_nothing() {
         let mut core = RenderStateCore::new(CursorConfig::default());
         core.pos = (32.0, 32.0);

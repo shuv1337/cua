@@ -19,6 +19,14 @@ const QUERY_MAX_ATTEMPTS: usize = 2;
 const MAX_REPLY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LOGICAL_PIXELS: u64 = 64 * 1024 * 1024;
 
+#[derive(Debug, thiserror::Error)]
+#[error("unsupported_display_transform: Hyprland display identity requires unrotated outputs ({output} has transform {transform}{standby})")]
+pub struct UnsupportedDisplayTransform {
+    pub output: String,
+    pub transform: u32,
+    pub standby: &'static str,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct Workspace {
     id: i64,
@@ -55,10 +63,16 @@ struct Monitor {
     dpms_status: bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
 struct DisplayMonitor {
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    serial: String,
+    #[serde(default, rename = "refreshRate")]
+    refresh_rate: Option<f64>,
     width: u32,
     height: u32,
     scale: f64,
@@ -133,6 +147,8 @@ pub struct FrameOutput {
     pub y: i32,
     pub width: u32,
     pub height: u32,
+    pub native_width: u32,
+    pub native_height: u32,
 }
 
 /// The desktop action frame: the bounding box of every powered output
@@ -151,9 +167,68 @@ pub struct DesktopFrame {
     /// outputs, so a single output reports its own scale.
     pub scale: f64,
     pub outputs: Vec<FrameOutput>,
+    pub identity: cua_driver_core::capture_runtime::CaptureFrameIdentity,
 }
 
 impl DesktopFrame {
+    /// Half-open powered-output coverage, not merely the bounding canvas.
+    pub fn contains_layout_point(&self, x: f64, y: f64) -> bool {
+        x.is_finite()
+            && y.is_finite()
+            && self.outputs.iter().any(|output| {
+                x >= f64::from(output.x)
+                    && y >= f64::from(output.y)
+                    && x < f64::from(output.x) + f64::from(output.width)
+                    && y < f64::from(output.y) + f64::from(output.height)
+            })
+    }
+
+    pub fn checked_layout_point(&self, x: f64, y: f64) -> Result<(f64, f64)> {
+        let point = (x + f64::from(self.x), y + f64::from(self.y));
+        if !self.contains_layout_point(point.0, point.1) {
+            bail!("desktop_coordinate_invalid: point is outside powered output coverage");
+        }
+        Ok(point)
+    }
+
+    fn bind_compositor(mut self) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let path = ipc_path()?;
+        let socket = std::fs::metadata(&path)?;
+        let ipc = ipc_connection()?;
+        let pid = peer_pid(ipc.as_raw_fd())?;
+        let wayland = wayland_connection()?;
+        if peer_pid(wayland.backend().poll_fd().as_raw_fd())? != pid {
+            bail!("Hyprland capture frame compositor identity changed");
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        let start_time = stat
+            .rsplit_once(')')
+            .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+            .context("Hyprland compositor lifetime unavailable")?;
+        self.identity =
+            cua_driver_core::capture_runtime::CaptureFrameIdentity::from_native_snapshot(
+                format!(
+                    "{:?}:{:?}:{}:{}:{pid}:{start_time}",
+                    self.identity,
+                    path,
+                    socket.dev(),
+                    socket.ino()
+                )
+                .as_bytes(),
+            );
+        Ok(self)
+    }
+
+    /// A final freshness check is not an atomic compositor transaction. Refuse
+    /// before dispatch rather than reinterpreting an old point in a new frame.
+    pub fn validate_current(&self) -> Result<()> {
+        if desktop_frame()?.identity != self.identity {
+            bail!(cua_driver_core::capture_runtime::CaptureActionError::NativeActionFrameMismatch);
+        }
+        Ok(())
+    }
+
     pub fn to_layout(&self, x: i32, y: i32) -> (i32, i32) {
         (self.x.saturating_add(x), self.y.saturating_add(y))
     }
@@ -480,7 +555,8 @@ fn screen_size_from_monitors(monitors: Vec<DisplayMonitor>) -> Result<(u32, u32,
 /// desktop-frame (logical) pixels; positions are `None` for monitors outside
 /// the frame (standby). Mirrors are omitted: they repeat another output.
 pub fn screen_report() -> Result<(DesktopFrame, serde_json::Value)> {
-    screen_report_from_monitors(query("j/monitors")?)
+    let (frame, report) = screen_report_from_monitors(query("j/monitors")?)?;
+    Ok((frame.bind_compositor()?, report))
 }
 
 fn screen_report_from_monitors(
@@ -525,7 +601,9 @@ pub struct DesktopSnapshot {
 }
 
 pub fn desktop_snapshot() -> Result<DesktopSnapshot> {
-    desktop_snapshot_from_monitors(query("j/monitors")?)
+    let mut snapshot = desktop_snapshot_from_monitors(query("j/monitors")?)?;
+    snapshot.frame = snapshot.frame.bind_compositor()?;
+    Ok(snapshot)
 }
 
 fn desktop_snapshot_from_monitors(monitors: Vec<DisplayMonitor>) -> Result<DesktopSnapshot> {
@@ -537,10 +615,37 @@ fn desktop_snapshot_from_monitors(monitors: Vec<DisplayMonitor>) -> Result<Deskt
 
 /// Current desktop frame spanning every powered output.
 pub fn desktop_frame() -> Result<DesktopFrame> {
-    desktop_frame_from_monitors(query("j/monitors")?)
+    desktop_frame_from_monitors(query("j/monitors")?)?.bind_compositor()
 }
 
-fn desktop_frame_from_monitors(monitors: Vec<DisplayMonitor>) -> Result<DesktopFrame> {
+fn desktop_frame_from_monitors(mut monitors: Vec<DisplayMonitor>) -> Result<DesktopFrame> {
+    // Canonicalize enumeration and retain all output state, including standby/disabled/mirrored
+    // members and each native mode/scale. A global maximum scale is metadata,
+    // never sufficient identity for mixed-scale capture/input.
+    if monitors.len() > 64 {
+        bail!("unsupported_display_layout: too many outputs");
+    }
+    monitors.sort_by(|a, b| a.name.cmp(&b.name));
+    if monitors.iter().any(|m| m.name.is_empty())
+        || monitors.windows(2).any(|pair| pair[0].name == pair[1].name)
+    {
+        bail!("unsupported_display_layout: missing or duplicate output identity");
+    }
+    for mirror in monitors
+        .iter()
+        .filter(|m| !matches!(m.mirror_of.as_str(), "" | "none"))
+    {
+        let source = monitors
+            .iter()
+            .find(|m| m.name == mirror.mirror_of)
+            .context("unsupported_display_layout: mirror source unavailable")?;
+        if mirror.logical_size()? != source.logical_size()? {
+            bail!("unsupported_display_layout: differently sized mirrored pointer coverage is unqualified");
+        }
+    }
+    let identity = cua_driver_core::capture_runtime::CaptureFrameIdentity::from_native_snapshot(
+        &serde_json::to_vec(&monitors)?,
+    );
     let in_layout: Vec<DisplayMonitor> = monitors
         .into_iter()
         .filter(DisplayMonitor::in_layout)
@@ -563,9 +668,28 @@ fn desktop_frame_from_monitors(monitors: Vec<DisplayMonitor>) -> Result<DesktopF
         // the single-output capture rotates into it. Composing several outputs
         // assumes unrotated ones, so a rotated output among others refuses.
         if monitor.transform != 0 && powered.len() > 1 {
-            bail!("Hyprland multi-monitor desktops require unrotated outputs");
+            bail!(UnsupportedDisplayTransform {
+                output: monitor.name.clone(),
+                transform: monitor.transform,
+                standby: if monitor.dpms_status {
+                    ""
+                } else {
+                    ", in standby"
+                },
+            });
         }
         outputs.push(frame_output(monitor)?);
+    }
+    for (index, a) in outputs.iter().enumerate() {
+        for b in &outputs[index + 1..] {
+            if i64::from(a.x) < i64::from(b.x) + i64::from(b.width)
+                && i64::from(b.x) < i64::from(a.x) + i64::from(a.width)
+                && i64::from(a.y) < i64::from(b.y) + i64::from(b.height)
+                && i64::from(b.y) < i64::from(a.y) + i64::from(a.height)
+            {
+                bail!("unsupported_display_layout: overlapping non-mirror outputs");
+            }
+        }
     }
     let (x, y, width, height) = bounding_box(&outputs)?;
     let scale = powered.iter().map(|m| m.scale).fold(f64::MIN, f64::max);
@@ -576,6 +700,7 @@ fn desktop_frame_from_monitors(monitors: Vec<DisplayMonitor>) -> Result<DesktopF
         height,
         scale,
         outputs,
+        identity,
     })
 }
 
@@ -587,6 +712,8 @@ fn frame_output(monitor: &DisplayMonitor) -> Result<FrameOutput> {
         y: monitor.y,
         width,
         height,
+        native_width: monitor.width,
+        native_height: monitor.height,
     })
 }
 
@@ -614,7 +741,10 @@ fn bounding_box(outputs: &[FrameOutput]) -> Result<(i32, i32, u32, u32)> {
         .context("no outputs")?;
     let width = u32::try_from(max_x - min_x)?;
     let height = u32::try_from(max_y - min_y)?;
-    if !valid_dimensions(width, height) {
+    if !valid_dimensions(width, height)
+        || max_x > i64::from(i32::MAX)
+        || max_y > i64::from(i32::MAX)
+    {
         bail!("invalid Hyprland display dimensions");
     }
     Ok((i32::try_from(min_x)?, i32::try_from(min_y)?, width, height))
@@ -630,16 +760,15 @@ fn pointer_layout_from_monitors(monitors: Vec<DisplayMonitor>) -> Result<(i32, i
     let mut outputs = Vec::new();
     for monitor in &in_layout {
         if monitor.transform != 0 && in_layout.len() > 1 {
-            bail!(
-                "Hyprland pointer layout requires unrotated outputs ({} has transform {}{})",
-                monitor.name,
-                monitor.transform,
-                if monitor.dpms_status {
+            bail!(UnsupportedDisplayTransform {
+                output: monitor.name.clone(),
+                transform: monitor.transform,
+                standby: if monitor.dpms_status {
                     ""
                 } else {
                     ", in standby"
-                }
-            );
+                },
+            });
         }
         outputs.push(frame_output(monitor)?);
     }
@@ -663,9 +792,10 @@ fn pointer_space_from_monitors(
         Err(_) if in_layout <= 1 => Ok(None),
         // Keep the cause in the message itself: tools report only the outer
         // error, and the agent needs to know which output blocks the action.
-        Err(error) => Err(anyhow::anyhow!(
-            "{error}; the virtual pointer spans every monitor in the layout, including ones in standby, so it cannot be sized"
-        )),
+        Err(error) => {
+            let detail = format!("{error}; the virtual pointer spans every monitor in the layout, including ones in standby, so it cannot be sized");
+            Err(error.context(detail))
+        }
     }
 }
 
@@ -691,7 +821,11 @@ pub fn composite_desktop_capture() -> Option<Result<Vec<u8>>> {
     if monitors.len() <= 1 {
         return None;
     }
-    Some(desktop_frame_from_monitors(monitors).and_then(|frame| compose_desktop_capture(&frame)))
+    Some(
+        desktop_frame_from_monitors(monitors)
+            .and_then(DesktopFrame::bind_compositor)
+            .and_then(|frame| compose_desktop_capture(&frame)),
+    )
 }
 
 /// The desktop frame and whether capturing it needs per-output composition
@@ -702,7 +836,9 @@ pub struct DesktopCapturePlan {
 }
 
 pub fn desktop_capture_plan() -> Result<DesktopCapturePlan> {
-    desktop_capture_plan_from_monitors(query("j/monitors")?)
+    let mut plan = desktop_capture_plan_from_monitors(query("j/monitors")?)?;
+    plan.frame = plan.frame.bind_compositor()?;
+    Ok(plan)
 }
 
 fn desktop_capture_plan_from_monitors(monitors: Vec<DisplayMonitor>) -> Result<DesktopCapturePlan> {
@@ -715,28 +851,81 @@ fn desktop_capture_plan_from_monitors(monitors: Vec<DisplayMonitor>) -> Result<D
 
 /// Compose `frame` from per-output captures (see [`composite_desktop_capture`]).
 pub fn compose_desktop_capture(frame: &DesktopFrame) -> Result<Vec<u8>> {
+    frame.validate_current()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
     let canvas = compose_frame(frame, |output| {
-        let png = capture_output_png(&output.name)?;
-        Ok(image::load_from_memory_with_format(&png, image::ImageFormat::Png)?.to_rgba8())
+        let png = capture_output_png(&output.name, deadline)?;
+        use image::ImageDecoder;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(output.native_width);
+        limits.max_image_height = Some(output.native_height);
+        limits.max_alloc = Some(MAX_LOGICAL_PIXELS * 4);
+        let decoder =
+            image::codecs::png::PngDecoder::with_limits(std::io::Cursor::new(&png), limits)?;
+        if decoder.dimensions() != (output.native_width, output.native_height) {
+            bail!(
+                "output {} capture does not match its qualified native mode",
+                output.name
+            );
+        }
+        Ok(image::DynamicImage::from_decoder(decoder)?.to_rgba8())
     })?;
     let mut encoded = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(canvas).write_to(&mut encoded, image::ImageFormat::Png)?;
+    frame.validate_current()?;
     Ok(encoded.into_inner())
 }
 
-fn capture_output_png(name: &str) -> Result<Vec<u8>> {
+fn capture_output_png(name: &str, deadline: Instant) -> Result<Vec<u8>> {
     // The PNG is decoded right away, so skip compression.
-    let out = std::process::Command::new("grim")
+    let mut child = std::process::Command::new("grim")
         .args(["-t", "png", "-l", "0", "-o", name, "-"])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .context("grim is required for multi-monitor Hyprland desktop capture")?;
-    if !out.status.success() || out.stdout.is_empty() {
-        bail!(
-            "grim could not capture output {name}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+    let result = (|| -> Result<Vec<u8>> {
+        let mut stdout = child.stdout.take().context("grim stdout unavailable")?;
+        let fd = stdout.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let mut png = Vec::new();
+        let mut chunk = [0; 65536];
+        let mut eof = false;
+        loop {
+            if Instant::now() >= deadline {
+                bail!("desktop_capture_timeout: grim deadline exceeded for {name}");
+            }
+            match stdout.read(&mut chunk) {
+                Ok(0) => eof = true,
+                Ok(count) => {
+                    if png.len() + count > (MAX_LOGICAL_PIXELS * 5) as usize {
+                        bail!("desktop_capture_limit: output PNG exceeds byte limit");
+                    }
+                    png.extend_from_slice(&chunk[..count]);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            }
+            if eof {
+                if let Some(status) = child.try_wait()? {
+                    if !status.success() || png.is_empty() {
+                        bail!("grim could not capture output {name}");
+                    }
+                    return Ok(png);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    Ok(out.stdout)
+    result
 }
 
 /// Place each output's capture at its logical rectangle inside the frame. A
@@ -811,6 +1000,9 @@ struct CursorPos {
 /// The pointer in Hyprland's global layout coordinates.
 pub fn cursor_position() -> Result<(f64, f64)> {
     let pos: CursorPos = query("j/cursorpos")?;
+    if !pos.x.is_finite() || !pos.y.is_finite() {
+        bail!("invalid Hyprland cursor position");
+    }
     Ok((pos.x, pos.y))
 }
 
@@ -838,6 +1030,50 @@ pub fn window_for_address(address: u64) -> Option<Window> {
         .ok()?
         .into_iter()
         .find(|w| w.address == address)
+}
+
+pub fn desktop_to_window_local(pid: u32, address: u64, x: f64, y: f64) -> Result<(f64, f64)> {
+    let frame = desktop_frame()?;
+    desktop_to_window_local_in(&frame, pid, address, x, y)
+}
+
+pub fn desktop_to_window_local_in(
+    frame: &DesktopFrame,
+    pid: u32,
+    address: u64,
+    x: f64,
+    y: f64,
+) -> Result<(f64, f64)> {
+    let window = window_for_address(address).context("native window identity unavailable")?;
+    let local = desktop_point_in_window(frame, &window, pid, address, x, y)?;
+    if window_for_address(address).as_ref() != Some(&window) {
+        bail!("native window geometry changed during desktop translation");
+    }
+    frame.validate_current()?;
+    Ok(local)
+}
+
+fn desktop_point_in_window(
+    frame: &DesktopFrame,
+    window: &Window,
+    pid: u32,
+    address: u64,
+    x: f64,
+    y: f64,
+) -> Result<(f64, f64)> {
+    if window.pid != pid || window.address != address || window.hidden {
+        bail!("native window identity mismatch");
+    }
+    let (x, y) = frame.checked_layout_point(x, y)?;
+    let local = (x - f64::from(window.x), y - f64::from(window.y));
+    if local.0 < 0.0
+        || local.1 < 0.0
+        || local.0 >= f64::from(window.width)
+        || local.1 >= f64::from(window.height)
+    {
+        bail!("desktop_coordinate_invalid: point is outside the exact native client");
+    }
+    Ok(local)
 }
 
 /// AT-SPI has no native Hyprland handle. Correlate only when the title is
@@ -1374,7 +1610,7 @@ mod tests {
 
     fn display_monitor() -> DisplayMonitor {
         serde_json::from_value(serde_json::json!({
-            "width": 1920, "height": 1080, "scale": 1.0,
+            "name": "DP-1", "width": 1920, "height": 1080, "scale": 1.0,
             "x": 0, "y": 0, "transform": 0,
         }))
         .unwrap()
@@ -1384,6 +1620,162 @@ mod tests {
         let mut monitor = display_monitor();
         (monitor.width, monitor.height, monitor.scale) = (width, height, scale);
         monitor
+    }
+
+    fn home_monitors() -> Vec<DisplayMonitor> {
+        [("DP-2", 0), ("DP-1", 2560)]
+            .into_iter()
+            .map(|(name, x)| {
+                let mut monitor = scaled_monitor(3840, 2160, 1.5);
+                monitor.name = name.into();
+                monitor.x = x;
+                monitor
+            })
+            .collect()
+    }
+
+    #[test]
+    fn home_dual_fractional_frame_capture_pointer_seam_and_cap_agree() {
+        let monitors = home_monitors();
+        let frame = desktop_frame_from_monitors(monitors.clone()).unwrap();
+        assert_eq!(
+            (frame.x, frame.y, frame.width, frame.height, frame.scale),
+            (0, 0, 5120, 1440, 1.5)
+        );
+        assert_eq!(
+            pointer_layout_from_monitors(monitors).unwrap(),
+            (0, 0, 5120, 1440)
+        );
+        assert_eq!(
+            frame.checked_layout_point(2560.0, 720.0).unwrap(),
+            (2560.0, 720.0)
+        );
+        assert_eq!(
+            super::super::output_approach_point(&frame, 2560, 720).unwrap(),
+            (2561, 720)
+        );
+        assert_eq!(
+            super::super::output_approach_point(&frame, 2559, 720).unwrap(),
+            (2558, 720)
+        );
+        let transform = cua_driver_core::capture_runtime::ScreenshotToActionTransform::new(
+            2.0, 0.0, 0.0, 2.0, 0.0, 0.0,
+        )
+        .unwrap();
+        assert_eq!(transform.apply(1920.0, 360.0), (3840.0, 720.0));
+        assert_eq!(
+            frame
+                .checked_layout_point(5120.0, 0.0)
+                .unwrap_err()
+                .to_string(),
+            "desktop_coordinate_invalid: point is outside powered output coverage"
+        );
+        let composed = compose_frame(&frame, |output| {
+            let color = if output.name == "DP-2" {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 255, 0, 255])
+            };
+            Ok(image::RgbaImage::from_pixel(
+                output.native_width,
+                output.native_height,
+                color,
+            ))
+        })
+        .unwrap();
+        assert_eq!(composed.dimensions(), (5120, 1440));
+        assert_eq!(composed.get_pixel(2559, 720).0, [255, 0, 0, 255]);
+        assert_eq!(composed.get_pixel(2560, 720).0, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn topology_identity_is_canonical_and_keeps_nonmax_scale_mode_standby_and_origin() {
+        let monitors = home_monitors();
+        let original = desktop_frame_from_monitors(monitors.clone()).unwrap();
+        let mut reversed = monitors.clone();
+        reversed.reverse();
+        assert_eq!(
+            original.identity,
+            desktop_frame_from_monitors(reversed).unwrap().identity
+        );
+        let mut mode_scale = monitors.clone();
+        mode_scale[0].width = 2560;
+        mode_scale[0].height = 1440;
+        mode_scale[0].scale = 1.0;
+        let changed = desktop_frame_from_monitors(mode_scale).unwrap();
+        assert_eq!(
+            (original.width, original.height, original.scale),
+            (changed.width, changed.height, changed.scale)
+        );
+        assert_ne!(original.identity, changed.identity);
+        for changed in [
+            {
+                let mut m = monitors.clone();
+                m[0].dpms_status = false;
+                m
+            },
+            {
+                let mut m = monitors.clone();
+                m[0].x = -2560;
+                m[1].x = 0;
+                m
+            },
+            {
+                let mut m = monitors.clone();
+                m[0].serial = "new-output".into();
+                m
+            },
+        ] {
+            assert_ne!(
+                original.identity,
+                desktop_frame_from_monitors(changed).unwrap().identity
+            );
+        }
+        let mut duplicate = monitors;
+        duplicate[1].name = duplicate[0].name.clone();
+        assert_eq!(
+            desktop_frame_from_monitors(duplicate)
+                .unwrap_err()
+                .to_string(),
+            "unsupported_display_layout: missing or duplicate output identity"
+        );
+    }
+
+    #[test]
+    fn signed_native_desktop_translation_requires_exact_pid_full_address_and_coverage() {
+        let mut monitors = home_monitors();
+        monitors[0].x = -2560;
+        monitors[1].x = 0;
+        let frame = desktop_frame_from_monitors(monitors).unwrap();
+        let mut client = window(0x100000010, 42);
+        client.x = -2500;
+        client.y = 20;
+        assert_eq!(
+            desktop_point_in_window(&frame, &client, 42, 0x100000010, 310.5, 270.25).unwrap(),
+            (250.5, 250.25)
+        );
+        assert_eq!(
+            desktop_point_in_window(&frame, &client, 43, 0x100000010, 310.5, 270.25)
+                .unwrap_err()
+                .to_string(),
+            "native window identity mismatch"
+        );
+        assert_eq!(
+            desktop_point_in_window(&frame, &client, 42, 0x10, 310.5, 270.25)
+                .unwrap_err()
+                .to_string(),
+            "native window identity mismatch"
+        );
+        let mut gapped = home_monitors();
+        gapped[1].x = 3000;
+        let frame = desktop_frame_from_monitors(gapped).unwrap();
+        assert_eq!(
+            frame
+                .checked_layout_point(2800.0, 50.0)
+                .unwrap_err()
+                .to_string(),
+            "desktop_coordinate_invalid: point is outside powered output coverage"
+        );
     }
 
     // (output mode, scale, logical frame). 1.6666666 is the #4219 laptop.
@@ -1544,7 +1936,7 @@ mod tests {
                 .iter()
                 .map(|o| (o.name.as_str(), o.x, o.width, o.height))
                 .collect::<Vec<_>>(),
-            [("eDP-1", 0, 1296, 810), ("DP-1", 1296, 2560, 1440)]
+            [("DP-1", 1296, 2560, 1440), ("eDP-1", 0, 1296, 810)]
         );
         assert_eq!(
             pointer_layout_from_monitors(vec![laptop, external]).unwrap(),

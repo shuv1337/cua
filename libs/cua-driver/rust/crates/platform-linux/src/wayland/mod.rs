@@ -1344,9 +1344,41 @@ pub struct VptrSession {
     /// coordinates; [`VptrSession::abs`] converts them for `motion_absolute`.
     pub origin_x: i32,
     pub origin_y: i32,
+    pub(super) frame: Option<hyprland::DesktopFrame>,
+    effect_started: bool,
 }
 
 impl VptrSession {
+    fn validate_frame(&mut self) -> anyhow::Result<()> {
+        if let Some(frame) = &self.frame {
+            if frame.validate_current().is_err() {
+                self.vptr.destroy();
+                let _ = self.conn.flush();
+                if self.effect_started {
+                    anyhow::bail!(
+                        "desktop_frame_changed_after_input: partial/unknown effect; do not replay"
+                    );
+                }
+                anyhow::bail!(
+                    cua_driver_core::capture_runtime::CaptureActionError::NativeActionFrameMismatch
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_layout_point(&mut self, x: i32, y: i32) -> anyhow::Result<()> {
+        self.validate_frame()?;
+        if self
+            .frame
+            .as_ref()
+            .is_some_and(|frame| !frame.contains_layout_point(f64::from(x), f64::from(y)))
+        {
+            anyhow::bail!("desktop_coordinate_invalid: point is outside powered output coverage");
+        }
+        Ok(())
+    }
+
     /// Layout point -> clamped `motion_absolute` coordinates.
     pub fn abs(&self, x: i32, y: i32) -> (u32, u32) {
         pointer_abs(
@@ -1386,6 +1418,17 @@ pub struct DesktopInputSpace {
 }
 
 impl DesktopInputSpace {
+    pub fn frame(&self) -> Option<&hyprland::DesktopFrame> {
+        self.snapshot.as_ref().map(|snapshot| &snapshot.frame)
+    }
+
+    pub fn validate_point(&self, x: i32, y: i32) -> anyhow::Result<()> {
+        if let Some(frame) = self.frame() {
+            frame.validate_current()?;
+            frame.checked_layout_point(f64::from(x), f64::from(y))?;
+        }
+        Ok(())
+    }
     pub fn current() -> anyhow::Result<Self> {
         let snapshot = if is_wayland() && hyprland::is_session() {
             Some(hyprland::desktop_snapshot()?)
@@ -1428,16 +1471,56 @@ impl VptrSession {
     /// from the keyboard) never got the wheel or the button that followed.
     /// Approaching from the next pixel always moves the pointer.
     fn point_at(&mut self, px: u32, py: u32) -> anyhow::Result<()> {
+        self.validate_frame()?;
         let (w, h) = (self.output_w, self.output_h);
-        self.vptr
-            .motion_absolute(event_time_ms(), approach_pixel(px, w), py, w, h);
+        let (ax, ay) = if let Some(frame) = &self.frame {
+            output_approach_point(frame, self.origin_x + px as i32, self.origin_y + py as i32)
+                .map(|(x, y)| self.abs(x, y))?
+        } else {
+            (approach_pixel(px, w), py)
+        };
+        self.effect_started = true;
+        self.vptr.motion_absolute(event_time_ms(), ax, ay, w, h);
         self.vptr.frame();
         self.queue.roundtrip(&mut self.state)?;
+        self.validate_frame()?;
         self.vptr.motion_absolute(event_time_ms(), px, py, w, h);
         self.vptr.frame();
         self.queue.roundtrip(&mut self.state)?;
         Ok(())
     }
+}
+
+fn output_approach_point(
+    frame: &hyprland::DesktopFrame,
+    x: i32,
+    y: i32,
+) -> anyhow::Result<(i32, i32)> {
+    let output = frame
+        .outputs
+        .iter()
+        .find(|output| {
+            i64::from(x) >= i64::from(output.x)
+                && i64::from(y) >= i64::from(output.y)
+                && i64::from(x) < i64::from(output.x) + i64::from(output.width)
+                && i64::from(y) < i64::from(output.y) + i64::from(output.height)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("desktop_coordinate_invalid: focus approach outside powered coverage")
+        })?;
+    if x > output.x {
+        return Ok((x - 1, y));
+    }
+    if output.width > 1 {
+        return Ok((x + 1, y));
+    }
+    if y > output.y {
+        return Ok((x, y - 1));
+    }
+    if output.height > 1 {
+        return Ok((x, y + 1));
+    }
+    anyhow::bail!("unsupported_display_layout: output has no focus-approach neighbor")
 }
 
 /// A pixel next to `px` on an output `extent` pixels wide.
@@ -1502,6 +1585,15 @@ fn open_vptr_session_in(
     activate_window_id: Option<u64>,
     snapshot: Option<&hyprland::DesktopSnapshot>,
 ) -> anyhow::Result<VptrSession> {
+    let observed = if snapshot.is_none() && hyprland::is_session() {
+        Some(hyprland::desktop_snapshot()?)
+    } else {
+        None
+    };
+    let snapshot = snapshot.or(observed.as_ref());
+    if let Some(snapshot) = snapshot {
+        snapshot.frame.validate_current()?;
+    }
     let conn = Connection::connect_to_env()?;
     let mut queue = conn.new_event_queue::<State>();
     let qh = queue.handle();
@@ -1577,6 +1669,8 @@ fn open_vptr_session_in(
         output_h,
         origin_x,
         origin_y,
+        frame: snapshot.map(|snapshot| snapshot.frame.clone()),
+        effect_started: activate_window_id.is_some(),
     })
 }
 
@@ -1806,6 +1900,7 @@ pub fn click_desktop(
     count: u32,
     button: u8,
 ) -> anyhow::Result<()> {
+    space.validate_point(x, y)?;
     if is_inject_mode() {
         let btn = evdev_button(button as u32);
         return inject_send(&[format!("d {x} {y} {} {btn}", count.max(1))]);
@@ -1833,6 +1928,7 @@ fn click_vptr(
     let (px, py) = if x == 0 && y == 0 && !hyprland::is_session() {
         (w / 2, h / 2)
     } else {
+        sess.validate_layout_point(x, y)?;
         sess.abs(x, y)
     };
     let btn = evdev_pointer_button(button);
@@ -1843,11 +1939,13 @@ fn click_vptr(
         if i == 0 {
             sess.point_at(px, py)?;
         } else {
+            sess.validate_frame()?;
             sess.vptr.motion_absolute(event_time_ms(), px, py, w, h);
             sess.vptr.frame();
             sess.queue.roundtrip(&mut sess.state)?;
         }
         std::thread::sleep(std::time::Duration::from_millis(15));
+        sess.validate_frame()?;
         sess.vptr.button(event_time_ms(), btn, ButtonState::Pressed);
         sess.vptr.frame();
         sess.queue.roundtrip(&mut sess.state)?;
@@ -1983,6 +2081,7 @@ pub fn scroll_desktop(
     direction: &str,
     amount: u32,
 ) -> anyhow::Result<()> {
+    space.validate_point(x, y)?;
     if is_inject_mode() {
         return inject_scroll_desktop(x, y, direction, amount);
     }
@@ -2016,6 +2115,7 @@ fn scroll_vptr(
 ) -> anyhow::Result<()> {
     let mut sess = open_vptr_session_in(window_id, snapshot)?;
     if let Some((x, y)) = point {
+        sess.validate_layout_point(x, y)?;
         let (px, py) = sess.abs(x, y);
         sess.point_at(px, py)?;
         record_synth_cursor(sess.origin_x + px as i32, sess.origin_y + py as i32);
@@ -2035,6 +2135,8 @@ fn scroll_vptr(
         if i > 0 {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+        sess.validate_frame()?;
+        sess.effect_started = true;
         sess.vptr.axis_source(AxisSource::Wheel);
         sess.vptr.axis_discrete(event_time_ms(), axis, value, sign);
         sess.vptr.frame();
@@ -2088,6 +2190,7 @@ pub fn move_cursor_absolute(window_id: Option<u64>, x: i32, y: i32) -> anyhow::R
 
 /// Warp the cursor to a desktop-frame point (the `get_desktop_state` frame).
 pub fn move_cursor_desktop(space: &DesktopInputSpace, x: i32, y: i32) -> anyhow::Result<()> {
+    space.validate_point(x, y)?;
     let (x, y) = space.input_layout(x, y)?;
     with_libei_fallback(
         || move_cursor_absolute_vptr(None, x, y, space.snapshot.as_ref()),
@@ -2104,7 +2207,9 @@ fn move_cursor_absolute_vptr(
 ) -> anyhow::Result<()> {
     let mut sess = open_vptr_session_in(window_id, snapshot)?;
     let (w, h) = (sess.output_w, sess.output_h);
+    sess.validate_layout_point(x, y)?;
     let (px, py) = sess.abs(x, y);
+    sess.effect_started = true;
     sess.vptr.motion_absolute(event_time_ms(), px, py, w, h);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
@@ -2150,6 +2255,7 @@ pub fn drag(
 }
 
 /// Drag through desktop-absolute points without activating a named toplevel.
+#[allow(clippy::too_many_arguments)]
 pub fn drag_desktop(
     space: &DesktopInputSpace,
     from_x: i32,
@@ -2160,6 +2266,8 @@ pub fn drag_desktop(
     duration_ms: u64,
     button: u8,
 ) -> anyhow::Result<()> {
+    space.validate_point(from_x, from_y)?;
+    space.validate_point(to_x, to_y)?;
     let (from_x, from_y) = space.input_layout(from_x, from_y)?;
     let (to_x, to_y) = space.input_layout(to_x, to_y)?;
     with_libei_fallback(
@@ -2199,20 +2307,38 @@ fn drag_vptr(
     let (w, h) = (sess.output_w, sess.output_h);
     let btn = evdev_pointer_button(button);
     let (origin_x, origin_y) = (sess.origin_x, sess.origin_y);
+    // Validate the actual interpolation before sending any input. Endpoints
+    // alone do not establish coverage across a black gap or standby output.
+    let n = steps.max(1);
+    for s in 0..=n {
+        let t = f64::from(s) / f64::from(n);
+        let ix = (f64::from(from_x) + (f64::from(to_x) - f64::from(from_x)) * t).round() as i32;
+        let iy = (f64::from(from_y) + (f64::from(to_y) - f64::from(from_y)) * t).round() as i32;
+        if sess
+            .frame
+            .as_ref()
+            .is_some_and(|frame| !frame.contains_layout_point(f64::from(ix), f64::from(iy)))
+        {
+            anyhow::bail!("desktop_coordinate_invalid: drag crosses uncovered output space");
+        }
+    }
+    sess.validate_layout_point(from_x, from_y)?;
     let clamp_xy = |x: i32, y: i32| pointer_abs(origin_x, origin_y, w, h, x, y);
     let (fx, fy) = clamp_xy(from_x, from_y);
+    sess.effect_started = true;
     sess.vptr.motion_absolute(event_time_ms(), fx, fy, w, h);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
     std::thread::sleep(std::time::Duration::from_millis(15));
+    sess.validate_frame()?;
     sess.vptr.button(event_time_ms(), btn, ButtonState::Pressed);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
-    let n = steps.max(1);
     for s in 1..=n {
+        sess.validate_frame()?;
         let t = s as f64 / n as f64;
-        let ix = (from_x as f64 + (to_x - from_x) as f64 * t).round() as i32;
-        let iy = (from_y as f64 + (to_y - from_y) as f64 * t).round() as i32;
+        let ix = (from_x as f64 + (f64::from(to_x) - f64::from(from_x)) * t).round() as i32;
+        let iy = (from_y as f64 + (f64::from(to_y) - f64::from(from_y)) * t).round() as i32;
         let (cx, cy) = clamp_xy(ix, iy);
         sess.vptr.motion_absolute(event_time_ms(), cx, cy, w, h);
         sess.vptr.frame();
@@ -2220,6 +2346,7 @@ fn drag_vptr(
         std::thread::sleep(std::time::Duration::from_millis(8));
     }
     let (tx, ty) = clamp_xy(to_x, to_y);
+    sess.validate_frame()?;
     sess.vptr.motion_absolute(event_time_ms(), tx, ty, w, h);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
