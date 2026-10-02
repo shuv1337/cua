@@ -3,6 +3,7 @@
 #include "input_experiment.hpp"
 #include "drag_geometry.hpp"
 #include "held_phase.hpp"
+#include "held_pointer_journal.hpp"
 #include "input_grant.hpp"
 #include "input_client_deadline.hpp"
 #include "passive_pointer_target.hpp"
@@ -196,6 +197,15 @@ struct InputExperiment::Impl {
         bool effects = false;
         std::vector<SP<CWlPointer>> independent;
         std::vector<WP<CWLPointerResource>> foreground;
+        struct ObservedPointer {
+            WP<CWLPointerResource> owner;
+            wl_resource* resource = nullptr;
+            HeldPointerJournal journal;
+            bool destroyed = false;
+            bool dnd_withheld = false;
+            struct Watch { wl_listener listener{}; ObservedPointer* record = nullptr; } watch;
+        };
+        std::vector<ObservedPointer> observed;
     };
     int listener = -1;
     wl_event_source* listen_source = nullptr;
@@ -223,6 +233,9 @@ struct InputExperiment::Impl {
     std::optional<Drag> drag;
     std::optional<Held> held;
     bool held_cleanup_unconfirmed = false;
+    wl_protocol_logger* held_logger = nullptr;
+    std::optional<std::size_t> held_press_slot;
+    std::optional<Held> foreground_debt;
     std::uint32_t held_button = 0;
     std::vector<std::uint32_t> held_keys;
     xkb_context* xkb_context_ = nullptr;
@@ -395,6 +408,7 @@ struct InputExperiment::Impl {
         global = wl_global_create(g_pCompositor->m_wlDisplay, &wl_seat_interface, 9, this, bind_seat);
         if (!global) throw std::runtime_error("synthetic seat unavailable");
         wl_event_source_timer_update(timer, 16);
+        held_logger = wl_display_add_protocol_logger(g_pCompositor->m_wlDisplay, held_event, this);
     }
     void resume() {
         if (retired || desktop_generation == UINT64_MAX)
@@ -449,6 +463,7 @@ struct InputExperiment::Impl {
         // or cursor requests (observed with foot). Retain inert resources and
         // callbacks until compositor exit; input-enabled modules are NODELETE.
         suspend("plugin_shutdown");
+        stop_held_logger();
         keymap_listener.reset();
         retired = true;
         for (auto& seat : seats)
@@ -458,6 +473,7 @@ struct InputExperiment::Impl {
     }
     ~Impl() {
         revoke("plugin_shutdown");
+        stop_held_logger();
         if (global) wl_global_destroy(global);
         if (listen_source) wl_event_source_remove(listen_source);
         if (timer) wl_event_source_remove(timer);
@@ -566,7 +582,99 @@ struct InputExperiment::Impl {
     }
     bool held_source(Client& c, const std::string& handle) {
         return held && held->client == &c && refresh(c) &&
-            held->root == c.surface && held->phase.permits(reinterpret_cast<std::uintptr_t>(&c), handle, witness(c), Clock::now());
+            held->root == c.surface && native_held_phase_live() && held->phase.permits(reinterpret_cast<std::uintptr_t>(&c), handle, witness(c), Clock::now());
+    }
+    bool native_held_phase_live() const {
+        return held && (held->client->route != InputRoute::primary_foreground ||
+            !std::ranges::any_of(held->observed, [](const auto& p) {
+                return p.destroyed || p.journal.left || p.journal.release_seen || p.journal.invalid;
+            }));
+    }
+    void stop_held_logger() {
+        if (held_logger) wl_protocol_logger_destroy(held_logger);
+        held_logger = nullptr;
+        detach_held_watchers(held);
+        detach_held_watchers(foreground_debt);
+    }
+    static void detach_held_watchers(std::optional<Held>& value) {
+        if (!value) return;
+        for (auto& observed : value->observed) if (observed.watch.record) {
+            wl_list_remove(&observed.watch.listener.link);
+            observed.watch.record = nullptr;
+        }
+    }
+    static void held_resource_destroyed(wl_listener* listener, void*) noexcept {
+        auto* watch = static_cast<Held::ObservedPointer::Watch*>(static_cast<void*>(listener));
+        if (!watch->record) return;
+        watch->record->destroyed = true;
+        watch->record->resource = nullptr;
+        wl_list_remove(&watch->listener.link);
+        watch->record = nullptr;
+    }
+    static bool observed_cleanup(const Held& value) {
+        return !value.observed.empty() && std::ranges::all_of(value.observed, [](const auto& p) { return p.journal.cleaned(); });
+    }
+    void retain_foreground_debt() {
+        if (!held || held->client->route != InputRoute::primary_foreground || held->phase.cleanup_confirmed) return;
+        // The journal and destroy listeners retain exact original resource
+        // incarnations, not a dangling Client* or input authority. A new
+        // independent owner is not blocked by foreground acknowledgement debt.
+        held->client = nullptr;
+        foreground_debt = std::move(held);
+        held.reset();
+    }
+    bool foreground_cleanup_pending() {
+        if (foreground_debt && foreground_debt->phase.cleanup_confirmed) {
+            detach_held_watchers(foreground_debt);
+            foreground_debt.reset();
+        }
+        return foreground_debt.has_value();
+    }
+    bool held_cleanup_pending(InputRoute route) {
+        return route == InputRoute::primary_foreground ? foreground_cleanup_pending() : held_cleanup_unconfirmed;
+    }
+    static void held_event(void* data, wl_protocol_logger_type direction, const wl_protocol_logger_message* event) noexcept {
+        auto& self = *static_cast<Impl*>(data);
+        if (direction != WL_PROTOCOL_LOGGER_EVENT || !event || !event->resource ||
+            std::strcmp(wl_resource_get_class(event->resource), "wl_pointer") != 0) return;
+        // Synchronous causality binds the actual resource during exactly one
+        // known native owner's BEGIN press call. No userdata/fromResource casts
+        // and no lookup of successor native resources are needed.
+        if (self.held && self.held_press_slot && *self.held_press_slot < self.held->observed.size()) {
+            auto& observed = self.held->observed[*self.held_press_slot];
+            if (!observed.resource && !observed.destroyed && event->message_opcode == WL_POINTER_BUTTON &&
+                event->arguments_count == 4 && event->arguments && event->arguments[2].u == self.held->button &&
+                event->arguments[3].u == WL_POINTER_BUTTON_STATE_PRESSED) {
+                observed.resource = event->resource;
+                observed.watch.record = &observed;
+                observed.watch.listener.notify = held_resource_destroyed;
+                wl_resource_add_destroy_listener(event->resource, &observed.watch.listener);
+            }
+        }
+        const auto observe = [&](std::optional<Held>& value) {
+            if (!value) return;
+            for (auto& observed : value->observed) if (!observed.destroyed && observed.resource == event->resource) {
+                observe_held_pointer_event(observed.journal, direction, event);
+                if (event->message_opcode == WL_POINTER_LEAVE && observed.journal.press_seen && !observed.journal.release_seen &&
+                    PROTO::data && PROTO::data->dndActive()) observed.dnd_withheld = true;
+                // Retirement never reopens admission. A later exact native
+                // event can only upgrade its separately observed cleanup fact.
+                if (value->phase.retired && observed_cleanup(*value)) value->phase.cleanup_confirmed = true;
+                return;
+            }
+        };
+        observe(self.held); observe(self.foreground_debt);
+    }
+    bool capture_held_pointers() {
+        if (!held_logger || !held) return false;
+        if (held->foreground.empty() || held->foreground.size() > kMaxResources) return false;
+        held->observed.reserve(held->foreground.size());
+        for (const auto& weak : held->foreground) {
+            const auto owner = weak.lock();
+            if (!owner || !owner->good() || owner->version() < 5) return false;
+            held->observed.push_back({weak, nullptr, HeldPointerJournal{.button = held->button}, false, false, {}});
+        }
+        return !held->observed.empty();
     }
     void cleanup_held() {
         if (!held || held->phase.retired) return;
@@ -576,17 +684,20 @@ struct InputExperiment::Impl {
         // during cleanup and never release a button to a successor focus.
         if (held_button) {
             if (held->client->route == InputRoute::primary_foreground) {
-                // Native sendButton is void and may silently refuse (caps,
-                // current surface or pressed-set loss). Its private state is
-                // not an acknowledgement. Attempt only the retained focus,
-                // but never advertise that attempt as observed cleanup.
-                confirmed = false;
-                if (!root || !root->good()) confirmed = false;
-                else if (g_pSeatManager->m_state.pointerFocus != root) confirmed = false;
-                else for (const auto& weak : held->foreground) {
-                    const auto p = weak.lock();
-                    if (!p || !p->good()) { confirmed = false; continue; }
-                    p->sendButton(event_ms(), held->button, WL_POINTER_BUTTON_STATE_RELEASED); p->sendFrame();
+                confirmed = held_logger && !held->observed.empty();
+                for (auto& observed : held->observed) {
+                    const auto p = observed.owner.lock();
+                    if (observed.journal.cleaned()) continue;
+                    if (!p || !p->good() || observed.destroyed) { confirmed = false; continue; }
+                    // A native old-focus sendLeave may already have released
+                    // it. Never send another button event to successor focus.
+                    if (observed.journal.press_seen && !observed.journal.release_seen && root && root->good() &&
+                        g_pSeatManager->m_state.pointerFocus == root && !observed.journal.left)
+                        p->sendButton(event_ms(), held->button, WL_POINTER_BUTTON_STATE_RELEASED);
+                    // Empty frames contain no position/button/target handoff.
+                    // The second observation proves first-frame queue success.
+                    p->sendFrame(); p->sendFrame();
+                    if (!observed.journal.cleaned()) confirmed = false;
                 }
             } else for (const auto& p : held->independent) {
                 if (!p || !p->resource()) { confirmed = false; continue; }
@@ -595,7 +706,7 @@ struct InputExperiment::Impl {
             }
         }
         held_button = 0;
-        if (!confirmed) held_cleanup_unconfirmed = true;
+        if (!confirmed && held->client->route == InputRoute::independent) held_cleanup_unconfirmed = true;
         held->phase.retire(confirmed);
     }
     bool primary_conflict(const Client& c) const {
@@ -1055,9 +1166,12 @@ struct InputExperiment::Impl {
         require_foreground(c);
         // Mark ownership before sending, so a later resource failure can unwind.
         if (pressed) held_button = code;
-        for (const auto& weak : foreground_pointers) {
+        for (std::size_t i = 0; i < foreground_pointers.size(); ++i) {
+            const auto& weak = foreground_pointers[i];
             const auto p = weak.lock(); if (!p || !p->good()) throw ForegroundFailure{ForegroundFailureReason::pointer_resources};
+            if (pressed && held && held->client == &c && i < held->observed.size()) held_press_slot = i;
             p->sendButton(event_ms(), code, pressed ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED);
+            held_press_slot.reset();
             p->sendFrame();
         }
         held_button = pressed ? code : 0;
@@ -1150,7 +1264,7 @@ struct InputExperiment::Impl {
             if (f.size() != 1 || c.hello) { send(c, refusal("invalid_request")); return; }
             c.hello = true;
             if (kProduction)
-                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"source_guard_version":1,"held_phase_version":1,"held_foreground":true}})", epoch));
+                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"source_guard_version":1,"held_phase_version":1,"held_foreground":{}}})", epoch, held_logger && !foreground_cleanup_pending()));
             else
                 send(c, std::format(R"({{"ok":true,"protocol":0,"epoch":"{}","challenge":"{}"}})", epoch, c.challenge));
             return;
@@ -1190,9 +1304,9 @@ struct InputExperiment::Impl {
             held_request(c, f); return;
         }
         if (command == "TARGET" || (kProduction && command == "FOREGROUND_TARGET")) {
-            if (held_cleanup_unconfirmed) { send(c, refusal("held_cleanup_unconfirmed")); return; }
-            if (drag || held) { send(c, refusal("lease_busy")); return; }
             const auto route = command == "FOREGROUND_TARGET" ? InputRoute::primary_foreground : InputRoute::independent;
+            if (held_cleanup_pending(route)) { send(c, refusal("held_cleanup_unconfirmed")); return; }
+            if (drag || held) { send(c, refusal("lease_busy")); return; }
             if (!bind_input_route(c.route, route)) { invalidate(c); send(c, refusal("route_mismatch")); return; }
             if (f.size() != (kProduction ? 4u : 3u)) {
                 if (kProduction) invalidate(c);
@@ -1361,9 +1475,10 @@ struct InputExperiment::Impl {
             // No coordinate/source/availability check may suppress owned cleanup.
             finish_foreground(); leave_keyboard(); retire_grant();
             send(c, std::format(R"({{"ok":{},"code":"{}","detail":"original held device cleanup","effect":"{}","handle":"{}","source_identity":"{}","sequence":{},"cleanup_confirmed":{}}})",
-                confirmed, confirmed ? "held_released" : "held_cleanup_unconfirmed",
+                confirmed, confirmed ? "held_released" : std::ranges::any_of(held->observed, [](const auto& p) {return p.dnd_withheld;}) ? "dnd_release_withheld" : "held_cleanup_unconfirmed",
                 aborted || !confirmed ? "partial" : "unverifiable", held->phase.handle, held->phase.source.root, sequence, confirmed));
-            if (confirmed) held.reset();
+            if (confirmed) { detach_held_watchers(held); held.reset(); }
+            else retain_foreground_debt();
             return;
         }
         if (command == "HOLD_MOVE") {
@@ -1375,9 +1490,7 @@ struct InputExperiment::Impl {
                     held->phase.reason = "lease_expired";
                     cleanup_held(); finish_foreground(); leave_keyboard(); retire_grant();
                 }
-                send(c, std::format(R"({{"ok":false,"code":"{}","detail":"original held phase retired","effect":"partial","handle":"{}","sequence":{},"cleanup_confirmed":{}}})",
-                    held->phase.reason == "lease_expired" ? "held_lease_expired" : "held_retired",
-                    held->phase.handle, sequence, held->phase.cleanup_confirmed)); return;
+                send(c, held_retired_reply(sequence)); return;
             }
             if (!held_source(c, f[2]) || !packet_witness(c, f) || !available() ||
                 !input_layout_qualified(c.route, false, layout_qualified()) || primary_conflict(c) || agent_conflict(c)) {
@@ -1405,7 +1518,7 @@ struct InputExperiment::Impl {
         // BEGIN consumes one original-source reconciled finite drag grant. The
         // new opaque handle never arms TARGET or substitutes a successor device.
         if (held || drag) { send(c, refusal("lease_busy")); return; }
-        if (held_cleanup_unconfirmed) { send(c, refusal("held_cleanup_unconfirmed")); return; }
+        if (held_cleanup_pending(c.route)) { send(c, refusal("held_cleanup_unconfirmed")); return; }
         if (c.token.empty() || f[2] != c.token || !refresh(c) || !packet_witness(c, f)) {
             send(c, refusal("stale_source")); return;
         }
@@ -1415,12 +1528,14 @@ struct InputExperiment::Impl {
         }
         const auto x = real(f[12]), y = real(f[13]); const auto code = number(f[14]);
         if (!point(c, x, y) || code < 272 || code > 274) { send(c, refusal("invalid_request")); return; }
+        if (c.route == InputRoute::primary_foreground && !held_logger) { send(c, refusal("held_observer_unavailable")); return; }
         if (!consume_grant(c, 8)) return;
-        held.emplace(Held{&c, HeldPhase{reinterpret_cast<std::uintptr_t>(&c), nonce(), witness(c), expires}, c.surface, static_cast<std::uint32_t>(code), false, {}, {}});
+        held.emplace(Held{&c, HeldPhase{reinterpret_cast<std::uintptr_t>(&c), nonce(), witness(c), expires}, c.surface, static_cast<std::uint32_t>(code), false, {}, {}, {}});
         held->effects = true; // activation/enter/motion are effects before press
         if (c.route == InputRoute::primary_foreground) {
             start_foreground(c, x, y, true, false, {});
             held->foreground = foreground_pointers;
+            if (!capture_held_pointers()) { revoke("held_observer_unavailable", true); send(c, refusal("held_partial_unknown")); return; }
         } else {
             if (!pointer_enter(c, x, y)) { revoke("client_not_bound", true); send(c, refusal("held_partial_unknown")); return; }
             for (const auto& p : pointers) if (!p->dead && p->wl->resource() && p->focus == c.surface) held->independent.push_back(p->wl);
@@ -1428,7 +1543,18 @@ struct InputExperiment::Impl {
         if (!held_source(c, held->phase.handle)) { revoke("held_source_changed", true); send(c, refusal("held_partial_unknown")); return; }
         if (c.route == InputRoute::primary_foreground) foreground_button(c, code, true);
         else button(code, true);
+        if (c.route == InputRoute::primary_foreground) {
+            for (const auto& weak : held->foreground) if (const auto p = weak.lock(); p && p->good()) p->sendFrame();
+            if (!std::ranges::all_of(held->observed, [](const auto& p) { return p.journal.began(); })) {
+                revoke("held_press_unconfirmed", true); send(c, refusal("held_partial_unknown")); return;
+            }
+        }
         send(c, std::format(R"({{"ok":true,"phase":"held_started","handle":"{}","sequence":{}}})", held->phase.handle, sequence));
+    }
+    std::string held_retired_reply(std::uint64_t sequence) const {
+        return std::format(R"({{"ok":false,"code":"{}","detail":"original held phase retired","effect":"partial","handle":"{}","sequence":{},"cleanup_confirmed":{}}})",
+            held->phase.reason == "lease_expired" ? "held_lease_expired" : "held_retired",
+            held->phase.handle, sequence, held->phase.cleanup_confirmed);
     }
     void foreground_request(Client& c, const std::vector<std::string>& f, std::uint64_t cap) {
         const auto& command = f[0];
@@ -1551,7 +1677,9 @@ struct InputExperiment::Impl {
         }
         if (lease && lease->dead) revoke("disconnected", true);
         if (reservation && reservation->dead) reservation = nullptr;
-        if (held && held->client->dead) { cleanup_held(); held.reset(); }
+        if (held && held->client->dead) {
+            cleanup_held(); retain_foreground_debt(); detach_held_watchers(held); held.reset();
+        }
         std::erase_if(clients, [](auto& c) { return c->dead; });
         std::erase_if(pointers, [](auto& p) { return p->dead; });
         std::erase_if(keyboards, [](auto& k) { return k->dead; });

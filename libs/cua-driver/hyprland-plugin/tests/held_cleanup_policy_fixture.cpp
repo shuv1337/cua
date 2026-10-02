@@ -1,4 +1,5 @@
 #include "held_phase.hpp"
+#include "held_pointer_journal.hpp"
 #include "foreground_route.hpp"
 #include <memory>
 #include <optional>
@@ -7,7 +8,6 @@
 #include <cstdlib>
 #include <iostream>
 using namespace cua::hyprland;
-constexpr int WL_POINTER_BUTTON_STATE_RELEASED = 0;
 struct Surface { bool live = true; bool good() const { return live; } };
 struct Seat { struct { std::shared_ptr<Surface> pointerFocus; } m_state; };
 Seat seat;
@@ -20,12 +20,13 @@ struct Proxy {
     std::vector<std::string>* events;
     std::string name;
     bool dead = false;
+    HeldPointerJournal* journal = nullptr;
     bool good() const { return live; }
     bool resource() const { return live; }
     int version() const { return 5; }
     void sendButton(unsigned, unsigned, unsigned, int) { ++buttons; events->push_back(name + ":release"); }
-    void sendButton(unsigned, unsigned, int) { ++buttons; events->push_back(name + ":release"); }
-    void sendFrame() { ++frames; events->push_back(name + ":frame"); }
+    void sendButton(unsigned, unsigned code, int state) { if (!PROTO::seat->m_currentCaps) return; ++buttons; events->push_back(name + ":release"); if (journal) journal->observe(WL_POINTER_BUTTON,code,state); }
+    void sendFrame() { if (journal && !PROTO::seat->m_currentCaps) return; ++frames; events->push_back(name + ":frame"); if (journal) journal->observe(WL_POINTER_FRAME); }
     ~Proxy() { events->push_back(name + ":destroy"); }
 };
 struct Client { InputRoute route; bool dead = false; };
@@ -40,9 +41,13 @@ struct Held {
     unsigned button = 272;
     std::vector<std::weak_ptr<Proxy>> foreground;
     std::vector<std::shared_ptr<Proxy>> independent;
+    struct ObservedPointer { std::weak_ptr<Proxy> owner; HeldPointerJournal journal; bool destroyed = false; };
+    std::vector<ObservedPointer> observed = {};
 };
 struct Owner {
     bool held_cleanup_unconfirmed = false;
+    bool held_logger = true;
+    std::optional<Held> foreground_debt;
     unsigned held_button = 272;
     std::optional<Held> held;
     std::optional<Drag> drag;
@@ -63,6 +68,8 @@ struct Owner {
     }
     void leave_keyboard() {}
     void retire_grant() { lease = nullptr; }
+    void retain_foreground_debt() { if (held && held->client->route == InputRoute::primary_foreground && !held->phase.cleanup_confirmed) { held->client=nullptr; foreground_debt=std::move(held); held.reset(); } }
+    static void detach_held_watchers(std::optional<Held>&) {}
     unsigned event_ms() const { return 1; }
     unsigned serial() const { return 2; }
     // PRODUCTION_CLEANUP
@@ -82,6 +89,12 @@ int main() {
             owner.held.emplace(Held{&client, HeldPhase{reinterpret_cast<std::uintptr_t>(&client), "handle", SourceWitness{"original-root", 7, 3, {}}, HeldPhase::Clock::now()}, root, 272, {original}, {original}});
             seat.m_state.pointerFocus = root;
             PROTO::seat->m_currentCaps = fault == 5 ? 0 : 1;
+            if (foreground) {
+                owner.held->observed.push_back({original,HeldPointerJournal{.button=272}});
+                original->journal=&owner.held->observed.front().journal;
+                original->journal->observe(WL_POINTER_BUTTON,272,WL_POINTER_BUTTON_STATE_PRESSED);
+                original->journal->observe(WL_POINTER_FRAME); original->journal->observe(WL_POINTER_FRAME);
+            }
             if (fault == 1) root->live = false;
             if (fault == 2) original->live = false;
             if (fault == 3) seat.m_state.pointerFocus = successor_root;
@@ -89,17 +102,17 @@ int main() {
             // Source validity and lease expiry do not gate coordinate-free
             // cleanup. Only originally captured proxies may receive release.
             owner.revoke(fault == 4 ? "source_destroyed" : fault == 2 ? "disconnected" : "lease_expired", true);
-            const bool confirmed = !foreground && fault != 2;
-            const bool attempted = confirmed || (foreground && (fault == 0 || fault == 5));
+            const bool confirmed = foreground ? fault == 0 : fault != 2;
+            const bool attempted = foreground ? fault == 0 : confirmed;
             check(owner.held->phase.retired && owner.held->phase.cleanup_confirmed == confirmed, "wrong retirement confirmation");
-            check(owner.held_cleanup_unconfirmed == !confirmed, "unconfirmed resource cleanup did not retain durable quarantine");
+            check(owner.held_cleanup_unconfirmed == (!foreground && !confirmed), "cleanup quarantine leaked across routes");
             check(original->buttons == (attempted ? 1u : 0u), "original release count");
             check(successor->buttons == 0 && successor->frames == 0, "released successor proxy");
             owner.cleanup_held();
             check(original->buttons == (attempted ? 1u : 0u), "duplicate cleanup release");
             owner.held.reset(); original.reset();
             if (confirmed) {
-                check(events.size() >= 3 && events[0] == "original:release" && events[1] == "original:frame" && events[2] == "original:destroy", "destruction preceded owned release/frame");
+                check(events.size() >= 3 && events[0] == "original:release" && events[1] == "original:frame" && events[foreground ? 3 : 2] == "original:destroy", "destruction preceded owned release/frame");
             }
             seat.m_state.pointerFocus.reset();
             successor.reset();

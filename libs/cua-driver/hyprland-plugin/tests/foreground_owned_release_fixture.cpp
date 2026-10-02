@@ -1,4 +1,5 @@
 // Methods are extracted verbatim from the matching native Hyprland source.
+#include "held_pointer_journal.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <memory>
@@ -6,12 +7,14 @@
 #include <string>
 #include <iostream>
 #include <cstdlib>
+#include <sys/socket.h>
+#include <unistd.h>
+using namespace cua::hyprland;
 #define LOGM(...) ((void)0)
-enum wl_pointer_button_state { WL_POINTER_BUTTON_STATE_RELEASED, WL_POINTER_BUTTON_STATE_PRESSED };
 struct eHIDCapabilityType { static constexpr int HID_INPUT_CAPABILITY_POINTER = 1; };
 namespace Time { unsigned steadyNow() { return 1; } unsigned millis(unsigned now) { return now; } }
 struct Owner {};
-struct SurfaceResource { bool resource() const { return true; } };
+struct SurfaceResource { wl_resource* raw=nullptr; wl_resource* resource() const { return raw; } };
 struct Surface { std::shared_ptr<SurfaceResource> value = std::make_shared<SurfaceResource>(); std::shared_ptr<SurfaceResource> getResource() const { return value; } };
 template<class T> struct Weak {
     std::weak_ptr<T> value;
@@ -23,9 +26,11 @@ template<class T> struct Weak {
     void reset() { value.reset(); }
 };
 struct Resource {
-    std::vector<std::string>* events;
-    void sendButton(unsigned,unsigned,unsigned,wl_pointer_button_state state) { events->push_back(state == WL_POINTER_BUTTON_STATE_RELEASED ? "old:release" : "old:press"); }
-    void sendLeave(unsigned,SurfaceResource*) { events->push_back("old:leave"); }
+    wl_resource* raw;
+    int version() const { return wl_resource_get_version(raw); }
+    void sendButton(unsigned serial,unsigned time,unsigned code,wl_pointer_button_state state) { wl_pointer_send_button(raw,serial,time,code,state); }
+    void sendLeave(unsigned serial,SurfaceResource* surface) { wl_pointer_send_leave(raw,serial,surface->resource()); }
+    void sendFrame() { wl_pointer_send_frame(raw); }
 };
 struct SeatManager {
     unsigned nextSerial(std::shared_ptr<Owner>,bool = false) { return 1; }
@@ -46,21 +51,48 @@ struct CWLPointerResource {
     struct { struct { void reset() {} } destroySurface; } m_listeners;
     void sendLeave();
     void sendButton(uint32_t,uint32_t,wl_pointer_button_state);
+    void sendFrame();
 };
 // NATIVE_RESOURCE_METHODS
 int main() {
-    for (bool dnd : {false,true}) {
+    for (int fault=0;fault<6;++fault) {
         std::vector<std::string> events;
+        struct Observer { wl_resource* original; HeldPointerJournal journal; std::vector<std::string>* events; };
+        auto* display=wl_display_create();int sockets[2];if(socketpair(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0,sockets))return 2;
+        auto* client=wl_client_create(display,sockets[0]);
+        auto* raw=wl_resource_create(client,&wl_pointer_interface,5,0);
+        Observer observer{raw,HeldPointerJournal{.button=272},&events};
+        auto* logger=wl_display_add_protocol_logger(display,[](void* data,wl_protocol_logger_type direction,const wl_protocol_logger_message* event) {
+            auto& o=*static_cast<Observer*>(data);
+            if(direction!=WL_PROTOCOL_LOGGER_EVENT || event->resource!=o.original)return;
+            observe_held_pointer_event(o.journal,direction,event);
+            if(event->message_opcode==WL_POINTER_BUTTON)o.events->push_back(event->arguments[3].u ? "old:press" : "old:release");
+            if(event->message_opcode==WL_POINTER_LEAVE)o.events->push_back("old:leave");
+        },&observer);
         auto owner=std::make_shared<Owner>(); auto old=std::make_shared<Surface>(); auto successor=std::make_shared<Surface>();
-        CWLPointerResource pointer{owner,old,std::make_shared<Resource>(&events),{}, {}};
-        PROTO::data->active=dnd;
+        old->value->raw=wl_resource_create(client,&wl_surface_interface,1,0);
+        successor->value->raw=wl_resource_create(client,&wl_surface_interface,1,0);
+        CWLPointerResource pointer{owner,old,std::make_shared<Resource>(raw),{}, {}};
+        PROTO::seat->m_currentCaps=1;PROTO::data->active=fault==2;
         pointer.sendButton(1,272,WL_POINTER_BUTTON_STATE_PRESSED);
-        pointer.sendLeave(); // focus-steal and original surface-destroy callback
-        pointer.m_currentSurface=Weak<Surface>(successor);
-        pointer.sendButton(1,272,WL_POINTER_BUTTON_STATE_RELEASED); // must not release successor
-        pointer.sendLeave();
-        const std::vector<std::string> expected=dnd ? std::vector<std::string>{"old:press","old:leave","old:leave"} : std::vector<std::string>{"old:press","old:release","old:leave","old:leave"};
-        if (events!=expected) { std::cerr << "native original-resource release ordering failed\n"; return 1; }
+        pointer.sendFrame();pointer.sendFrame();
+        if(!observer.journal.began())return 3;
+        if(fault==0) pointer.sendButton(1,272,WL_POINTER_BUTTON_STATE_RELEASED); // ordinary up
+        if(fault==1 || fault==2) {
+            pointer.sendLeave(); // same method used by focus-steal / surface-destroy listener
+            pointer.m_currentSurface=Weak<Surface>(successor);
+            pointer.sendButton(1,272,WL_POINTER_BUTTON_STATE_RELEASED); // native pressed-set guard must refuse
+        }
+        if(fault==3) {PROTO::seat->m_currentCaps=0;pointer.sendButton(1,272,WL_POINTER_BUTTON_STATE_RELEASED);}
+        if(fault==4) {pointer.m_pressedButtons.clear();pointer.sendButton(1,272,WL_POINTER_BUTTON_STATE_RELEASED);}
+        if(fault==5) {wl_client_post_implementation_error(client,"fixture error");pointer.sendButton(1,272,WL_POINTER_BUTTON_STATE_RELEASED);}
+        pointer.sendFrame();pointer.sendFrame();
+        if(observer.journal.cleaned()!=(fault==0 || fault==1)) {std::cerr<<"native silent refusal / DnD fabricated queue fact\n";return 4;}
+        const std::vector<std::string> expected=fault==0 ? std::vector<std::string>{"old:press","old:release"} :
+            fault==1 ? std::vector<std::string>{"old:press","old:release","old:leave"} :
+            fault==2 ? std::vector<std::string>{"old:press","old:leave"} : std::vector<std::string>{"old:press"};
+        if (events!=expected) { std::cerr << "native original-resource release ordering failed\n"; return 5; }
+        wl_protocol_logger_destroy(logger);wl_client_destroy(client);wl_display_destroy(display);close(sockets[1]);
     }
-    std::cout << "native foreground resource ordering and explicit DnD loss limit passed\n";
+    std::cout << "extracted native methods through real logger: ordinary up / auto leave / DnD / silent refusal passed\n";
 }

@@ -237,6 +237,61 @@ async fn retained_held_begin_and_move_use_real_recording_sink_original_consumed_
                 cause == "valid" || (cause == "lost_after" && turn == "turn-00001"),
                 "{cause}/{turn}"
             );
+            if path.join("click.png").exists() {
+                let actual =
+                    image::load_from_memory(&std::fs::read(path.join("click.png")).unwrap())
+                        .unwrap()
+                        .to_rgba8();
+                // Original 2x cap maps once into the retained native desktop;
+                // MOVE keeps the original capture ID but records its new point.
+                let point = if turn == "turn-00001" {
+                    (2570.5, 20.75)
+                } else {
+                    (2580.5, 30.75)
+                };
+                let expected = cua_driver_core::image_utils::crosshair_png_bytes(
+                    &context.png,
+                    point.0,
+                    point.1,
+                )
+                .unwrap();
+                let expected = image::load_from_memory(&expected).unwrap().to_rgba8();
+                assert_eq!(
+                    actual, expected,
+                    "decoded marker pixels at original source-mapped point: {cause}/{turn}"
+                );
+                let centroid = |image: &image::RgbaImage| {
+                    let (mut x, mut y, mut n) = (0u64, 0u64, 0u64);
+                    for (px, py, value) in image.enumerate_pixels() {
+                        if value[0] == 255 && value[1] == 26 && value[2] == 26 {
+                            x += u64::from(px);
+                            y += u64::from(py);
+                            n += 1;
+                        }
+                    }
+                    assert!(n > 0);
+                    (x as f64 / n as f64, y as f64 / n as f64)
+                };
+                assert_eq!(
+                    centroid(&actual),
+                    centroid(&expected),
+                    "marker centroid (including edge clipping) must match mapped native point"
+                );
+                let (mut left, mut right) = (u32::MAX, 0u32);
+                for (x, _, pixel) in actual.enumerate_pixels() {
+                    if pixel[0] == 255 && pixel[1] == 26 && pixel[2] == 26 {
+                        left = left.min(x);
+                        right = right.max(x);
+                    }
+                }
+                // Vertical clipping/stroke rasterization shifts the full mask
+                // centroid; its unclipped horizontal-arm midpoint still pins
+                // the actual marker center independently of that clipping.
+                assert!(
+                    ((f64::from(left) + f64::from(right)) / 2.0 - point.0).abs() < 1.0,
+                    "marker applied cap twice or drifted to alternate handoff"
+                );
+            }
         }
         assert!(
             !context.alternate.load(Ordering::Acquire),

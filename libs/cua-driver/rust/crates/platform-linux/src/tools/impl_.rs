@@ -13026,6 +13026,7 @@ async fn actual_mouse_down_invoke_capture_ids_are_admitted_once_or_refused_befor
         "consumed",
         "malformed",
         "overlay_stale",
+        "begin_ack_unknown",
     ] {
         for spelling in ["local", "desktop", "zoom"] {
             let state = ToolState::new();
@@ -13090,7 +13091,8 @@ async fn actual_mouse_down_invoke_capture_ids_are_admitted_once_or_refused_befor
                 arrived: tokio::sync::Notify::new(),
                 resume: tokio::sync::Notify::new(),
             });
-            let positive = spelling == "desktop" && matches!(kind, "valid" | "overlay_stale");
+            let positive = spelling == "desktop"
+                && matches!(kind, "valid" | "overlay_stale" | "begin_ack_unknown");
             let server = if positive {
                 Some(std::thread::spawn(move || {
                     let mut bytes = [0u8; 2048];
@@ -13107,12 +13109,21 @@ async fn actual_mouse_down_invoke_capture_ids_are_admitted_once_or_refused_befor
                         target["source_identity"] = json!("44444444444444444444444444444444");
                     }
                     peer.send(target.to_string().as_bytes()).unwrap();
-                    if kind == "valid" {
+                    if matches!(kind, "valid" | "begin_ack_unknown") {
                         assert!(
                             receive().contains("12.5 10.25 10.25 272"),
                             "2x admission converted exactly once"
                         );
-                        peer.send(json!({"ok":true,"phase":"held_started","sequence":1,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
+                        peer.send(json!({"ok":true,"phase":"held_started","sequence":if kind=="begin_ack_unknown" {999} else {1},"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
+                        if kind == "begin_ack_unknown" {
+                            assert_eq!(receive(), "HOLD_ABORT 2 22222222222222222222222222222222");
+                            peer.send(json!({"ok":true,"cleanup_confirmed":true,"source_identity":"22222222222222222222222222222222","sequence":2,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
+                            assert!(
+                                receive().is_empty(),
+                                "unknown BEGIN must not reacquire input"
+                            );
+                            return;
+                        }
                         assert_eq!(receive(), "HOLD_RELEASE 2 55555555555555555555555555555555");
                         peer.send(json!({"ok":true,"cleanup_confirmed":true,"sequence":2,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
                     }
@@ -13157,6 +13168,23 @@ async fn actual_mouse_down_invoke_capture_ids_are_admitted_once_or_refused_befor
                 oracle.overlays.load(Ordering::SeqCst),
                 usize::from(positive)
             );
+            if positive && kind == "begin_ack_unknown" {
+                use cua_driver_core::action_record::{ActionEffect, ActionTransport};
+                let record = result.action_record.as_ref().unwrap();
+                assert_eq!(record.effect, ActionEffect::Unverifiable);
+                assert_eq!(
+                    record.delivered_count, None,
+                    "abort ACK cannot prove press count"
+                );
+                assert_eq!(
+                    record.transport,
+                    ActionTransport::LinuxHyprlandForegroundInput
+                );
+                assert_eq!(record.cleanup_confirmed, Some(true));
+                let public = record.public_result().unwrap();
+                assert_eq!(public.cleanup_confirmed, Some(true));
+                assert_eq!(public.delivery.unwrap().delivered_count, None);
+            }
             if positive {
                 assert_eq!(source.admission().unwrap().capture_id, id);
                 if kind == "valid" {
@@ -16848,12 +16876,219 @@ impl Tool for BringToFrontTool {
 
 // ── registry ─────────────────────────────────────────────────────────────────
 
+#[cfg(test)]
+thread_local! {static TEST_BUILT_STATE:std::cell::RefCell<Option<std::sync::Weak<ToolState>>>=const {std::cell::RefCell::new(None)};}
+
+#[cfg(test)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_registry_session_end_defers_registered_cleanup_until_pinned_helper_client_exits() {
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    type Gate = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+    struct ResumeOnDrop(Gate);
+    impl Drop for ResumeOnDrop {
+        fn drop(&mut self) {
+            *self.0 .0.lock().unwrap() = true;
+            self.0 .1.notify_all();
+        }
+    }
+    struct Helper {
+        def: ToolDef,
+        args: Arc<std::sync::Mutex<Option<Value>>>,
+        source: Arc<std::sync::Mutex<Option<Arc<crate::wayland::hyprland_input::WindowSource>>>>,
+        gate: Arc<std::sync::Mutex<Option<Gate>>>,
+        entered: Arc<tokio::sync::Notify>,
+        hits: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Tool for Helper {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, args: Value) -> ToolResult {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            *self.args.lock().unwrap() = Some(args);
+            let gate = self.gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                let source = self.source.lock().unwrap().clone().unwrap();
+                let entered = self.entered.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::wayland::hyprland_input::tests::pin_held_tool_client(
+                        &source, &entered, &gate,
+                    )
+                })
+                .await
+                .unwrap();
+            }
+            ToolResult::text("fixture helper complete")
+                .with_structured(json!({"width":3000,"height":100,"scale_factor":1.5}))
+        }
+    }
+    let scope = format!("held-lifecycle-{}", std::process::id());
+    let mut registry = cua_driver_core::tool::with_runtime_scope(scope, || {
+        build_registry_with_provider(false, None)
+    });
+    let state = TEST_BUILT_STATE.with(|slot| slot.borrow_mut().take().unwrap().upgrade().unwrap());
+    let service = registry.capture_service();
+    let (mut source, peer, public_owner) =
+        crate::wayland::hyprland_input::tests::held_tool_fixture(&service);
+    let args = Arc::new(std::sync::Mutex::new(None));
+    let helper_source = Arc::new(std::sync::Mutex::new(None));
+    let gate = Arc::new(std::sync::Mutex::new(None));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let hits = Arc::new(AtomicUsize::new(0));
+    registry.register(Box::new(Helper {
+        def: ToolDef {
+            name: "get_screen_size".into(),
+            description: "pinned original client helper".into(),
+            input_schema: json!({"type":"object"}),
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            open_world: false,
+        },
+        args: args.clone(),
+        source: helper_source.clone(),
+        gate: gate.clone(),
+        entered: entered.clone(),
+        hits: hits.clone(),
+    }));
+    assert_ne!(
+        registry
+            .invoke_from_trusted_adapter("get_screen_size", json!({"_session_id":public_owner}))
+            .await
+            .is_error,
+        Some(true)
+    );
+    let owner = args.lock().unwrap().as_ref().unwrap()["_session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    crate::wayland::hyprland_input::tests::namespace_held_tool_fixture(
+        &mut source,
+        &service,
+        &owner,
+    );
+    let releases = Arc::new(AtomicUsize::new(0));
+    let server_releases = releases.clone();
+    let server = std::thread::spawn(move || {
+        let mut bytes = [0u8; 2048];
+        let mut receive = || {
+            let n =
+                unsafe { libc::recv(peer.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len(), 0) };
+            assert!(n >= 0);
+            String::from_utf8(bytes[..n as usize].to_vec()).unwrap()
+        };
+        assert!(receive().starts_with("FOREGROUND_TARGET "));
+        peer.send(
+            crate::wayland::hyprland_input::tests::guarded_target()
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(receive().starts_with("HOLD_BEGIN 1 "));
+        peer.send(json!({"ok":true,"phase":"held_started","sequence":1,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
+        assert_eq!(
+            receive(),
+            "HOLD_RELEASE 2 55555555555555555555555555555555",
+            "no MOVE/TARGET/reconnect during lifecycle cleanup"
+        );
+        server_releases.fetch_add(1, Ordering::SeqCst);
+        peer.send(json!({"ok":true,"cleanup_confirmed":true,"sequence":2,"handle":"55555555555555555555555555555555"}).to_string().as_bytes()).unwrap();
+        assert!(
+            receive().is_empty(),
+            "registered session/runtime cleanup duplicated release"
+        );
+    });
+    let retained = source.clone();
+    let handle = tokio::task::spawn_blocking(move || {
+        crate::wayland::hyprland_input::begin_held_source(
+            retained,
+            (10.25, 10.25),
+            1,
+            true,
+            crate::wayland::hyprland_input::ActionCancellation::default(),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    state.mouse_hold.lock().unwrap().insert(
+        owner.clone(),
+        MouseHoldState {
+            pid: source.pid,
+            xid: source.address,
+            button: 1,
+            x: 10.25,
+            y: 10.25,
+            guarded: Some(handle.clone()),
+        },
+    );
+    *helper_source.lock().unwrap() = Some(source.clone());
+    let resume = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let _resume_on_drop = ResumeOnDrop(resume.clone());
+    *gate.lock().unwrap() = Some(resume.clone());
+    let registry = Arc::new(registry);
+    let worker_registry = registry.clone();
+    let worker_owner = owner.clone();
+    let worker = tokio::spawn(async move {
+        worker_registry
+            .invoke_from_trusted_adapter("get_screen_size", json!({"_session_id":worker_owner}))
+            .await
+    });
+    entered.notified().await;
+    let result = registry
+        .invoke_from_trusted_adapter("end_session", json!({"_session_id":owner}))
+        .await;
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "end_session must explicitly report pending cleanup: {result:?}"
+    );
+    assert_eq!(
+        result.structured_content.as_ref().unwrap()["cleanup_in_progress"],
+        true
+    );
+    let rejected = registry
+        .invoke_from_trusted_adapter("get_screen_size", json!({"_session_id":owner}))
+        .await;
+    assert_eq!(
+        rejected.is_error,
+        Some(true),
+        "ending must block new helper dispatch: {rejected:?}"
+    );
+    // Keep the ordinary helper's actual SessionClient mutex beyond cleanup's
+    // budget. The registry lease defers the registered cleanup, not a lock-
+    // timeout assertion or a hand-wired release callback.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    assert_eq!(releases.load(Ordering::SeqCst), 0);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    *resume.0.lock().unwrap() = true;
+    resume.1.notify_all();
+    assert_ne!(worker.await.unwrap().is_error, Some(true));
+    assert_eq!(releases.load(Ordering::SeqCst), 1);
+    assert!(
+        !state.mouse_hold.lock().unwrap().contains_key(&owner),
+        "registered hook left active owner state"
+    );
+    assert_ne!(
+        service.current_binding(owner.as_str()).unwrap(),
+        source.binding
+    );
+    drop(registry);
+    drop(handle);
+    crate::wayland::hyprland_input::tests::close_held_tool_fixture(&source);
+    server.join().unwrap();
+}
+
 pub fn build_registry_with_provider(
     compat: bool,
     provider: Option<std::sync::Arc<dyn cua_driver_core::consent::ProtectedConsentProvider>>,
 ) -> ToolRegistry {
     let mut r = ToolRegistry::new_with_protected_consent_provider(provider);
     let state = ToolState::new_with_capture_service(r.capture_service());
+    #[cfg(test)]
+    TEST_BUILT_STATE.with(|slot| *slot.borrow_mut() = Some(Arc::downgrade(&state)));
     if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
         let recording_state = Arc::downgrade(&state);
         r.recording
@@ -16929,7 +17164,13 @@ pub fn build_registry_with_provider(
         cua_driver_core::session::register_scoped_fallible_session_end_hook(
             "linux_input",
             move |session_id| {
-                if crate::wayland::is_wayland() {
+                let guarded_hold = state_for_session_end
+                    .mouse_hold
+                    .lock()
+                    .unwrap()
+                    .get(session_id)
+                    .is_some_and(|held| held.guarded.is_some());
+                if crate::wayland::is_wayland() || guarded_hold {
                     release_mouse_hold_for_session(
                         &state_for_session_end,
                         session_id,

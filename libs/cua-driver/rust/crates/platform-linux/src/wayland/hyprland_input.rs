@@ -1412,7 +1412,7 @@ fn begin_held_on_client(
         ));
     }
     if route == DeliveryRoute::Foreground && !client.held_foreground_supported {
-        return Err(source_refusal("held_foreground_unavailable: compositor has no pre-focus-transition owned-release guarantee; finite foreground gestures remain supported"));
+        return Err(source_refusal("held_foreground_unavailable: module lacks a ready original-resource event observer; finite foreground gestures remain supported"));
     }
     client.check_route(route)?;
     ensure!(
@@ -2409,6 +2409,18 @@ pub(crate) mod tests {
     pub(crate) fn close_held_tool_fixture(source: &WindowSource) {
         *source.connection.as_ref().unwrap().client.lock().unwrap() = None;
     }
+    pub(crate) fn pin_held_tool_client(
+        source: &WindowSource,
+        entered: &tokio::sync::Notify,
+        resume: &(Mutex<bool>, std::sync::Condvar),
+    ) {
+        let _client = source.connection.as_ref().unwrap().client.lock().unwrap();
+        entered.notify_one();
+        let mut go = resume.0.lock().unwrap();
+        while !*go {
+            go = resume.1.wait(go).unwrap();
+        }
+    }
     pub(crate) fn namespace_held_tool_fixture(
         source: &mut Arc<WindowSource>,
         service: &cua_driver_core::capture_runtime::CaptureService,
@@ -2488,6 +2500,49 @@ pub(crate) mod tests {
             },
             -1
         );
+    }
+
+    #[test]
+    fn held_foreground_observer_capability_false_refuses_before_any_target_or_press() {
+        let (source, peer) = held_fixture(true);
+        source
+            .connection
+            .as_ref()
+            .unwrap()
+            .client
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .held_foreground_supported = false;
+        let error = begin_held_source(
+            source.clone(),
+            (10.25, 10.25),
+            1,
+            true,
+            ActionCancellation::default(),
+        )
+        .unwrap_err();
+        assert!(error.is::<WindowSourceRefusal>());
+        assert!(error.to_string().contains("held_foreground_unavailable"));
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            unsafe {
+                libc::recv(
+                    peer.as_raw_fd(),
+                    byte.as_mut_ptr().cast(),
+                    1,
+                    libc::MSG_DONTWAIT,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "capability false sent TARGET/BEGIN"
+        );
+        close_held_tool_fixture(&source);
     }
 
     #[test]
