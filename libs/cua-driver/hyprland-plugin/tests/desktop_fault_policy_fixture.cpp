@@ -37,7 +37,7 @@ struct Pointer {
     bool resource() const { return resource_live; }
 };
 struct Drag { Client* client; DragGeometry geometry{1}; SourceWitness source{}; };
-struct Held { HeldPhase phase; };
+struct Held { HeldPhase phase; Client* client=nullptr; InputRoute route=InputRoute::independent; };
 struct Trace { void mark(const char*, unsigned) {} };
 void wl_event_source_remove(void*) {}
 int close(int) { return 0; }
@@ -67,6 +67,9 @@ struct Lane {
     Client* reservation = nullptr;
     std::optional<Drag> drag;
     std::optional<Held> held;
+    std::optional<Held> foreground_debt, independent_debt;
+    bool cleanup_confirmable=true;
+    unsigned watcher_detachments=0;
     InputGrant grant;
     Clock::time_point expires;
     std::vector<unsigned> held_keys{42};
@@ -92,8 +95,9 @@ struct Lane {
     void cleanup_held() {
         if (!held || held->phase.retired) return;
         release_pointer_button();
-        held->phase.retire(true);
+        held->phase.retire(cleanup_confirmable);
     }
+    void detach_held_watchers(std::optional<Held>& value) {if(value)++watcher_detachments;}
     template<typename T> bool primary_conflict(const T&) const { return primary_busy; }
     template<typename T> bool agent_conflict(const T&) const { return peer_busy; }
     std::optional<Target::Geometry> target_geometry(
@@ -129,6 +133,18 @@ struct Lane {
 };
 
 int main() {
+    for(auto route:{InputRoute::primary_foreground,InputRoute::independent}) for(bool confirmed:{false,true}) {
+        Lane l;l.drag.reset();l.lease->route=route;l.cleanup_confirmable=confirmed;
+        l.held.emplace(Held{HeldPhase{reinterpret_cast<std::uintptr_t>(l.lease),"hold",{},Clock::now()+std::chrono::seconds(5)},l.lease,route});
+        l.suspend(); // extracted production destroys the actual unique_ptr Client
+        check(l.clients.empty() && !l.lease && !l.reservation && !l.held,"suspend retained owner authority");
+        auto& debt=route==InputRoute::primary_foreground ? l.foreground_debt : l.independent_debt;
+        check(bool(debt)==!confirmed,"suspend erased unknown obligation/retained completed phase");
+        if(debt)check(!debt->client && debt->route==route && debt->phase.retired && !debt->phase.cleanup_confirmed,"ownerless debt lost original route/fact");
+        check(l.watcher_detachments==unsigned(confirmed),"unknown resource witness detached/completed witness retained");
+        l.suspend("resume_failed");l.guard_targets();l.check_inert();
+        check(l.releases==1,"repeat suspend replayed original cleanup");
+    }
     { Lane l; l.suspend(); l.guard_targets(); l.check_inert();
       check(!l.reservation && l.clients.empty() && !l.available(), "disable retained admission"); }
     { Lane l; l.suspend("plugin_shutdown"); l.guard_targets(); l.check_inert(false); }
