@@ -108,6 +108,32 @@ fn ipc(topic: &str) -> Value {
     dual_display_guard::query(topic).expect("bounded independent Hyprland observation")
 }
 
+#[test]
+fn fixture_button_callback_uses_numeric_public_accessor() {
+    let mut child = Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            include_str!("support/dual_display_fixture_event_test.py"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Python callback regression interpreter");
+    std::io::Write::write_all(
+        &mut child.stdin.take().unwrap(),
+        include_bytes!("support/dual_display_fixture.py"),
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "fixture callback regression: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn qualify_layout(monitors: &Value) {
     let monitors = monitors.as_array().expect("monitor array");
     assert_eq!(
@@ -160,6 +186,10 @@ fn events(path: &Path) -> Vec<Value> {
     assert!(
         events.len() <= 20001 && !events.iter().any(|e| e["kind"] == "journal-resource-cap"),
         "fixture event resource cap reached"
+    );
+    assert!(
+        !events.iter().any(|e| e["kind"] == "fixture-event-error"),
+        "fixture rejected an invalid event payload; journal cannot qualify input"
     );
     events
 }
@@ -1127,6 +1157,12 @@ fn journal_resource_cap_is_a_failure_not_missing_or_truncated_evidence() {
     .unwrap();
     assert!(std::panic::catch_unwind(|| events(&path)).is_err());
     std::fs::write(&path, vec![b' '; 4 * 1024 * 1024 + 1]).unwrap();
+    assert!(std::panic::catch_unwind(|| events(&path)).is_err());
+    std::fs::write(
+        &path,
+        "{\"kind\":\"fixture-event-error\",\"code\":\"invalid-button-payload\"}\n",
+    )
+    .unwrap();
     assert!(std::panic::catch_unwind(|| events(&path)).is_err());
 }
 

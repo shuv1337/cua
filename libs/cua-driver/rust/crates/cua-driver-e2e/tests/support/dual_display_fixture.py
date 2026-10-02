@@ -66,6 +66,13 @@ def draw(widget, cr):
 def event(widget, e):
     if e.type in (Gdk.EventType.BUTTON_PRESS, Gdk.EventType.BUTTON_RELEASE,
                   Gdk.EventType.MOTION_NOTIFY, Gdk.EventType.SCROLL):
+        button = None
+        if e.type in (Gdk.EventType.BUTTON_PRESS, Gdk.EventType.BUTTON_RELEASE):
+            _button_ok, button = e.get_button()
+            if not _button_ok or type(button) is not int or button <= 0:
+                record("fixture-event-error", code="invalid-button-payload",
+                       event_type=e.type.value_nick)
+                return False  # No counter/effect evidence for an invalid packet.
         if e.type == Gdk.EventType.BUTTON_RELEASE:
             state["clicks"] += 1
         scroll = {}
@@ -79,8 +86,6 @@ def event(widget, e):
                           delta_available=bool(_ok), is_stop=is_stop)
             if direction != "smooth" and not is_stop:
                 state["scrolls"] += 1  # Meaningful discrete ticks, not smooth/stop packets.
-        button = int(e.button) if e.type in (Gdk.EventType.BUTTON_PRESS,
-                                             Gdk.EventType.BUTTON_RELEASE) else None
         record(e.type.value_nick, x=e.x, y=e.y, button=button, **scroll, **state)
     return False
 
