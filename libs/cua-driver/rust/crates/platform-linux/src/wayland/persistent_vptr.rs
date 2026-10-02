@@ -88,7 +88,7 @@ struct ActivePointer {
 
 /// Process-global command channel into the owner thread. Lazily started on
 /// first use.
-type Request = (Cmd, Arc<AtomicBool>);
+type Request = (Cmd, Arc<AtomicBool>, std::time::Instant);
 // Socket2 custom markers are visible to every subscriber. Idle revocation is
 // bounded to two observations/sec; command phases perform their own qualified
 // validation rather than redundantly running the whole idle observation first.
@@ -158,7 +158,7 @@ fn owner_thread(rx: Receiver<Request>) {
                 }
             }
         }
-        let (cmd, cancelled) = match command {
+        let (cmd, cancelled, deadline) = match command {
             Ok(cmd) => cmd,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -175,12 +175,16 @@ fn owner_thread(rx: Receiver<Request>) {
             }
             | Cmd::Forget { cursor_id, reply } => (cursor_id, reply),
         };
-        if cancelled.load(Ordering::Acquire) {
+        if cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
             if matches!(&cmd, Cmd::Press { .. }) {
+                let _ = reply.try_send(Err(anyhow::anyhow!(
+                    "action_cancelled: queued press expired before input; no press effects"
+                )));
                 continue;
             }
             let result = destroy_owned(&mut active, cursor_id);
             retain_cleanup_failure(&mut cleanup_failures, cursor_id, &result);
+            let _ = reply.try_send(result.and_then(|()| Err(anyhow::anyhow!("held_pointer_partial_unknown: expired queued phase; owned cleanup acknowledged"))));
             continue;
         }
         if let Some(error) = cleanup_failures.get(cursor_id) {
@@ -202,10 +206,18 @@ fn owner_thread(rx: Receiver<Request>) {
                 }
                 revoked_releases.remove(&cursor_id);
                 let previously_owned = active.contains_key(&cursor_id);
-                let r = super::hyprland::with_observation_deadline(
-                    std::time::Instant::now() + std::time::Duration::from_secs(2),
-                    || handle_press(&mut active, &cursor_id, window_id, x, y, button, &cancelled),
-                );
+                let r = super::hyprland::with_observation_deadline(deadline, || {
+                    handle_press(
+                        &mut active,
+                        &cursor_id,
+                        window_id,
+                        x,
+                        y,
+                        button,
+                        &cancelled,
+                        deadline,
+                    )
+                });
                 let cleanup_unconfirmed = r
                     .as_ref()
                     .err()
@@ -238,10 +250,9 @@ fn owner_thread(rx: Receiver<Request>) {
                 y,
                 reply,
             } => {
-                let r = super::hyprland::with_observation_deadline(
-                    std::time::Instant::now() + std::time::Duration::from_secs(2),
-                    || handle_move(&mut active, &cursor_id, x, y, &cancelled),
-                );
+                let r = super::hyprland::with_observation_deadline(deadline, || {
+                    handle_move(&mut active, &cursor_id, x, y, &cancelled, deadline)
+                });
                 let r = finish_command(&mut active, &cursor_id, r);
                 retain_cleanup_failure(&mut cleanup_failures, &cursor_id, &r);
                 if let Some(pointer) = active.get_mut(&cursor_id) {
@@ -338,17 +349,47 @@ mod reply_cancellation_tests {
                 reply,
             },
             Arc::new(AtomicBool::new(true)),
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
         ))
         .unwrap();
         drop(tx);
         // The real owner processes cancellation before attempting any native
         // open. An uncancelled request would return an unavailable-session error
-        // in this hermetic environment; this one never dispatches or replies.
+        // in this hermetic environment; this one acknowledges pre-effect refusal.
         owner_thread(rx);
-        assert!(matches!(
-            receive.try_recv(),
-            Err(crossbeam_channel::TryRecvError::Disconnected)
-        ));
+        assert!(receive
+            .try_recv()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .starts_with("action_cancelled:"));
+    }
+
+    #[test]
+    fn expired_queued_press_is_refused_by_real_owner_before_opening_native_session() {
+        let (tx, rx) = bounded(2);
+        let (reply, receive) = bounded(1);
+        tx.send((
+            Cmd::Press {
+                cursor_id: "expired-fixture".into(),
+                window_id: 1,
+                x: 1,
+                y: 1,
+                button: 1,
+                reply,
+            },
+            Arc::new(AtomicBool::new(false)),
+            std::time::Instant::now(),
+        ))
+        .unwrap();
+        drop(tx);
+        owner_thread(rx);
+        assert!(receive
+            .try_recv()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .starts_with("action_cancelled:"));
     }
 
     #[test]
@@ -461,6 +502,7 @@ fn handle_press(
     y: i32,
     button: u8,
     cancelled: &AtomicBool,
+    deadline: std::time::Instant,
 ) -> anyhow::Result<()> {
     if !active.is_empty() {
         anyhow::bail!("mouse_hold_conflict: generic primary-seat pointer already owns a held device; parallel independent holds require an isolated compositor route");
@@ -497,7 +539,7 @@ fn handle_press(
         }
     }
 
-    if cancelled.load(Ordering::Acquire) {
+    if cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
         anyhow::bail!("cancelled_before_input");
     }
 
@@ -551,6 +593,7 @@ fn handle_move(
     x: i32,
     y: i32,
     cancelled: &AtomicBool,
+    deadline: std::time::Instant,
 ) -> anyhow::Result<()> {
     let entry = active.get_mut(cursor_id).ok_or_else(|| {
         anyhow::anyhow!(
@@ -561,7 +604,7 @@ fn handle_move(
         anyhow::bail!("persistent pointer unresolved reply budget exceeded");
     }
     validate_owned_target(entry)?;
-    if cancelled.load(Ordering::Acquire) {
+    if cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
         anyhow::bail!("cancelled_before_input");
     }
     if entry
@@ -733,7 +776,11 @@ fn request(make: impl FnOnce(Sender<anyhow::Result<()>>) -> Cmd) -> anyhow::Resu
     let (reply, receive) = bounded(1);
     let cancelled = Arc::new(AtomicBool::new(false));
     tx().send_timeout(
-        (make(reply), cancelled.clone()),
+        (
+            make(reply),
+            cancelled.clone(),
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        ),
         std::time::Duration::from_secs(1),
     )
     .map_err(|error| anyhow::anyhow!("persistent pointer admission unavailable: {error}"))?;

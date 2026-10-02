@@ -480,7 +480,7 @@ pub struct CaptureActionRequest {
     pub screenshot_y: f64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CaptureActionAdmission {
     pub capture_id: CaptureId,
     pub target: CaptureTarget,
@@ -489,6 +489,8 @@ pub struct CaptureActionAdmission {
     pub native_action_dimensions: NativeActionDimensions,
     pub digest: ContentDigest,
     pub frame_identity: Option<CaptureFrameIdentity>,
+    pub encoded_dimensions: EncodedScreenshotDimensions,
+    pub screenshot_to_action: ScreenshotToActionTransform,
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq)]
@@ -918,6 +920,8 @@ impl CaptureRegistry {
             native_action_dimensions: capture.native_action_dimensions,
             digest: capture.digest,
             frame_identity: capture.frame_identity.clone(),
+            encoded_dimensions: capture.encoded_dimensions,
+            screenshot_to_action: capture.screenshot_to_action,
         };
         self.remove_capture(&mut inner, request.capture_id);
         Ok(admission)
@@ -1142,6 +1146,7 @@ pub struct CaptureService {
     registry: CaptureRegistry,
     session_generations: Mutex<HashMap<Arc<str>, u64>>,
     desktop_observations: Mutex<HashMap<Arc<str>, DesktopObservation>>,
+    desktop_unavailable: Mutex<HashMap<Arc<str>, CaptureBinding>>,
     publication_sequences: Mutex<HashMap<(CaptureBinding, CaptureTarget), u64>>,
     next_publication_sequence: AtomicU64,
 }
@@ -1166,6 +1171,7 @@ impl CaptureService {
             registry: CaptureRegistry::with_clock(config, clock)?,
             session_generations: Mutex::new(HashMap::new()),
             desktop_observations: Mutex::new(HashMap::new()),
+            desktop_unavailable: Mutex::new(HashMap::new()),
             publication_sequences: Mutex::new(HashMap::new()),
             next_publication_sequence: AtomicU64::new(1),
         })
@@ -1321,6 +1327,10 @@ impl CaptureService {
             frame_identity,
         )?;
         if let Some(identity) = desktop_identity {
+            self.desktop_unavailable
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(binding.session_id());
             self.desktop_observations
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -1372,7 +1382,77 @@ impl CaptureService {
                 *stale = true;
             }
         }
+        self.desktop_unavailable
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(binding.session_id.clone(), binding.clone());
         Ok(())
+    }
+
+    /// Absence means raw desktop input before any observation. A completed
+    /// visual-only observation is a distinct, lifetime-bound unavailable state.
+    pub fn desktop_observation_unavailable(&self, binding: &CaptureBinding) -> bool {
+        self.desktop_unavailable
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(binding.session_id())
+            == Some(binding)
+    }
+
+    /// Registry completion and the legacy affine share publication ordering and
+    /// the session lifetime lock. Older completions cannot install/forget a cap
+    /// belonging to a newer observation, or resurrect retired authority.
+    pub(crate) fn complete_desktop_result(
+        &self,
+        binding: &CaptureBinding,
+        sequence: u64,
+        args: &serde_json::Value,
+        result: Option<&serde_json::Value>,
+    ) {
+        let generations = self
+            .session_generations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if self.runtime_retired.load(Ordering::Acquire)
+            || binding.runtime_generation != self.runtime_generation
+            || generations
+                .get(binding.session_id())
+                .is_some_and(|g| *g != binding.session_generation())
+            || self
+                .publication_sequences
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&(binding.clone(), CaptureTarget::PrimaryDesktop))
+                .copied()
+                != Some(sequence)
+        {
+            return;
+        }
+        if result
+            .and_then(|v| v.get("action_capture_available"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        {
+            self.desktop_unavailable
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(binding.session_id.clone(), binding.clone());
+            if let Some(observation) = self
+                .desktop_observations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(binding.session_id())
+            {
+                observation.2 = true;
+            }
+            crate::desktop_capture_scale::forget_binding(binding);
+        } else {
+            crate::desktop_capture_scale::record_desktop_state_for_binding(
+                args,
+                result,
+                Some(binding),
+            );
+        }
     }
 
     /// Validate the last delivered desktop image, including uncapped ratio-one
@@ -1408,6 +1488,9 @@ impl CaptureService {
             .desktop_observations
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        if self.desktop_observation_unavailable(binding) {
+            return Err(CaptureActionError::NativeActionFrameMismatch);
+        }
         let Some((observed_binding, identity, stale, id, _)) =
             observations.get_mut(binding.session_id())
         else {
@@ -1452,6 +1535,7 @@ impl CaptureService {
         if observed_binding != binding {
             return false;
         }
+        args["_native_desktop_original_coordinates"] = serde_json::json!({"x": args.get("x"), "y": args.get("y"), "from_x": args.get("from_x"), "from_y": args.get("from_y"), "to_x": args.get("to_x"), "to_y": args.get("to_y")});
         for (keys, factor) in [(["x", "from_x", "to_x"], fx), (["y", "from_y", "to_y"], fy)] {
             for key in keys {
                 if let Some(value) = args.get(key).and_then(serde_json::Value::as_f64) {

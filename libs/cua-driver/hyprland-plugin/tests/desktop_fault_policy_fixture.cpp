@@ -3,6 +3,7 @@
 #include "drag_geometry.hpp"
 #include "foreground_route.hpp"
 #include "input_grant.hpp"
+#include "held_phase.hpp"
 #include "passive_pointer_target.hpp"
 
 #include <algorithm>
@@ -35,7 +36,8 @@ struct Pointer {
     std::shared_ptr<Surface> focus;
     bool resource() const { return resource_live; }
 };
-struct Drag { Client* client; DragGeometry geometry{1}; };
+struct Drag { Client* client; DragGeometry geometry{1}; SourceWitness source{}; };
+struct Held { HeldPhase phase; };
 struct Trace { void mark(const char*, unsigned) {} };
 void wl_event_source_remove(void*) {}
 int close(int) { return 0; }
@@ -64,6 +66,7 @@ struct Lane {
     Client* lease = nullptr;
     Client* reservation = nullptr;
     std::optional<Drag> drag;
+    std::optional<Held> held;
     InputGrant grant;
     Clock::time_point expires;
     std::vector<unsigned> held_keys{42};
@@ -82,6 +85,15 @@ struct Lane {
     bool available() const { return !suspended && session; }
     bool layout_qualified() const { return layout; }
     bool refresh(Client&) const { return refresh_ok; }
+    SourceWitness witness(const Client&) const { return {}; }
+    bool held_source(Client& client, const std::string& handle) const {
+        return held && held->phase.permits(reinterpret_cast<std::uintptr_t>(&client), handle, witness(client), Clock::now());
+    }
+    void cleanup_held() {
+        if (!held || held->phase.retired) return;
+        release_pointer_button();
+        held->phase.retire(true);
+    }
     template<typename T> bool primary_conflict(const T&) const { return primary_busy; }
     template<typename T> bool agent_conflict(const T&) const { return peer_busy; }
     std::optional<Target::Geometry> target_geometry(

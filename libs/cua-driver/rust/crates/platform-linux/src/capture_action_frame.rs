@@ -44,6 +44,18 @@ pub fn pin_publication_binding_for_target(
     target: CaptureTarget,
 ) -> anyhow::Result<Value> {
     let binding = service.binding_from_args(args)?;
+    if target == CaptureTarget::PrimaryDesktop
+        && args
+            .get("_capture_started_sequence")
+            .and_then(Value::as_u64)
+            .is_some()
+        && args
+            .get("_capture_session_generation")
+            .and_then(Value::as_u64)
+            == Some(binding.session_generation())
+    {
+        return Ok(args.clone());
+    }
     let sequence = service.begin_publication(&binding, target)?;
     let mut args = args.clone();
     args["_capture_session_generation"] = serde_json::json!(binding.session_generation());
@@ -407,6 +419,17 @@ pub fn admit_desktop_click_in(
     let Some(frame) = space.frame() else {
         return admit_desktop_click(service, args, capture_id, screenshot_x, screenshot_y);
     };
+    admit_desktop_click_in_frame(service, args, capture_id, screenshot_x, screenshot_y, frame)
+}
+
+pub(crate) fn admit_desktop_click_in_frame(
+    service: &CaptureService,
+    args: &Value,
+    capture_id: &str,
+    screenshot_x: f64,
+    screenshot_y: f64,
+    frame: &crate::wayland::hyprland::DesktopFrame,
+) -> anyhow::Result<(f64, f64)> {
     let recording_sink = recording_sink();
     let source_binding = service.binding_from_args(args)?;
     frame.validate_current()?;

@@ -336,6 +336,8 @@ struct Client {
     protocol: InputProtocol,
     foreground_supported: bool,
     source_guard_supported: bool,
+    held_phase_supported: bool,
+    owned_cleanup: bool,
     delivery_route: Option<DeliveryRoute>,
     // Assigned by the compositor to this connection, never by the local pool.
     lane: Option<usize>,
@@ -367,15 +369,12 @@ pub(crate) struct WindowSource {
     pub geometry: [f64; 6],
     desktop_generation: u64,
     admission: Mutex<Option<SourceAdmission>>,
+    connection: Option<Arc<SessionClient>>,
     #[cfg(test)]
     native_validator: Option<fn() -> Result<()>>,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct SourceAdmission {
-    pub capture_id: cua_driver_core::capture_runtime::CaptureId,
-    pub target: cua_driver_core::capture_runtime::CaptureTarget,
-}
+pub(crate) type SourceAdmission = cua_driver_core::capture_runtime::CaptureActionAdmission;
 
 #[derive(Clone, Debug, PartialEq)]
 struct SourceMetadata {
@@ -446,7 +445,16 @@ impl WindowSource {
         if admission.as_ref().is_some_and(|admission| {
             admission.target == cua_driver_core::capture_runtime::CaptureTarget::PrimaryDesktop
         }) {
-            return; // Consumed desktop admission was already handed off once.
+            let (sx, sy) = self.layout_point(point);
+            sink.retain_action_point_with_capture_id(
+                &self.binding,
+                Some(&self.frame.identity),
+                &cua_driver_core::capture_runtime::CaptureTarget::PrimaryDesktop,
+                (self.frame.width, self.frame.height),
+                (sx - f64::from(self.frame.x), sy - f64::from(self.frame.y)),
+                admission.as_ref().map(|a| &a.capture_id),
+            );
+            return; // First handoff wins within each sink; next held phase has its own sink.
         }
         // Carry the original successful admission's ID, never rediscover or
         // reconsume it. Requested-but-unconsumed is not genuinely unbound.
@@ -500,10 +508,7 @@ impl WindowSource {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if slot.is_none() {
-            *slot = Some(SourceAdmission {
-                capture_id: admission.capture_id,
-                target: admission.target.clone(),
-            });
+            *slot = Some(admission.clone());
         }
     }
 
@@ -642,10 +647,25 @@ fn wait(
     events: i16,
     deadline: Instant,
 ) -> Result<()> {
+    wait_mode(socket, owner, cancellation, events, deadline, false)
+}
+
+fn wait_mode(
+    socket: &socket2::Socket,
+    owner: &str,
+    cancellation: &ActionCancellation,
+    events: i16,
+    deadline: Instant,
+    owned_cleanup: bool,
+) -> Result<()> {
     loop {
         cancellation.check()?;
         ensure!(
-            !cua_driver_core::session::is_session_ending(owner),
+            Instant::now() < deadline,
+            "Hyprland input deadline expired; no packet may be sent"
+        );
+        ensure!(
+            owned_cleanup || !cua_driver_core::session::is_session_ending(owner),
             "Hyprland input session ending; dispatch effect is unknown"
         );
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -672,7 +692,11 @@ fn wait(
         }
         cancellation.check()?;
         ensure!(
-            !cua_driver_core::session::is_session_ending(owner),
+            Instant::now() < deadline,
+            "Hyprland input deadline expired; no packet may be sent"
+        );
+        ensure!(
+            owned_cleanup || !cua_driver_core::session::is_session_ending(owner),
             "Hyprland input session ending; dispatch effect is unknown"
         );
         ensure!(
@@ -685,6 +709,26 @@ fn wait(
 }
 
 impl Client {
+    fn wait_ready(&self, events: i16, deadline: Instant) -> Result<()> {
+        if self.owned_cleanup {
+            wait_mode(
+                &self.socket,
+                &self.owner,
+                &self.cancellation,
+                events,
+                deadline,
+                true,
+            )
+        } else {
+            wait(
+                &self.socket,
+                &self.owner,
+                &self.cancellation,
+                events,
+                deadline,
+            )
+        }
+    }
     fn peer_closed(&self) -> bool {
         let mut fd = libc::pollfd {
             fd: self.socket.as_raw_fd(),
@@ -732,6 +776,8 @@ impl Client {
             protocol: protocol(),
             foreground_supported: false,
             source_guard_supported: false,
+            held_phase_supported: false,
+            owned_cleanup: false,
             delivery_route: None,
             lane: None,
             owner,
@@ -772,6 +818,8 @@ impl Client {
             self.protocol == InputProtocol::Production && hello["foreground_target"] == true;
         self.source_guard_supported =
             self.protocol == InputProtocol::Production && hello["source_guard_version"] == 1;
+        self.held_phase_supported =
+            self.protocol == InputProtocol::Production && hello["held_phase_version"] == 1;
         if self.protocol == InputProtocol::Experiment {
             self.challenge = hex_field(&hello, "challenge")?;
         } else {
@@ -797,6 +845,10 @@ impl Client {
 
     fn request(&self, packet: &str) -> Result<Value> {
         let deadline = Instant::now() + TIMEOUT;
+        self.request_until(packet, deadline)
+    }
+
+    fn request_until(&self, packet: &str, deadline: Instant) -> Result<Value> {
         self.send_packet(packet, deadline)?;
         self.receive(deadline)
     }
@@ -807,13 +859,7 @@ impl Client {
             "invalid input packet"
         );
         loop {
-            wait(
-                &self.socket,
-                &self.owner,
-                &self.cancellation,
-                libc::POLLOUT,
-                deadline,
-            )?;
+            self.wait_ready(libc::POLLOUT, deadline)?;
             let count = unsafe {
                 libc::send(
                     self.socket.as_raw_fd(),
@@ -841,13 +887,7 @@ impl Client {
     fn receive(&self, deadline: Instant) -> Result<Value> {
         let mut bytes = [0u8; MAX_PACKET];
         loop {
-            wait(
-                &self.socket,
-                &self.owner,
-                &self.cancellation,
-                libc::POLLIN,
-                deadline,
-            )?;
+            self.wait_ready(libc::POLLIN, deadline)?;
             let count = unsafe {
                 libc::recv(
                     self.socket.as_raw_fd(),
@@ -1164,6 +1204,12 @@ struct SessionClient {
     client: Mutex<Option<Client>>,
 }
 
+impl std::fmt::Debug for SessionClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OriginalSessionConnection")
+    }
+}
+
 impl SessionClient {
     fn lock(&self, cancellation: &ActionCancellation) -> Result<MutexGuard<'_, Option<Client>>> {
         loop {
@@ -1264,6 +1310,401 @@ pub fn cleanup_runtime(prefix: &str) {
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum HeldStatus {
+    Active,
+    Released(bool),
+    Quarantined,
+}
+
+/// Runtime-private held authority. It retains the *original* connection and
+/// admission; no method consults the pool to acquire/reconnect another device.
+#[derive(Debug)]
+pub(crate) struct HeldHandle {
+    pub source: Arc<WindowSource>,
+    connection: Arc<SessionClient>,
+    handle: String,
+    status: Mutex<HeldStatus>,
+    gesture: Mutex<()>,
+    foreground: bool,
+}
+
+fn lock_phase_until<'a, T>(
+    mutex: &'a Mutex<T>,
+    cancellation: &ActionCancellation,
+    deadline: Instant,
+) -> Result<MutexGuard<'a, T>> {
+    loop {
+        cancellation.check()?;
+        ensure!(
+            Instant::now() < deadline,
+            "held phase queue deadline expired; no dispatch"
+        );
+        match mutex.try_lock() {
+            Ok(guard) => {
+                cancellation.check()?;
+                return Ok(guard);
+            }
+            Err(TryLockError::WouldBlock) => std::thread::sleep(CANCELLATION_POLL),
+            Err(TryLockError::Poisoned(_)) => bail!("held phase owner poisoned"),
+        }
+    }
+}
+
+impl WindowSource {
+    fn held_packet(
+        &self,
+        command: &str,
+        sequence: u64,
+        token: &str,
+        point: (f64, f64),
+    ) -> Result<String> {
+        ensure!(
+            point.0.is_finite()
+                && point.1.is_finite()
+                && point.0 >= 0.0
+                && point.1 >= 0.0
+                && point.0 < self.geometry[2]
+                && point.1 < self.geometry[3],
+            "held point outside original target"
+        );
+        let [a, b, c, d, e, f] = self.geometry;
+        Ok(format!(
+            "{command} {sequence} {token} {} {} {} {a} {b} {c} {d} {e} {f} {} {}",
+            self.revision, self.identity, self.desktop_generation, point.0, point.1
+        ))
+    }
+}
+
+fn begin_held_on_client(
+    client: &mut Client,
+    source: &WindowSource,
+    point: (f64, f64),
+    button: u8,
+    route: DeliveryRoute,
+    cancellation: ActionCancellation,
+    deadline: Instant,
+) -> Result<String> {
+    if !client.held_phase_supported {
+        return Err(source_refusal(
+            "window_source_guard_unavailable: loaded module lacks held_phase_version=1",
+        ));
+    }
+    client.check_route(route)?;
+    ensure!(
+        client.delivery_route == Some(route),
+        "held route differs from original source"
+    );
+    ensure!((1..=3).contains(&button), "unsupported held button");
+    cancellation.check()?;
+    source.validate_native().map_err(source_refusal)?;
+    client.cancellation = cancellation;
+    let action = Action::Drag {
+        from: point,
+        to: point,
+        duration_ms: 50,
+    };
+    let target = client.request_until(&client.target_packet_routed(&action, route), deadline)?;
+    if target["ok"] != true {
+        return Err(source_refusal(format!(
+            "window_source_changed: held target refused: {target}"
+        )));
+    }
+    validate_target_route(&target, route).map_err(source_refusal)?;
+    source.reconcile(client, &target).map_err(source_refusal)?;
+    source.retain_action_point(point);
+    source.validate_native().map_err(source_refusal)?;
+    client.sequence = client
+        .sequence
+        .checked_add(1)
+        .context("held sequence exhausted")?;
+    let sequence = client.sequence;
+    let token = hex_field(&target, "target")?;
+    let mut packet = source.held_packet("HOLD_BEGIN", sequence, &token, point)?;
+    packet.push_str(&format!(
+        " {}",
+        match button {
+            1 => 272,
+            2 => 274,
+            _ => 273,
+        }
+    ));
+    // After send begins, failure cannot be promoted to a pre-effect refusal.
+    client
+        .send_packet(&packet, deadline)
+        .map_err(|error| unknown_dispatch(error, 0))?;
+    let reply = client
+        .receive(deadline)
+        .map_err(|error| unknown_dispatch(error, 0))?;
+    if reply["ok"] != true {
+        if reply["code"] == "stale_source"
+            || reply["code"] == "action_not_admitted"
+            || reply["code"] == "invalid_request"
+            || reply["code"] == "lease_busy"
+        {
+            return Err(source_refusal(format!(
+                "window_source_changed: held begin refused before effects: {reply}"
+            )));
+        }
+        return Err(unknown_dispatch(
+            anyhow::anyhow!("held begin unconfirmed: {reply}"),
+            0,
+        ));
+    }
+    (|| {
+        ensure!(
+            reply["phase"] == "held_started" && reply["sequence"].as_u64() == Some(sequence),
+            "held BEGIN acknowledgment does not match original phase"
+        );
+        hex_field(&reply, "handle")
+    })()
+    .map_err(|error| unknown_dispatch(error, 0))
+}
+
+pub(crate) fn begin_held_source(
+    source: Arc<WindowSource>,
+    point: (f64, f64),
+    button: u8,
+    foreground: bool,
+    cancellation: ActionCancellation,
+) -> Result<Arc<HeldHandle>> {
+    let deadline = Instant::now() + TIMEOUT;
+    let connection = source
+        .connection
+        .clone()
+        .context("window_source_guard_unavailable: original source connection absent")?;
+    let mut slot = lock_phase_until(&connection.client, &cancellation, deadline)?;
+    let client = slot
+        .as_mut()
+        .context("window_source_changed: original connection retired; no reconnect")?;
+    let route = if foreground {
+        DeliveryRoute::Foreground
+    } else {
+        DeliveryRoute::Background
+    };
+    if route == DeliveryRoute::Background {
+        super::hyprland_compatibility::qualify(source.pid)
+            .map_err(|reason| source_refusal(reason))?;
+    }
+    let result = begin_held_on_client(
+        client,
+        &source,
+        point,
+        button,
+        route,
+        cancellation,
+        deadline,
+    );
+    let handle = match result {
+        Ok(handle) => handle,
+        Err(error) => {
+            if error.is::<DispatchUnknown>() {
+                *slot = None;
+            }
+            return Err(error);
+        }
+    };
+    drop(slot);
+    Ok(Arc::new(HeldHandle {
+        source,
+        connection,
+        handle,
+        status: Mutex::new(HeldStatus::Active),
+        gesture: Mutex::new(()),
+        foreground,
+    }))
+}
+
+impl HeldHandle {
+    pub(crate) fn authorize_route(&self, foreground: bool) -> Result<()> {
+        ensure!(
+            self.foreground == foreground,
+            "held_owner_mismatch: delivery route is immutable"
+        );
+        Ok(())
+    }
+    pub(crate) fn authorize(
+        &self,
+        owner: &str,
+        binding: &cua_driver_core::capture_runtime::CaptureBinding,
+    ) -> Result<()> {
+        ensure!(
+            owner == self.source.owner && *binding == self.source.binding,
+            "held_owner_mismatch: original runtime/session generation required"
+        );
+        Ok(())
+    }
+
+    fn move_to_until(
+        &self,
+        owner: &str,
+        binding: &cua_driver_core::capture_runtime::CaptureBinding,
+        point: (f64, f64),
+        cancellation: ActionCancellation,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.authorize(owner, binding)?;
+        let mut status = lock_phase_until(&self.status, &cancellation, deadline)?;
+        ensure!(
+            *status == HeldStatus::Active,
+            "held pointer retired/quarantined; do not replay"
+        );
+        let mut slot = lock_phase_until(&self.connection.client, &cancellation, deadline)?;
+        let result = (|| {
+            let client = slot
+                .as_mut()
+                .context("original held connection lost; no reconnect")?;
+            self.source.validate_native()?;
+            client.cancellation = cancellation;
+            client.sequence = client
+                .sequence
+                .checked_add(1)
+                .context("held sequence exhausted")?;
+            let sequence = client.sequence;
+            self.source.retain_action_point(point);
+            let packet = self
+                .source
+                .held_packet("HOLD_MOVE", sequence, &self.handle, point)?;
+            let reply = client.request_until(&packet, deadline)?;
+            ensure!(
+                reply["ok"] == true
+                    && reply["phase"] == "held_moved"
+                    && reply["handle"] == self.handle
+                    && reply["sequence"].as_u64() == Some(sequence),
+                "held motion not acknowledged: {reply}"
+            );
+            Ok(())
+        })();
+        if let Err(error) = result {
+            // Closing this exact channel revokes only its original lane/device.
+            // There is no retry/another RELEASE after an unconfirmed wire phase.
+            *status = HeldStatus::Quarantined;
+            *slot = None;
+            return Err(unknown_dispatch(error, 1));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn drag_to(
+        &self,
+        owner: &str,
+        binding: &cua_driver_core::capture_runtime::CaptureBinding,
+        from: (f64, f64),
+        to: (f64, f64),
+        duration: Duration,
+        steps: usize,
+        cancellation: ActionCancellation,
+    ) -> Result<()> {
+        self.authorize(owner, binding)?;
+        let started = Instant::now();
+        let deadline = started + duration + TIMEOUT;
+        let gesture = lock_phase_until(&self.gesture, &cancellation, deadline)
+            .map_err(|error| unknown_dispatch(error, 1))?;
+        let result = (|| {
+            for i in 1..=steps {
+                let t = i as f64 / steps as f64;
+                let due = started + duration.mul_f64(t);
+                while Instant::now() < due {
+                    cancellation.check()?;
+                    std::thread::sleep(
+                        due.saturating_duration_since(Instant::now())
+                            .min(CANCELLATION_POLL),
+                    );
+                }
+                self.move_to_until(
+                    owner,
+                    binding,
+                    (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t),
+                    cancellation.clone(),
+                    deadline,
+                )?;
+            }
+            Ok(())
+        })();
+        drop(gesture);
+        if let Err(error) = result {
+            let _cleanup = self.release(owner, binding);
+            return Err(unknown_dispatch(error, 1));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release(
+        &self,
+        owner: &str,
+        binding: &cua_driver_core::capture_runtime::CaptureBinding,
+    ) -> Result<bool> {
+        self.authorize(owner, binding)?;
+        let cancellation = ActionCancellation::default();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let _gesture = lock_phase_until(&self.gesture, &cancellation, deadline)
+            .map_err(|e| unknown_dispatch(e, 1))?;
+        let mut status = lock_phase_until(&self.status, &cancellation, deadline)
+            .map_err(|error| unknown_dispatch(error, 1))?;
+        if let HeldStatus::Released(aborted) = *status {
+            return Ok(aborted);
+        }
+        if *status != HeldStatus::Active {
+            return Err(unknown_dispatch(anyhow::anyhow!("held_cleanup_unconfirmed: original device quarantined; no duplicate release/reconnect"), 1));
+        }
+        let mut slot = lock_phase_until(&self.connection.client, &cancellation, deadline)
+            .map_err(|error| unknown_dispatch(error, 1))?;
+        let result = (|| {
+            let client = slot
+                .as_mut()
+                .context("held_cleanup_unconfirmed: original channel lost")?;
+            client.cancellation = cancellation;
+            client.owned_cleanup = true;
+            client.sequence = client
+                .sequence
+                .checked_add(1)
+                .context("held sequence exhausted")?;
+            let sequence = client.sequence;
+            let reply = client.request_until(
+                &format!("HOLD_RELEASE {sequence} {}", self.handle),
+                deadline,
+            );
+            client.owned_cleanup = false;
+            let reply = reply?;
+            ensure!(
+                reply["ok"] == true
+                    && reply["cleanup_confirmed"] == true
+                    && reply["handle"] == self.handle
+                    && reply["sequence"].as_u64() == Some(sequence),
+                "held_cleanup_unconfirmed: {reply}"
+            );
+            Ok(reply["effect"] == "partial")
+        })();
+        match result {
+            Ok(aborted) => {
+                *status = HeldStatus::Released(aborted);
+                Ok(aborted)
+            }
+            Err(error) => {
+                *status = HeldStatus::Quarantined;
+                *slot = None;
+                Err(unknown_dispatch(error, 1))
+            }
+        }
+    }
+}
+
+impl Drop for HeldHandle {
+    fn drop(&mut self) {
+        // An async caller can disappear after BEGIN's ACK but before installing
+        // its public hold. The last owner still performs bounded exact cleanup.
+        let _ = self.release(&self.source.owner, &self.source.binding);
+        if let Ok(mut slot) = self.connection.client.try_lock() {
+            if !matches!(
+                *self.status.get_mut().unwrap_or_else(|p| p.into_inner()),
+                HeldStatus::Released(_)
+            ) {
+                *slot = None;
+            }
+        }
+    }
+}
+
 pub(crate) fn prepare_window_source(
     owner: Option<String>,
     target: (u32, u64),
@@ -1290,8 +1731,8 @@ pub(crate) fn prepare_window_source(
     }
     frame.validate_current()?;
     let local = super::hyprland::local_window_frame(pid, address)?;
-    let client = session_client(&owner)?;
-    let mut slot = client.lock(&cancellation)?;
+    let connection = session_client(&owner)?;
+    let mut slot = connection.lock(&cancellation)?;
     if let Some(client) = slot.as_ref() {
         if client.pid != pid
             || client.address != address
@@ -1352,6 +1793,7 @@ pub(crate) fn prepare_window_source(
         geometry: metadata.geometry,
         desktop_generation: metadata.desktop_generation,
         admission: Mutex::new(None),
+        connection: Some(connection.clone()),
         #[cfg(test)]
         native_validator: None,
     };
@@ -1768,8 +2210,8 @@ fn terminal_connection_result(value: &Value) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    fn guarded_target() -> Value {
+pub(crate) mod tests {
+    pub(crate) fn guarded_target() -> Value {
         json!({"ok":true,"target":"11111111111111111111111111111111","revision":7,"width":100.0,"height":100.0,
             "route":"primary_foreground","source_guard_version":1,"source_identity":"22222222222222222222222222222222",
             "source_geometry":[2560.25,10.5,100.0,100.0,2562.25,12.5],"desktop_generation":3})
@@ -1821,8 +2263,325 @@ mod tests {
             geometry: metadata.geometry,
             desktop_generation: metadata.desktop_generation,
             admission: Mutex::new(None),
+            connection: None,
             native_validator: Some(|| Ok(())),
         })
+    }
+
+    pub(crate) struct GuardedToolInput {
+        pub source: Arc<WindowSource>,
+        client: Mutex<Client>,
+    }
+
+    fn held_fixture(capability: bool) -> (Arc<WindowSource>, socket2::Socket) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let (mut client, peer) = production_test_client();
+        client.owner = format!("held-fixture-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+        client.held_phase_supported = capability;
+        client.delivery_route = Some(DeliveryRoute::Foreground);
+        let mut source = fixture_window_source(&client);
+        Arc::get_mut(&mut source).unwrap().connection = Some(Arc::new(SessionClient {
+            client: Mutex::new(Some(client)),
+        }));
+        (source, peer)
+    }
+
+    fn serve_held_begin(peer: &socket2::Socket) {
+        assert!(read_packet(peer).starts_with("FOREGROUND_TARGET "));
+        peer.send(guarded_target().to_string().as_bytes()).unwrap();
+        let begin = read_packet(peer);
+        assert!(begin.starts_with("HOLD_BEGIN 1 11111111111111111111111111111111 7 22222222222222222222222222222222 3 2560.25 10.5 100 100 2562.25 12.5 10.25 10.25 272"), "{begin}");
+        peer.send(json!({"ok":true,"phase":"held_started","handle":"55555555555555555555555555555555","sequence":1}).to_string().as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn held_missing_capability_and_cancelled_queue_send_no_target_or_press() {
+        let (source, peer) = held_fixture(false);
+        let error = begin_held_source(
+            source.clone(),
+            (10.25, 10.25),
+            1,
+            true,
+            ActionCancellation::default(),
+        )
+        .unwrap_err();
+        assert!(error.is::<WindowSourceRefusal>());
+        assert!(error.to_string().contains("held_phase_version=1"));
+        let mut byte = [0u8];
+        assert_eq!(
+            unsafe {
+                libc::recv(
+                    peer.as_raw_fd(),
+                    byte.as_mut_ptr().cast(),
+                    1,
+                    libc::MSG_DONTWAIT,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        let (source, peer) = held_fixture(true);
+        let connection = source.connection.clone().unwrap();
+        let lock = connection.client.lock().unwrap();
+        let (cancel_guard, cancellation) = ActionCancellation::invocation();
+        let queued = std::thread::spawn(move || {
+            begin_held_source(source, (10.25, 10.25), 1, true, cancellation)
+        });
+        drop(cancel_guard);
+        drop(lock);
+        assert!(queued.join().unwrap().unwrap_err().is::<ActionCancelled>());
+        assert_eq!(
+            unsafe {
+                libc::recv(
+                    peer.as_raw_fd(),
+                    byte.as_mut_ptr().cast(),
+                    1,
+                    libc::MSG_DONTWAIT,
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn held_begin_changed_root_geometry_or_generation_has_zero_press_packets() {
+        for change in ["root", "origin", "revision", "generation"] {
+            let (source, peer) = held_fixture(true);
+            let server = std::thread::spawn(move || {
+                assert!(read_packet(&peer).starts_with("FOREGROUND_TARGET "));
+                let mut target = guarded_target();
+                match change {
+                    "root" => target["source_identity"] = json!("66666666666666666666666666666666"),
+                    "origin" => target["source_geometry"][0] = json!(2561.25),
+                    "revision" => target["revision"] = json!(8),
+                    _ => target["desktop_generation"] = json!(4),
+                }
+                peer.send(target.to_string().as_bytes()).unwrap();
+                let mut bytes = [0u8; 512];
+                assert_eq!(
+                    unsafe {
+                        libc::recv(peer.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len(), 0)
+                    },
+                    0
+                );
+            });
+            let error = begin_held_source(
+                source.clone(),
+                (10.25, 10.25),
+                1,
+                true,
+                ActionCancellation::default(),
+            )
+            .unwrap_err();
+            assert!(error.is::<WindowSourceRefusal>());
+            *source.connection.as_ref().unwrap().client.lock().unwrap() = None;
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn held_owner_generation_motion_and_owned_release_keep_original_connection_and_witness() {
+        let (source, peer) = held_fixture(true);
+        let server = std::thread::spawn(move || {
+            serve_held_begin(&peer);
+            let motion = read_packet(&peer);
+            assert!(motion.starts_with("HOLD_MOVE 2 55555555555555555555555555555555 7 22222222222222222222222222222222 3 2560.25 10.5 100 100 2562.25 12.5 20.5 30.75"),"{motion}");
+            peer.send(json!({"ok":true,"phase":"held_moved","handle":"55555555555555555555555555555555","sequence":2}).to_string().as_bytes()).unwrap();
+            assert_eq!(
+                read_packet(&peer),
+                "HOLD_RELEASE 3 55555555555555555555555555555555"
+            );
+            peer.send(json!({"ok":true,"effect":"partial","cleanup_confirmed":true,"handle":"55555555555555555555555555555555","sequence":3}).to_string().as_bytes()).unwrap();
+            let mut bytes = [0u8; 128];
+            assert_eq!(
+                unsafe { libc::recv(peer.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len(), 0) },
+                0,
+                "no duplicate release"
+            );
+        });
+        let handle = begin_held_source(
+            source.clone(),
+            (10.25, 10.25),
+            1,
+            true,
+            ActionCancellation::default(),
+        )
+        .unwrap();
+        assert!(handle.authorize("foreign-actor", &source.binding).is_err());
+        let successor = cua_driver_core::capture_runtime::CaptureBinding::new(
+            source.binding.runtime_generation(),
+            source.binding.session_id(),
+            source.binding.session_generation() + 1,
+        )
+        .unwrap();
+        assert!(handle.authorize(&source.owner, &successor).is_err());
+        assert!(handle.authorize_route(false).is_err());
+        handle
+            .drag_to(
+                &source.owner,
+                &source.binding,
+                (10.25, 10.25),
+                (20.5, 30.75),
+                Duration::ZERO,
+                1,
+                ActionCancellation::default(),
+            )
+            .unwrap();
+        // The server has already revoked source authority, but the original
+        // handle still acknowledges coordinate-free owned release as partial.
+        assert!(handle.release(&source.owner, &source.binding).unwrap());
+        assert!(handle.release(&source.owner, &source.binding).unwrap());
+        drop(handle);
+        *source.connection.as_ref().unwrap().client.lock().unwrap() = None;
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn held_dropped_release_ack_quarantines_without_duplicate_release_or_reconnect() {
+        let (source, peer) = held_fixture(true);
+        let server = std::thread::spawn(move || {
+            serve_held_begin(&peer);
+            assert_eq!(
+                read_packet(&peer),
+                "HOLD_RELEASE 2 55555555555555555555555555555555"
+            );
+            // Keep the original channel open but drop ACK. Driver must close it
+            // after its independent release budget, not send another command.
+            let mut bytes = [0u8; 128];
+            assert_eq!(
+                unsafe { libc::recv(peer.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len(), 0) },
+                0
+            );
+        });
+        let handle = begin_held_source(
+            source.clone(),
+            (10.25, 10.25),
+            1,
+            true,
+            ActionCancellation::default(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        assert!(handle
+            .release(&source.owner, &source.binding)
+            .unwrap_err()
+            .is::<DispatchUnknown>());
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(handle.release(&source.owner, &source.binding).is_err());
+        assert!(source
+            .connection
+            .as_ref()
+            .unwrap()
+            .client
+            .lock()
+            .unwrap()
+            .is_none());
+        drop(handle);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn held_wire_deadline_expiry_sends_no_packet_even_when_peer_is_immediately_writable() {
+        let (source, peer) = held_fixture(true);
+        let connection = source.connection.as_ref().unwrap();
+        let slot = connection.client.lock().unwrap();
+        let client = slot.as_ref().unwrap();
+        assert!(client
+            .send_packet("HOLD_BEGIN expired", Instant::now())
+            .is_err());
+        let mut byte = [0u8];
+        assert_eq!(
+            unsafe {
+                libc::recv(
+                    peer.as_raw_fd(),
+                    byte.as_mut_ptr().cast(),
+                    1,
+                    libc::MSG_DONTWAIT,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn held_malformed_successful_begin_ack_closes_original_channel_without_replay() {
+        for reply in [
+            json!({"ok":true,"phase":"wrong_phase","sequence":1,"handle":"55555555555555555555555555555555"}),
+            json!({"ok":true,"phase":"held_started","sequence":2,"handle":"55555555555555555555555555555555"}),
+            json!({"ok":true,"phase":"held_started","sequence":1,"handle":"malformed"}),
+        ] {
+            let (source, peer) = held_fixture(true);
+            let server = std::thread::spawn(move || {
+                assert!(read_packet(&peer).starts_with("FOREGROUND_TARGET "));
+                peer.send(guarded_target().to_string().as_bytes()).unwrap();
+                assert!(read_packet(&peer).starts_with("HOLD_BEGIN "));
+                peer.send(reply.to_string().as_bytes()).unwrap();
+                let mut bytes = [0u8; 128];
+                assert_eq!(
+                    unsafe {
+                        libc::recv(peer.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len(), 0)
+                    },
+                    0
+                );
+            });
+            let error = begin_held_source(
+                source.clone(),
+                (10.25, 10.25),
+                1,
+                true,
+                ActionCancellation::default(),
+            )
+            .unwrap_err();
+            assert!(error.is::<DispatchUnknown>());
+            assert!(source
+                .connection
+                .as_ref()
+                .unwrap()
+                .client
+                .lock()
+                .unwrap()
+                .is_none());
+            server.join().unwrap();
+        }
+    }
+    impl GuardedToolInput {
+        pub(crate) fn new() -> (Arc<Self>, socket2::Socket) {
+            let (client, peer) = production_test_client();
+            let source = fixture_window_source(&client);
+            (
+                Arc::new(Self {
+                    source,
+                    client: Mutex::new(client),
+                }),
+                peer,
+            )
+        }
+        pub(crate) fn dispatch(&self, action: Action) -> Result<Value> {
+            with_window_source(Some(self.source.clone()), || {
+                self.client.lock().unwrap().execute_routed_with_attest(
+                    action,
+                    None,
+                    DeliveryRoute::Background,
+                    |_| Ok(()),
+                )
+            })
+        }
+        pub(crate) fn close(&self) {
+            self.client
+                .lock()
+                .unwrap()
+                .socket
+                .shutdown(std::net::Shutdown::Both)
+                .unwrap();
+        }
     }
 
     #[test]
@@ -3338,6 +4097,8 @@ mod tests {
                 protocol: InputProtocol::Experiment,
                 foreground_supported: false,
                 source_guard_supported: false,
+                held_phase_supported: false,
+                owned_cleanup: false,
                 delivery_route: None,
                 lane: None,
                 owner: "input-unregistered-test-client".into(),

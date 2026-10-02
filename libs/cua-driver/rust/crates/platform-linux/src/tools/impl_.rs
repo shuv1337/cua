@@ -293,6 +293,11 @@ impl<T: Tool> Tool for NativePointerOutcomeTool<T> {
     }
     async fn invoke(&self, args: Value) -> ToolResult {
         let tool = self.0.def().name.as_str();
+        if tool == "mouse_drag" {
+            // Cross-call motion uses the press-owned handle/source. Preparing
+            // a new TARGET here would revoke or reinterpret the held operation.
+            return native_pointer_outcome(self.0.invoke(args).await);
+        }
         if coordinate_free_semantic(tool, &args) {
             if args.get("capture_id").is_some_and(|value| !value.is_null()) {
                 return ToolResult::error(
@@ -336,12 +341,10 @@ impl<T: Tool> Tool for NativePointerOutcomeTool<T> {
         // Native held-device and AT-SPI action routes cannot atomically apply
         // the retained plugin root grant. Refuse before any focus/input; never
         // silently replace a semantic action with synthetic foreground input.
-        if matches!(
-            tool,
-            "mouse_button_down" | "mouse_drag" | "move_cursor" | "set_value"
-        ) || args
-            .get("element_token")
-            .is_some_and(|value| !value.is_null())
+        if matches!(tool, "move_cursor" | "set_value")
+            || args
+                .get("element_token")
+                .is_some_and(|value| !value.is_null())
         {
             if !required {
                 return native_pointer_outcome(self.0.invoke(args).await);
@@ -549,6 +552,7 @@ pub struct MouseHoldState {
     pub button: u8,
     pub x: f64,
     pub y: f64,
+    pub(crate) guarded: Option<Arc<crate::wayland::hyprland_input::HeldHandle>>,
 }
 
 impl ToolState {
@@ -3108,6 +3112,14 @@ async fn desktop_to_window_local_for(
     let args = args.clone();
     let source = window_action_source();
     tokio::task::spawn_blocking(move || {
+        if let Some(source) = &source {
+            anyhow::ensure!(
+                source.pid == pid && source.address == xid,
+                "window_source_changed: nested target differs from original source"
+            );
+            source.validate_native()?;
+            return source.translate(x, y);
+        }
         if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
             if let Some(source) = &source {
                 anyhow::ensure!(
@@ -4677,6 +4689,10 @@ fn linux_input_error(error: anyhow::Error) -> ToolResult {
 }
 
 fn isolated_hyprland_background(delivery: crate::input::delivery::DeliveryMode) -> bool {
+    #[cfg(test)]
+    if TEST_CLICK_BACKEND.try_with(|_| ()).is_ok() {
+        return !delivery.is_foreground();
+    }
     !delivery.is_foreground() && crate::wayland::hyprland_input::enabled()
 }
 
@@ -5483,6 +5499,13 @@ async fn isolated_hyprland_action(
     xid: u64,
     action: crate::wayland::hyprland_input::Action,
 ) -> ToolResult {
+    #[cfg(test)]
+    if let Ok(backend) = TEST_CLICK_BACKEND.try_with(Arc::clone) {
+        return match tokio::task::spawn_blocking(move || backend.input.dispatch(action)).await {
+            Ok(result) => isolated_hyprland_result(result),
+            Err(error) => isolated_hyprland_task_error(error, false),
+        };
+    }
     let owner = named_session_cursor_key(args);
     let (_cancellation, dispatch) = match spawn_isolated_hyprland(args, move |cancellation| {
         crate::wayland::hyprland_input::execute(owner, pid, xid, action, cancellation)
@@ -5887,6 +5910,7 @@ fn coordinate_less_mouse_button_up_survives_snapshot_replacement() {
         button: 1,
         x: 120.0,
         y: 80.0,
+        guarded: None,
     };
     state.snapshots.publish_for_session(
         hold.pid as i32,
@@ -5959,6 +5983,7 @@ fn session_end_releases_only_its_hold_before_discarding_state() {
         button: 1,
         x: 10.0,
         y: 20.0,
+        guarded: None,
     };
     let other_hold = MouseHoldState {
         pid: 43,
@@ -5966,6 +5991,7 @@ fn session_end_releases_only_its_hold_before_discarding_state() {
         button: 3,
         x: 30.0,
         y: 40.0,
+        guarded: None,
     };
     {
         let mut holds = state.mouse_hold.lock().unwrap();
@@ -6002,6 +6028,7 @@ fn failed_session_end_release_remains_retryable_and_bounded() {
         button: 1,
         x: 10.0,
         y: 20.0,
+        guarded: None,
     };
     state
         .mouse_hold
@@ -6949,6 +6976,145 @@ fn inject_terminal_input(pid: u32, xid: u64, text: &str) -> anyhow::Result<bool>
 
 pub struct ClickTool {
     state: Arc<ToolState>,
+}
+
+#[cfg(test)]
+struct TestClickBackend {
+    input: Arc<crate::wayland::hyprland_input::tests::GuardedToolInput>,
+    semantic_calls: std::sync::atomic::AtomicUsize,
+    point: std::sync::Mutex<Option<(f64, f64)>>,
+    arrived: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+#[cfg(test)]
+tokio::task_local! { static TEST_CLICK_BACKEND: Arc<TestClickBackend>; }
+
+async fn reveal_click_pointer(
+    state: &ToolState,
+    cursor: &str,
+    xid: u64,
+    point: Option<(f64, f64)>,
+) {
+    #[cfg(test)]
+    if let Ok(backend) = TEST_CLICK_BACKEND.try_with(Arc::clone) {
+        *backend.point.lock().unwrap() = point;
+        backend.arrived.notify_one();
+        backend.resume.notified().await;
+        return;
+    }
+    crate::overlay::send_command_for(
+        cursor.to_owned(),
+        cursor_overlay::OverlayCommand::PinAbove(xid),
+    );
+    if let Some((x, y)) = point {
+        reveal_pointer_action_for(state, cursor, x, y, true).await;
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn actual_click_invoke_paused_overlay_stale_root_origin_revision_never_escapes_to_semantics()
+{
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for change in ["root", "origin", "revision", "unsupported", "unchanged"] {
+        let (input, peer) = crate::wayland::hyprland_input::tests::GuardedToolInput::new();
+        let backend = Arc::new(TestClickBackend {
+            input: input.clone(),
+            semantic_calls: AtomicUsize::new(0),
+            point: std::sync::Mutex::new(None),
+            arrived: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        let packets = Arc::new(AtomicUsize::new(0));
+        let server_packets = packets.clone();
+        let changed = Arc::new(AtomicUsize::new(0));
+        let server_changed = changed.clone();
+        let server = std::thread::spawn(move || {
+            let receive = || {
+                let mut bytes = [0u8; 4096];
+                let n = unsafe {
+                    libc::recv(peer.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len(), 0)
+                };
+                assert!(n >= 0);
+                String::from_utf8(bytes[..n as usize].to_vec()).unwrap()
+            };
+            assert!(receive().starts_with("TARGET "));
+            assert_eq!(
+                server_changed.load(Ordering::SeqCst),
+                1,
+                "the production tool must pause before dispatch"
+            );
+            let mut target = crate::wayland::hyprland_input::tests::guarded_target();
+            target["route"] = json!("independent");
+            match change {
+                "root" => target["source_identity"] = json!("44444444444444444444444444444444"),
+                "origin" => target["source_geometry"][0] = json!(2561.25),
+                "revision" => target["revision"] = json!(8),
+                "unsupported" => {
+                    target = json!({"ok":false,"code":"unsupported","detail":"semantic-only policy; raw input unavailable"})
+                }
+                _ => {}
+            }
+            peer.send(target.to_string().as_bytes()).unwrap();
+            let action = receive();
+            if change == "unchanged" {
+                assert!(
+                    action.starts_with("CLICK 1 11111111111111111111111111111111 7 10.25 10.25 ")
+                );
+                server_packets.fetch_add(1, Ordering::SeqCst);
+                peer.send(
+                    json!({"ok":true,"effect":"unverifiable","route":"synthetic_events"})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .unwrap();
+            } else {
+                assert!(
+                    action.is_empty(),
+                    "stale original source must send no action packet: {action}"
+                );
+            }
+        });
+        let args = json!({"pid":input.source.pid,"window_id":input.source.address,"coordinate_frame":"desktop","x":2570.5,"y":20.75});
+        let source = input.source.clone();
+        let worker_backend = backend.clone();
+        let task = tokio::spawn(async move {
+            TEST_CLICK_BACKEND
+                .scope(
+                    worker_backend,
+                    WINDOW_ACTION_SOURCE.scope(
+                        source,
+                        ClickTool {
+                            state: ToolState::new(),
+                        }
+                        .invoke(args),
+                    ),
+                )
+                .await
+        });
+        backend.arrived.notified().await;
+        assert_eq!(
+            *backend.point.lock().unwrap(),
+            Some((2570.5, 20.75)),
+            "original fractional overlay point on the second output"
+        );
+        changed.store(1, Ordering::SeqCst);
+        backend.resume.notify_one();
+        let result = task.await.unwrap();
+        assert_eq!(
+            backend.semantic_calls.load(Ordering::SeqCst),
+            0,
+            "semantic oracle reports success if called, but must not be called"
+        );
+        assert_eq!(result.is_error == Some(true), change != "unchanged");
+        input.close();
+        server.join().unwrap();
+        assert_eq!(
+            packets.load(Ordering::SeqCst),
+            usize::from(change == "unchanged")
+        );
+    }
 }
 
 fn capture_admission_error(error: anyhow::Error) -> ToolResult {
@@ -8066,10 +8232,6 @@ impl Tool for ClickTool {
             }
         }
 
-        crate::overlay::send_command_for(
-            cursor_id.clone(),
-            cursor_overlay::OverlayCommand::PinAbove(xid),
-        );
         // Resolve the screen point the cursor glides to. Tool coordinates are
         // always window-local screenshot pixels; native Wayland translates
         // through compositor/AT-SPI geometry while X11 uses XTranslateCoordinates.
@@ -8098,9 +8260,7 @@ impl Tool for ClickTool {
                 .ok()
                 .and_then(|r| r.ok())
         };
-        if let Some((sx, sy)) = glide_target {
-            reveal_pointer_action_for(&self.state, &cursor_id, sx, sy, true).await;
-        }
+        reveal_click_pointer(&self.state, &cursor_id, xid, glide_target).await;
 
         let (xi, yi) = (x as i32, y as i32);
         let pixel_screen_point =
@@ -8133,6 +8293,13 @@ impl Tool for ClickTool {
                 );
             }
             if retained_source.is_none() && button == 1 && count == 1 {
+                #[cfg(test)]
+                if let Ok(backend) = TEST_CLICK_BACKEND.try_with(Arc::clone) {
+                    backend
+                        .semantic_calls
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return ToolResult::text("semantic oracle would succeed");
+                }
                 let semantic = tokio::task::spawn_blocking(move || {
                     crate::atspi::perform_action_at_screen_point(pid, xid, output_x, output_y)
                 })
@@ -12004,6 +12171,8 @@ impl Tool for DragTool {
                 "to_y":{"type":"number","description":"Drag end Y (same frame as from_x)."},
                 "duration_ms":{"type":"integer","minimum":0,"maximum":10000,"description":"Total drag duration. Default: 500."},
                 "steps":{"type":"integer","minimum":1,"maximum":200,"description":"Intermediate MotionNotify events. Default: 20."},
+                "coordinate_frame": coordinate_frame_schema(),
+                "delivery_mode": crate::input::delivery::delivery_mode_schema(),
                 "modifier": cua_driver_core::tool_schema::modifier_schema(),
                 "button": cua_driver_core::tool_schema::button_schema(),
                 "from_zoom":{"type":"boolean","description":"Set true after a zoom call to auto-translate zoom-image pixel coordinates back to full-window space."},
@@ -12758,6 +12927,8 @@ impl Tool for MouseButtonDownTool {
                 "y":{"type":"number","description":"Window-local pixel Y of the target window's own get_window_state screenshot (0..screenshot_height); see x."},
                 "coordinate_frame": coordinate_frame_schema(),
                 "button": cua_driver_core::tool_schema::button_schema(),
+                "delivery_mode": crate::input::delivery::delivery_mode_schema(),
+                "capture_id":{"type":"string","description":"Bind the press to the original desktop capture. Held phases retain this admission."},
                 "from_zoom":{"type":"boolean","description":"Set true after a zoom call to auto-translate zoom-image pixel coordinates back to full-window space."}
             },"additionalProperties":false}),
             read_only: false, destructive: true, idempotent: false, open_world: true,
@@ -12793,6 +12964,32 @@ impl Tool for MouseButtonDownTool {
         let mut x = args.f64_or("x", 0.0);
         let mut y = args.f64_or("y", 0.0);
         let desktop_frame = desktop_frame_requested(&args);
+        let held_source = window_action_source();
+        if desktop_frame {
+            if let Some(source) = &held_source {
+                let id = args
+                    .opt_str("capture_id")
+                    .or_else(|| args.opt_str("_native_desktop_observation"));
+                if let Some(id) = id {
+                    let raw = args
+                        .get("_native_desktop_original_coordinates")
+                        .unwrap_or(&args);
+                    let px = raw.get("x").and_then(Value::as_f64).unwrap_or(x);
+                    let py = raw.get("y").and_then(Value::as_f64).unwrap_or(y);
+                    match crate::capture_action_frame::admit_desktop_click_in_frame(
+                        &self.state.capture_service,
+                        &args,
+                        &id,
+                        px,
+                        py,
+                        &source.frame,
+                    ) {
+                        Ok(point) => (x, y) = point,
+                        Err(error) => return capture_admission_error(error),
+                    }
+                }
+            }
+        }
         if desktop_frame {
             // Desktop pixels: no zoom/screenshot scaling; translated once below.
         } else if args.bool_or("from_zoom", false) {
@@ -12827,6 +13024,52 @@ impl Tool for MouseButtonDownTool {
             }
         }
 
+        if let Some(source) = held_source {
+            let (sx, sy) = source.layout_point((x, y));
+            reveal_pointer_action_for(&self.state, &cursor_id, sx, sy, true).await;
+            let foreground = crate::input::delivery::DeliveryMode::from_args(&args).is_foreground();
+            let (_cancellation, dispatch) =
+                match spawn_isolated_hyprland(&args, move |cancellation| {
+                    crate::wayland::hyprland_input::begin_held_source(
+                        source,
+                        (x, y),
+                        button,
+                        foreground,
+                        cancellation,
+                    )
+                }) {
+                    Ok(dispatch) => dispatch,
+                    Err(refusal) => return refusal,
+                };
+            let guarded = match dispatch.await {
+                Ok(Ok(handle)) => handle,
+                Ok(Err(error)) => return isolated_hyprland_result(Err(error)),
+                Err(error) => return isolated_hyprland_task_error(error, false),
+            };
+            let hold = MouseHoldState {
+                pid,
+                xid,
+                button,
+                x,
+                y,
+                guarded: Some(guarded),
+            };
+            self.state
+                .mouse_hold
+                .lock()
+                .unwrap()
+                .insert(cursor_id.clone(), hold.clone());
+            self.state
+                .cursor_registry
+                .update_position(&cursor_id, sx, sy);
+            overlay_snap_to_for(&cursor_id, sx, sy, None);
+            crate::overlay::send_command_for(
+                cursor_id.clone(),
+                cursor_overlay::OverlayCommand::SetPressed(true),
+            );
+            return ToolResult::text("Mouse button held.")
+                .with_structured(mouse_hold_json(&cursor_id, Some(&hold)));
+        }
         crate::overlay::send_command_for(
             cursor_id.clone(),
             cursor_overlay::OverlayCommand::PinAbove(xid),
@@ -12872,6 +13115,7 @@ impl Tool for MouseButtonDownTool {
                     button,
                     x,
                     y,
+                    guarded: None,
                 };
                 self.state
                     .mouse_hold
@@ -12962,8 +13206,88 @@ impl Tool for MouseDragTool {
         if let Some(refusal) = require_point_args("mouse_drag", &args) {
             return refusal;
         }
+        if hold.guarded.is_none() && desktop_frame_requested(&args) {
+            return window_source_refusal("desktop-derived held motion requires the original source retained by mouse_button_down");
+        }
         let mut to_x = args.f64_or("x", 0.0);
         let mut to_y = args.f64_or("y", 0.0);
+        if let Some(guarded) = hold.guarded.clone() {
+            let Some(owner) = named_session_cursor_key(&args) else {
+                return window_source_refusal(
+                    "held_owner_mismatch: authenticated original owner required",
+                );
+            };
+            let binding = match self.state.capture_service.binding_from_args(&args) {
+                Ok(b) => b,
+                Err(e) => return window_source_refusal(e),
+            };
+            if let Err(e) = guarded.authorize(&owner, &binding) {
+                return window_source_refusal(e);
+            }
+            if args.get("delivery_mode").is_some() {
+                if let Err(e) = guarded.authorize_route(
+                    crate::input::delivery::DeliveryMode::from_args(&args).is_foreground(),
+                ) {
+                    return window_source_refusal(e);
+                }
+            }
+            if args.bool_or("from_zoom", false) || args.get("capture_id").is_some() {
+                return window_source_refusal(
+                    "held motion retains its original frame; no zoom or new capture admission",
+                );
+            }
+            if desktop_frame_requested(&args) {
+                if let Some(admission) = guarded.source.admission() {
+                    if admission.target
+                        != cua_driver_core::capture_runtime::CaptureTarget::PrimaryDesktop
+                        || to_x < 0.0
+                        || to_y < 0.0
+                        || to_x >= f64::from(admission.encoded_dimensions.width())
+                        || to_y >= f64::from(admission.encoded_dimensions.height())
+                    {
+                        return window_source_refusal("held point outside original admitted image");
+                    }
+                    (to_x, to_y) = admission.screenshot_to_action.apply(to_x, to_y);
+                }
+                match guarded.source.translate(to_x, to_y) {
+                    Ok(p) => (to_x, to_y) = p,
+                    Err(e) => return window_source_refusal(e),
+                }
+            }
+            let from = (hold.x, hold.y);
+            let to = (to_x, to_y);
+            let duration = std::time::Duration::from_millis(args.u64_or("duration_ms", 500));
+            let steps = args.u64_or("steps", 20).clamp(1, 200) as usize;
+            let (sx, sy) = guarded.source.layout_point(from);
+            reveal_pointer_action_for(&self.state, &cursor_id, sx, sy, true).await;
+            let retained = guarded.clone();
+            let (_cancellation, dispatch) =
+                match spawn_isolated_hyprland(&args, move |cancellation| {
+                    retained.drag_to(&owner, &binding, from, to, duration, steps, cancellation)
+                }) {
+                    Ok(d) => d,
+                    Err(e) => return e,
+                };
+            match dispatch.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return isolated_hyprland_result(Err(error)),
+                Err(error) => return isolated_hyprland_task_error(error, true),
+            }
+            hold.x = to_x;
+            hold.y = to_y;
+            self.state
+                .mouse_hold
+                .lock()
+                .unwrap()
+                .insert(cursor_id.clone(), hold.clone());
+            let (sx, sy) = guarded.source.layout_point(to);
+            self.state
+                .cursor_registry
+                .update_position(&cursor_id, sx, sy);
+            overlay_snap_to_for(&cursor_id, sx, sy, None);
+            return ToolResult::text("Moved the held pointer.")
+                .with_structured(mouse_hold_json(&cursor_id, Some(&hold)));
+        }
         if args.bool_or("from_zoom", false) {
             match self.state.zoom_context(&args, hold.pid, Some(hold.xid)) {
                 Ok(ctx) => {
@@ -13170,6 +13494,37 @@ impl Tool for MouseButtonUpTool {
 
         let xid = hold.xid;
         let pid = hold.pid;
+
+        if let Some(guarded) = hold.guarded.clone() {
+            let Some(owner) = named_session_cursor_key(&args) else {
+                return window_source_refusal("held_owner_mismatch: original lifecycle required");
+            };
+            let binding = match self.state.capture_service.binding_from_args(&args) {
+                Ok(b) => b,
+                Err(e) => return window_source_refusal(e),
+            };
+            if let Err(e) = guarded.authorize(&owner, &binding) {
+                return window_source_refusal(e);
+            }
+            let result =
+                tokio::task::spawn_blocking(move || guarded.release(&owner, &binding)).await;
+            return match result {
+                Ok(Ok(aborted)) => {
+                    clear_mouse_hold_after_release(&self.state, &cursor_id);
+                    crate::overlay::send_command_for(
+                        cursor_id.clone(),
+                        cursor_overlay::OverlayCommand::SetPressed(false),
+                    );
+                    let mut outcome = mouse_hold_json(&cursor_id, None);
+                    outcome["cleanup_confirmed"] = json!(true);
+                    outcome["effect"] = json!(if aborted { "partial" } else { "unverifiable" });
+                    outcome["endpoint_motion"] = json!(false);
+                    ToolResult::text("Released the original held pointer.").with_structured(outcome)
+                }
+                Ok(Err(error)) => isolated_hyprland_result(Err(error)),
+                Err(error) => isolated_hyprland_task_error(error, true),
+            };
+        }
 
         if crate::wayland::is_wayland() {
             // Release cleanup never needs a current screenshot, live endpoint
@@ -14140,6 +14495,12 @@ impl Tool for GetDesktopStateTool {
             };
             let (png, shot_w, shot_h, scale_factor) =
                 normalize_desktop_capture_for_action_frame(native_png, screen_w, screen_h)?;
+            // Display DPI metadata is distinct from the image-to-action ratio.
+            // Native screencopy is normalized to logical pixels, but a 1.5x
+            // output still reports 1.5 here, as get_screen_size does.
+            let display_scale_factor = hyprland_frame
+                .as_ref()
+                .map_or(scale_factor, |frame| frame.scale);
             // Opt-in long-edge cap: the full-size capture is the desktop
             // action frame; a capped image is mapped back at dispatch
             // (cua_driver_core::desktop_capture_scale) and by its capture_id.
@@ -14195,7 +14556,7 @@ impl Tool for GetDesktopStateTool {
                 shot_h,
                 screen_w,
                 screen_h,
-                scale_factor,
+                display_scale_factor,
                 written,
                 windows,
                 capture_id,
@@ -16069,7 +16430,13 @@ pub fn build_registry_with_provider(
                         &state_for_session_end,
                         session_id,
                         |cursor_id, held| {
-                            crate::wayland::persistent_vptr::release(cursor_id, held.button)
+                            if let Some(guarded) = &held.guarded {
+                                guarded
+                                    .release(cursor_id, &guarded.source.binding)
+                                    .map(|_| ())
+                            } else {
+                                crate::wayland::persistent_vptr::release(cursor_id, held.button)
+                            }
                         },
                     )?;
                 } else {
@@ -16098,7 +16465,23 @@ pub fn build_registry_with_provider(
         let prefix = format!("__cua_runtime_{runtime_scope}:");
         let cursor_registry = state.cursor_registry.clone();
         let capture_service = state.capture_service.clone();
+        let held_state = state.clone();
         r.retain_runtime_cleanup(move || {
+            let owned: Vec<_> = held_state
+                .mouse_hold
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(owner, _)| owner.starts_with(&prefix))
+                .filter_map(|(owner, hold)| {
+                    hold.guarded.clone().map(|handle| (owner.clone(), handle))
+                })
+                .collect();
+            for (owner, handle) in owned {
+                if handle.release(&owner, &handle.source.binding).is_ok() {
+                    clear_mouse_hold_after_release(&held_state, &owner);
+                }
+            }
             crate::capture_action_frame::retire_runtime(&capture_service);
             crate::wayland::hyprland_input::cleanup_runtime(&prefix);
             for cursor in cursor_registry

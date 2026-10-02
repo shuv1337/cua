@@ -13,7 +13,7 @@ The cursor conflicts retain main's `matches!` style and the shared placement
 predicate. Main's floating-point native cursor readback replaces the duplicate
 integer readback introduced by the contribution.
 
-No public display selector, protocol expansion, background allowlist change,
+No public display selector, background allowlist change,
 monitor/plugin configuration, installation or publication is part of this work.
 The separately authored supplemental GTK acceptance tests are integrated intact;
 their native row remains explicitly ignored and is not run by implementation.
@@ -26,9 +26,10 @@ their native row remains explicitly ignored and is not run by implementation.
   native mode, independently resized to its rounded logical rectangle and placed
   at its frame offset. Two 3840×2160@1.5 outputs at `(0,0)` and `(2560,0)` produce
   **5120×1440**. A 2560×720 encoded image maps `(1920,360)` to `(3840,720)` once.
-- `get_screen_size.scale_factor` is compatibility output-DPI metadata (maximum
-  powered scale), not an input multiplier. `get_desktop_state.scale_factor` is
-  native-capture normalization; an already logical composite reports 1.
+- `get_screen_size.scale_factor` and `get_desktop_state.scale_factor` share
+  output-DPI metadata (maximum powered scale), not an input multiplier. The
+  image-to-action affine and `frame_scale` remain independent: a logical full
+  image has frame scale 1 even on 1.5x outputs; a 2560-wide cap has frame scale 2.
 - Standby outputs are absent from pixels but remain in absolute-pointer coverage.
   Non-mirror overlap and differently sized mirrors are refused. Rotations and
   reflections have a typed `unsupported_display_transform` refusal.

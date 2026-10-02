@@ -15,13 +15,21 @@ are not retried; possible effects are never replayed. Missing capability returns
 `window_source_guard_unavailable`. Installing or hotloading a module is not part
 of capability negotiation.
 
-Desktop-derived stateful native holds and coordinate-bearing semantic pointer
-fallbacks currently return that refusal: those adapters cannot apply a compositor root grant. They
-must not silently focus, synthesize a semantic substitute, or use current geometry
-to reinterpret an old point. Ordinary window-local input and coordinate-less
-release of an original owned device remain available. A generic desktop pointer
-has topology authority, not a window root grant. Userspace observation followed
-by generic native input is not compositor-atomic.
+Coordinate-bearing semantic pointer fallbacks cannot substitute for a guarded
+native phase. A generic desktop pointer has topology authority, not a window
+root grant. Userspace observation followed by generic native input is not
+compositor-atomic.
+
+`held_phase_version: 1` negotiates cross-call held-button phases. `HOLD_BEGIN`
+consumes the reconciled capability-8 grant and returns a connection-owned opaque
+handle. `HOLD_MOVE` carries the original root/client nonce, revision, fractional
+geometry and desktop generation; it never reacquires TARGET. `HOLD_RELEASE`
+is coordinate-free and remains available after invalidation for only the
+original resource set. The original five-second grant lease is not renewed.
+Source loss retires the handle irreversibly. Missing or malformed ACKs produce
+partial/unknown outcomes and quarantine the original connection; there is no
+reconnect, successor-resource cleanup, or replay. Cleanup confirmation means
+protocol delivery acknowledgement, not application processing proof.
 
 Coordinate-free plain element activation and `set_value` do not translate
 desktop pixels. They use the token's immutable AT-SPI unique owner/node/frame,

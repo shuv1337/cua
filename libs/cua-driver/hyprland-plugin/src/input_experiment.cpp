@@ -2,6 +2,7 @@
 // TARGET uses independent resources; FOREGROUND_TARGET explicitly uses the primary seat.
 #include "input_experiment.hpp"
 #include "drag_geometry.hpp"
+#include "held_phase.hpp"
 #include "input_grant.hpp"
 #include "input_client_deadline.hpp"
 #include "passive_pointer_target.hpp"
@@ -185,6 +186,16 @@ struct InputExperiment::Impl {
         Clock::time_point start;
         unsigned duration;
         DragGeometry geometry;
+        SourceWitness source;
+    };
+    struct Held {
+        Client* client;
+        HeldPhase phase;
+        WP<CWLSurfaceResource> root;
+        std::uint32_t button;
+        bool effects = false;
+        std::vector<SP<CWlPointer>> independent;
+        std::vector<WP<CWLPointerResource>> foreground;
     };
     int listener = -1;
     wl_event_source* listen_source = nullptr;
@@ -210,6 +221,7 @@ struct InputExperiment::Impl {
     Clock::time_point expires{};
     InputGrant grant;
     std::optional<Drag> drag;
+    std::optional<Held> held;
     std::uint32_t held_button = 0;
     std::vector<std::uint32_t> held_keys;
     xkb_context* xkb_context_ = nullptr;
@@ -543,6 +555,42 @@ struct InputExperiment::Impl {
         }
         return true;
     }
+    SourceWitness witness(const Client& c) const {
+        return {c.sourceIdentity, c.revision, desktop_generation, c.geometry};
+    }
+    bool packet_witness(const Client& c, const std::vector<std::string>& f) const {
+        if (f[4] != c.sourceIdentity || number(f[3]) != c.revision || number(f[5]) != desktop_generation) return false;
+        for (unsigned i = 0; i < 6; ++i) if (real(f[6 + i]) != c.geometry[i]) return false;
+        return !c.sourceIdentity.empty();
+    }
+    bool held_source(Client& c, const std::string& handle) {
+        return held && held->client == &c && refresh(c) &&
+            held->root == c.surface && held->phase.permits(reinterpret_cast<std::uintptr_t>(&c), handle, witness(c), Clock::now());
+    }
+    void cleanup_held() {
+        if (!held || held->phase.retired) return;
+        bool confirmed = true;
+        const auto root = held->root.lock();
+        // The captured proxy set is the device. Never discover new resources
+        // during cleanup and never release a button to a successor focus.
+        if (held_button) {
+            if (!root || !root->good()) confirmed = false;
+            else if (held->client->route == InputRoute::primary_foreground) {
+                if (g_pSeatManager->m_state.pointerFocus != root) confirmed = false;
+                else for (const auto& weak : held->foreground) {
+                    const auto p = weak.lock();
+                    if (!p || !p->good()) { confirmed = false; continue; }
+                    p->sendButton(event_ms(), held->button, WL_POINTER_BUTTON_STATE_RELEASED); p->sendFrame();
+                }
+            } else for (const auto& p : held->independent) {
+                if (!p || !p->resource()) { confirmed = false; continue; }
+                p->sendButton(serial(), event_ms(), held->button, WL_POINTER_BUTTON_STATE_RELEASED);
+                if (p->version() >= 5) p->sendFrame();
+            }
+        }
+        held_button = 0;
+        held->phase.retire(confirmed);
+    }
     bool primary_conflict(const Client& c) const {
         if (c.route == InputRoute::primary_foreground)
             return foreground_started && !foreground_activating && !foreground_guard(c).can_dispatch(foreground_needs_pointer);
@@ -662,9 +710,10 @@ struct InputExperiment::Impl {
         if (lease && trace && reason != "completed") trace->mark("agent_cancel", lane + 1);
         if (drag && drag->client && !drag->client->dead)
             send(*drag->client, failure.reason == ForegroundFailureReason::none ?
-                refusal(foreground_started ? "foreground_partial_unknown" : reason) :
-                refusal(foreground_started ? "foreground_partial_unknown" : reason, failure));
+                refusal(foreground_started ? "foreground_partial_unknown" : "drag_partial_unknown") :
+                refusal(foreground_started ? "foreground_partial_unknown" : "drag_partial_unknown", failure));
         drag.reset();
+        cleanup_held();
         finish_foreground();
         if (retain_pointer) release_pointer_button(); else leave_pointer();
         leave_keyboard(); retire_grant();
@@ -748,9 +797,10 @@ struct InputExperiment::Impl {
             }
             catch (...) {
                 const bool foreground_partial = c.foreground_attempted;
+                const bool held_partial = self.held && self.held->client == &c && self.held->effects;
                 const bool foreground_drag_reply = foreground_partial && self.drag && self.drag->client == &c;
                 if (kProduction && (self.lease == &c || self.reservation == &c)) self.revoke("invalid_request");
-                if (!foreground_drag_reply) self.send(c, refusal(foreground_partial ? "foreground_partial_unknown" : "invalid_request"));
+                if (!foreground_drag_reply) self.send(c, refusal(foreground_partial ? "foreground_partial_unknown" : held_partial ? "held_partial_unknown" : "invalid_request"));
             }
         }
         if (c.dead) {
@@ -1092,7 +1142,7 @@ struct InputExperiment::Impl {
             if (f.size() != 1 || c.hello) { send(c, refusal("invalid_request")); return; }
             c.hello = true;
             if (kProduction)
-                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"source_guard_version":1}})", epoch));
+                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"source_guard_version":1,"held_phase_version":1}})", epoch));
             else
                 send(c, std::format(R"({{"ok":true,"protocol":0,"epoch":"{}","challenge":"{}"}})", epoch, c.challenge));
             return;
@@ -1128,8 +1178,11 @@ struct InputExperiment::Impl {
         if (command == "APPROVE") { approve(c, f); return; }
 #endif
         if (reservation != &c) { send(c, refusal("lane_not_claimed")); return; }
+        if (kProduction && (command == "HOLD_BEGIN" || command == "HOLD_MOVE" || command == "HOLD_RELEASE")) {
+            held_request(c, f); return;
+        }
         if (command == "TARGET" || (kProduction && command == "FOREGROUND_TARGET")) {
-            if (drag) { send(c, refusal("invalid_request")); return; }
+            if (drag || held) { send(c, refusal("lease_busy")); return; }
             const auto route = command == "FOREGROUND_TARGET" ? InputRoute::primary_foreground : InputRoute::independent;
             if (!bind_input_route(c.route, route)) { invalidate(c); send(c, refusal("route_mismatch")); return; }
             if (f.size() != (kProduction ? 4u : 3u)) {
@@ -1267,7 +1320,7 @@ struct InputExperiment::Impl {
                 if (!pointer_enter(c, x, y)) { send(c, refusal("client_not_bound")); return; }
                 if (trace) trace->mark("agent_drag_start", lane + 1);
                 button(272, true);
-                drag.emplace(Drag{&c, x, y, x2, y2, Clock::now(), static_cast<unsigned>(duration), DragGeometry{c.revision}});
+                drag.emplace(Drag{&c, x, y, x2, y2, Clock::now(), static_cast<unsigned>(duration), DragGeometry{c.revision}, witness(c)});
                 send(c, R"({"ok":true,"phase":"started"})"); return;
             }
         }
@@ -1275,6 +1328,81 @@ struct InputExperiment::Impl {
         if (trace) trace->mark("agent_action_end", lane + 1);
         if (kProduction) complete_action();
         send(c, kDelivered);
+    }
+    void held_request(Client& c, const std::vector<std::string>& f) {
+        const auto& command = f[0];
+        const auto size = command == "HOLD_RELEASE" ? 3u : command == "HOLD_BEGIN" ? 15u : 14u;
+        if (f.size() != size) { send(c, refusal("invalid_request")); return; }
+        const auto sequence = number(f[1]);
+        if (sequence <= c.sequence) { send(c, refusal("replay")); return; }
+        c.sequence = sequence;
+        if (command == "HOLD_RELEASE") {
+            if (!held || !held->phase.owns(reinterpret_cast<std::uintptr_t>(&c), f[2])) {
+                send(c, refusal("held_owner_mismatch")); return;
+            }
+            const bool aborted = held->phase.retired;
+            cleanup_held();
+            const bool confirmed = held->phase.cleanup_confirmed;
+            // No coordinate/source/availability check may suppress owned cleanup.
+            finish_foreground(); leave_keyboard(); retire_grant();
+            send(c, std::format(R"({{"ok":{},"code":"{}","detail":"original held device cleanup","effect":"{}","handle":"{}","sequence":{},"cleanup_confirmed":{}}})",
+                confirmed, confirmed ? "held_released" : "held_cleanup_unconfirmed",
+                aborted || !confirmed ? "partial" : "unverifiable", held->phase.handle, sequence, confirmed));
+            held.reset(); return;
+        }
+        if (command == "HOLD_MOVE") {
+            if (!held || !held->phase.owns(reinterpret_cast<std::uintptr_t>(&c), f[2])) {
+                send(c, refusal("held_owner_mismatch")); return;
+            }
+            if (!held_source(c, f[2]) || !packet_witness(c, f) || !available() ||
+                !input_layout_qualified(c.route, false, layout_qualified()) || primary_conflict(c) || agent_conflict(c)) {
+                revoke("held_source_changed", true); send(c, refusal("held_partial_unknown")); return;
+            }
+            const auto x = real(f[12]), y = real(f[13]);
+            if (!point(c, x, y)) { revoke("invalid_request", true); send(c, refusal("held_partial_unknown")); return; }
+            if (c.route == InputRoute::primary_foreground) foreground_motion(c, x, y);
+            else {
+                const auto root = held->root.lock();
+                const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
+                if (!root || root->at(local, true).first != root || held->independent.empty()) {
+                    revoke("held_target_changed", true); send(c, refusal("held_partial_unknown")); return;
+                }
+                for (const auto& p : held->independent) if (!p || !p->resource()) {
+                    revoke("held_device_changed", true); send(c, refusal("held_partial_unknown")); return;
+                }
+                for (const auto& p : held->independent) {
+                    p->sendMotion(event_ms(), wl_fixed_from_double(local.x), wl_fixed_from_double(local.y));
+                    if (p->version() >= 5) p->sendFrame();
+                }
+            }
+            send(c, std::format(R"({{"ok":true,"phase":"held_moved","handle":"{}","sequence":{}}})", held->phase.handle, sequence)); return;
+        }
+        // BEGIN consumes one original-source reconciled finite drag grant. The
+        // new opaque handle never arms TARGET or substitutes a successor device.
+        if (held || drag) { send(c, refusal("lease_busy")); return; }
+        if (c.token.empty() || f[2] != c.token || !refresh(c) || !packet_witness(c, f)) {
+            send(c, refusal("stale_source")); return;
+        }
+        if (!available() || !input_layout_qualified(c.route, false, layout_qualified()) ||
+            primary_conflict(c) || agent_conflict(c) || lease != &c || !grant.permits(8, Clock::now())) {
+            send(c, refusal("action_not_admitted")); return;
+        }
+        const auto x = real(f[12]), y = real(f[13]); const auto code = number(f[14]);
+        if (!point(c, x, y) || code < 272 || code > 274) { send(c, refusal("invalid_request")); return; }
+        if (!consume_grant(c, 8)) return;
+        held.emplace(Held{&c, HeldPhase{reinterpret_cast<std::uintptr_t>(&c), nonce(), witness(c), expires}, c.surface, static_cast<std::uint32_t>(code), false, {}, {}});
+        held->effects = true; // activation/enter/motion are effects before press
+        if (c.route == InputRoute::primary_foreground) {
+            start_foreground(c, x, y, true, false, {});
+            held->foreground = foreground_pointers;
+        } else {
+            if (!pointer_enter(c, x, y)) { revoke("client_not_bound", true); send(c, refusal("held_partial_unknown")); return; }
+            for (const auto& p : pointers) if (!p->dead && p->wl->resource() && p->focus == c.surface) held->independent.push_back(p->wl);
+        }
+        if (!held_source(c, held->phase.handle)) { revoke("held_source_changed", true); send(c, refusal("held_partial_unknown")); return; }
+        if (c.route == InputRoute::primary_foreground) foreground_button(c, code, true);
+        else button(code, true);
+        send(c, std::format(R"({{"ok":true,"phase":"held_started","handle":"{}","sequence":{}}})", held->phase.handle, sequence));
     }
     void foreground_request(Client& c, const std::vector<std::string>& f, std::uint64_t cap) {
         const auto& command = f[0];
@@ -1329,7 +1457,7 @@ struct InputExperiment::Impl {
             }
         } else if (command == "DRAG") {
             foreground_button(c, 272, true);
-            drag.emplace(Drag{&c, x, y, x2, y2, Clock::now(), static_cast<unsigned>(duration), DragGeometry{c.revision}});
+            drag.emplace(Drag{&c, x, y, x2, y2, Clock::now(), static_cast<unsigned>(duration), DragGeometry{c.revision}, witness(c)});
             send(c, R"({"ok":true,"phase":"started"})"); return;
         }
         require_foreground(c);
@@ -1358,7 +1486,8 @@ struct InputExperiment::Impl {
             else if (!available() || !input_layout_qualified(lease->route, keyboard_action, layout_qualified()))
                 revoke("cancelled", true);
             else if (!refresh(*lease) || primary_conflict(*lease) || agent_conflict(*lease) ||
-                (drag && !drag->geometry.matches(lease->revision))) revoke("cancelled");
+                (drag && (!drag->geometry.matches(lease->revision) || drag->source != witness(*lease))) ||
+                (held && !held->phase.retired && !held_source(*lease, held->phase.handle))) revoke("cancelled");
         }
         if (pointer_target.entered()) {
             const auto surface = pointer_target.surface();
@@ -1396,6 +1525,7 @@ struct InputExperiment::Impl {
         }
         if (lease && lease->dead) revoke("disconnected", true);
         if (reservation && reservation->dead) reservation = nullptr;
+        if (held && held->client->dead) { cleanup_held(); held.reset(); }
         std::erase_if(clients, [](auto& c) { return c->dead; });
         std::erase_if(pointers, [](auto& p) { return p->dead; });
         std::erase_if(keyboards, [](auto& k) { return k->dead; });

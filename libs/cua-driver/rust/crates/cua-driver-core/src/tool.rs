@@ -2264,6 +2264,22 @@ impl ToolRegistry {
             args["_action_capture_generation"] = generation.clone();
             recording_args["_action_capture_generation"] = generation;
         }
+        let desktop_publication = if resolved_name == "get_desktop_state" {
+            desktop_binding.as_ref().and_then(|binding| {
+                self.capture_service
+                    .begin_publication(
+                        binding,
+                        crate::capture_runtime::CaptureTarget::PrimaryDesktop,
+                    )
+                    .ok()
+            })
+        } else {
+            None
+        };
+        if let (Some(binding), Some(sequence)) = (&desktop_binding, desktop_publication) {
+            args["_capture_session_generation"] = serde_json::json!(binding.session_generation());
+            args["_capture_started_sequence"] = serde_json::json!(sequence);
+        }
         let _desktop_action = if requires_desktop_coordination(
             resolved_name,
             &args,
@@ -2318,30 +2334,46 @@ impl ToolRegistry {
 
         // Desktop pixels read off a capped get_desktop_state image are mapped
         // back to the uncapped capture before any platform interprets them.
-        if !desktop_binding.as_ref().is_some_and(|binding| {
-            self.capture_service
-                .map_desktop_observation_args(binding, &mut args)
-        }) {
+        if resolved_name != "mouse_drag"
+            && !desktop_binding.as_ref().is_some_and(|binding| {
+                self.capture_service
+                    .map_desktop_observation_args(binding, &mut args)
+            })
+        {
             crate::desktop_capture_scale::map_desktop_args_for_binding(
                 &mut args,
                 desktop_binding.as_ref(),
             );
         }
         crate::tool_activity::note_tool_activity();
-        let mut result = crate::recording::scope_dispatch_click_capture(
-            pending_turn.as_ref(),
-            tool.invoke(args.clone()),
-        )
-        .await;
+        let implicit_desktop_point = resolved_name != "mouse_drag"
+            && args.get("capture_id").is_none_or(Value::is_null)
+            && (args.get("scope").and_then(Value::as_str) == Some("desktop")
+                || args.get("coordinate_frame").and_then(Value::as_str) == Some("desktop"))
+            && ["x", "y", "from_x", "from_y", "to_x", "to_y"]
+                .iter()
+                .any(|key| args.get(*key).is_some_and(Value::is_number));
+        let mut result = if implicit_desktop_point
+            && desktop_binding.as_ref().is_some_and(|binding| {
+                self.capture_service
+                    .desktop_observation_unavailable(binding)
+            }) {
+            ToolResult::error("The latest desktop image has no action authority. Refresh with a qualified capture before using its coordinates.").with_structured(serde_json::json!({"code":"capture_frame_mismatch","effect":"none"}))
+        } else {
+            crate::recording::scope_dispatch_click_capture(
+                pending_turn.as_ref(),
+                tool.invoke(args.clone()),
+            )
+            .await
+        };
         match resolved_name {
             "get_desktop_state" if result.is_error != Some(true) => {
-                if desktop_binding.as_ref()
-                    == self.capture_service.binding_from_args(&args).ok().as_ref()
-                {
-                    crate::desktop_capture_scale::record_desktop_state_for_binding(
+                if let (Some(binding), Some(sequence)) = (&desktop_binding, desktop_publication) {
+                    self.capture_service.complete_desktop_result(
+                        binding,
+                        sequence,
                         &args,
                         result.structured_content.as_ref(),
-                        desktop_binding.as_ref(),
                     );
                 }
             }
