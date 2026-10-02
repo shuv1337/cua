@@ -386,7 +386,6 @@ struct TurnCapture {
     screenshot_classification: Option<&'static str>,
     cursor_point: Option<(f64, f64)>,
     frame_qualified: bool,
-    point_failure: Option<RecordingUnavailable>,
 }
 
 type TurnContextFn = Arc<
@@ -449,19 +448,7 @@ impl RecordingAdmissionSink {
         binding: &crate::capture_registry::CaptureBinding,
         admission: &crate::capture_registry::CaptureActionAdmission,
     ) {
-        if self
-            .0
-            .expected_capture_id
-            .as_ref()
-            .is_some_and(|expected| *expected != admission.capture_id.to_string())
-        {
-            let mut retained = self.0.admitted_point.lock().unwrap();
-            if retained.is_none() {
-                *retained = Some(Err(RecordingUnavailable::InvalidFrame));
-            }
-            return;
-        }
-        self.retain_action_point(
+        self.retain_action_point_with_capture_id(
             binding,
             admission.frame_identity.as_ref(),
             &admission.target,
@@ -470,6 +457,7 @@ impl RecordingAdmissionSink {
                 admission.native_action_dimensions.height(),
             ),
             (admission.action_x, admission.action_y),
+            Some(&admission.capture_id),
         );
     }
 
@@ -483,6 +471,27 @@ impl RecordingAdmissionSink {
         native_dimensions: (u32, u32),
         point: (f64, f64),
     ) {
+        self.retain_action_point_with_capture_id(
+            binding,
+            identity,
+            target,
+            native_dimensions,
+            point,
+            None,
+        );
+    }
+
+    /// Capture-bound calls must carry the original consumed ID on every handoff
+    /// path. ID-free calls are reserved for truly unbound/capped/zoom turns.
+    pub fn retain_action_point_with_capture_id(
+        &self,
+        binding: &crate::capture_registry::CaptureBinding,
+        identity: Option<&crate::capture_registry::CaptureFrameIdentity>,
+        target: &crate::capture_registry::CaptureTarget,
+        native_dimensions: (u32, u32),
+        point: (f64, f64),
+        capture_id: Option<&crate::capture_registry::CaptureId>,
+    ) {
         let scope = &self.0;
         if !scope.capture_bound {
             return;
@@ -490,6 +499,13 @@ impl RecordingAdmissionSink {
         let mut retained = scope.admitted_point.lock().unwrap();
         if retained.is_none() {
             *retained = Some(scope.context.as_ref().map_err(|e| *e).and_then(|context| {
+                if scope
+                    .expected_capture_id
+                    .as_ref()
+                    .is_some_and(|expected| capture_id.is_none_or(|id| *expected != id.to_string()))
+                {
+                    return Err(RecordingUnavailable::InvalidFrame);
+                }
                 if context.frame().binding.as_ref() != Some(binding) {
                     return Err(RecordingUnavailable::StaleFrame);
                 }
@@ -509,6 +525,25 @@ impl RecordingAdmissionSink {
         source_window: &crate::recording_frame::RecordingWindow,
         point: (f64, f64),
     ) {
+        self.retain_window_action_point_with_capture_id(
+            binding,
+            identity,
+            source_window,
+            point,
+            None,
+        );
+    }
+
+    /// Preferred reconciled window handoff for a consumed client-local capture:
+    /// carry its ID separately from the proven global recording frame identity.
+    pub fn retain_window_action_point_with_capture_id(
+        &self,
+        binding: &crate::capture_registry::CaptureBinding,
+        identity: Option<&crate::capture_registry::CaptureFrameIdentity>,
+        source_window: &crate::recording_frame::RecordingWindow,
+        point: (f64, f64),
+        capture_id: Option<&crate::capture_registry::CaptureId>,
+    ) {
         let matches = self
             .0
             .context
@@ -521,7 +556,7 @@ impl RecordingAdmissionSink {
             }
             return;
         }
-        self.retain_action_point(
+        self.retain_action_point_with_capture_id(
             binding,
             identity,
             &crate::capture_registry::CaptureTarget::Window {
@@ -530,6 +565,7 @@ impl RecordingAdmissionSink {
             },
             source_window.dimensions,
             point,
+            capture_id,
         );
     }
 }
@@ -1417,7 +1453,6 @@ impl TurnCapture {
             screenshot_classification: Some("privacy_suppressed"),
             cursor_point: None,
             frame_qualified: false,
-            point_failure: None,
         }
     }
 }
@@ -1443,7 +1478,6 @@ fn capture_turn(window_id: Option<u64>, pid: Option<i64>, state: StatePlan) -> T
         screenshot_classification: screenshot.classification,
         cursor_point: None,
         frame_qualified: false,
-        point_failure: None,
     }
 }
 
@@ -1523,7 +1557,6 @@ fn unavailable_frame_turn(error: RecordingUnavailable, pid: Option<i64>) -> Turn
             StateCapture::default()
         },
         screenshot_classification: Some(error.classification()),
-        point_failure: Some(error),
         ..Default::default()
     }
 }
@@ -1544,13 +1577,9 @@ fn capture_turn_in_frame_until(
         }
     }
     let context = scope.context.as_ref().ok().cloned();
-    let point = scope
-        .admitted_point
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|point| point.as_ref().ok())
-        .copied();
+    // This phase validates its own image/state/cursor authority. The admitted
+    // point is a proof against BEFORE pixels, not a request to revalidate the
+    // action's target after it may have been dismissed or moved by that action.
     run_frame_evidence(scope.capture_busy.clone(), deadline, move || {
         let mut screenshot = match &context {
             Some(context) => context.capture(deadline),
@@ -1578,15 +1607,6 @@ fn capture_turn_in_frame_until(
         if screenshot.png.is_some() && !screenshot.native_frame_qualified {
             screenshot.classification =
                 Some(RecordingUnavailable::UnqualifiedFrame.classification());
-        }
-        let mut point_failure = None;
-        if Instant::now() >= deadline {
-            return unavailable_frame_turn(RecordingUnavailable::BudgetExceeded, pid);
-        }
-        if screenshot.native_frame_qualified {
-            if let (Some(context), Some(point)) = (&context, point) {
-                point_failure = context.validate_point(point).err();
-            }
         }
         if Instant::now() >= deadline {
             return unavailable_frame_turn(RecordingUnavailable::BudgetExceeded, pid);
@@ -1647,7 +1667,6 @@ fn capture_turn_in_frame_until(
             screenshot_classification: screenshot.classification,
             frame_qualified: screenshot.native_frame_qualified,
             cursor_point,
-            point_failure,
         }
     })
     .unwrap_or_else(|error| unavailable_frame_turn(error, pid))
@@ -1982,10 +2001,6 @@ fn write_turn_with_after(
         if before.screenshot.is_some() && !before.frame_qualified {
             click_point = None;
             supplemental.failure = Some(RecordingUnavailable::UnqualifiedFrame.classification());
-        }
-        if let Some(error) = after.point_failure {
-            click_point = None;
-            supplemental.failure = Some(error.classification());
         }
     }
     let click_source = supplemental
@@ -2334,7 +2349,6 @@ mod tests {
                 screenshot_classification: None,
                 cursor_point: None,
                 frame_qualified: false,
-                point_failure: None,
             },
             dispatch_click: Some(Arc::new(DispatchClickScope {
                 window_id: 902,
