@@ -219,3 +219,6 @@ docs/scripts/check-all-links.py
 docs/scripts/check-mdx-links.py
 # Local Windows RE scratch (downloaded PDBs, disassembly scripts)
 .re-windows/
+
+# Local-only runbook with private tailnet details
+docs/remote-gui-testing-mbp.md
