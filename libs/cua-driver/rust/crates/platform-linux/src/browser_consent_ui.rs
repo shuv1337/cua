@@ -254,12 +254,15 @@ pub fn dismiss(pid: u32, window_id: u64) -> Result<bool, BrowserRefusal> {
             )
         })?;
         let node = walked_node(&tree.nodes, index)?;
-        crate::atspi::perform_action_walked(pid, window_id, &node).map_err(|error| {
-            refusal(
-                BrowserRefusalCode::BrowserWrongTargetRefused,
-                format!("the exact browser consent cancel action failed: {error}"),
-            )
-        })?;
+        // A cancel that failed after it was sent may have dismissed the
+        // prompt: the next pass reads that back instead of refusing.
+        crate::atspi::action_sent(crate::atspi::perform_action_walked(pid, window_id, &node))
+            .map_err(|error| {
+                refusal(
+                    BrowserRefusalCode::BrowserWrongTargetRefused,
+                    format!("the exact browser consent cancel action failed: {error}"),
+                )
+            })?;
         dismissed = true;
         if Instant::now() >= deadline {
             return Err(refusal(
@@ -344,7 +347,9 @@ pub async fn handle(
             Some(index) if accessibility_action_at.is_none() => {
                 let node = walked_node(&tree.nodes, index)?;
                 consent_action(&request.action, deadline, move || {
-                    crate::atspi::perform_action_walked(pid, window_id, &node)
+                    crate::atspi::action_sent(crate::atspi::perform_action_walked(
+                        pid, window_id, &node,
+                    ))
                 })
                 .await?;
                 accessibility_action_at = Some(Instant::now());
