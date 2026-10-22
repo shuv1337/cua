@@ -336,6 +336,42 @@ static NEXT_SESSION_REVIVE_HOOK_ID: AtomicU64 = AtomicU64::new(1);
 /// crash and inactivity fallback. `"default"` and empty ids are never tracked.
 static SESSION_ACTIVITY: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
+/// Resource lifetime protection from *idle* eviction only. Explicit end,
+/// revocation, transport teardown and runtime shutdown remain authoritative.
+/// Keys are runtime-private lifecycle identities, never public labels.
+static IDLE_PROTECTIONS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+fn idle_protections() -> &'static Mutex<HashMap<String, usize>> {
+    IDLE_PROTECTIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) struct SessionIdleProtection(String);
+
+pub(crate) fn protect_from_idle(session_id: &str) -> SessionIdleProtection {
+    let mut protections = idle_protections().lock().unwrap();
+    *protections.entry(session_id.to_owned()).or_default() += 1;
+    // Idle selection may have raced the admitted start_recording dispatch.
+    // Cancel only that deferred idle end, never an explicit termination.
+    if let Some(record) = lifecycle_records().lock().unwrap().get_mut(session_id) {
+        if record.pending_end == Some(SessionEndReason::IdleTimeout) {
+            record.pending_end = None;
+        }
+    }
+    SessionIdleProtection(session_id.to_owned())
+}
+
+impl Drop for SessionIdleProtection {
+    fn drop(&mut self) {
+        let mut protections = idle_protections().lock().unwrap();
+        if let Some(count) = protections.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                protections.remove(&self.0);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LifecycleRecord {
     public_label: Option<String>,
@@ -1221,6 +1257,11 @@ pub fn release_process_state_for_shutdown() {
         activity.clear();
         activity.shrink_to_fit();
     }
+    if let Some(protections) = IDLE_PROTECTIONS.get() {
+        let mut protections = protections.lock().unwrap();
+        protections.clear();
+        protections.shrink_to_fit();
+    }
     if let Some(records) = LIFECYCLE_RECORDS.get() {
         let mut records = records.lock().unwrap();
         records.clear();
@@ -1636,6 +1677,14 @@ fn end_session_with_reason(session_id: &str, reason: SessionEndReason) {
     if !is_trackable(session_id) {
         return;
     }
+    let protections =
+        (reason == SessionEndReason::IdleTimeout).then(|| idle_protections().lock().unwrap());
+    if protections
+        .as_ref()
+        .is_some_and(|map| map.contains_key(session_id))
+    {
+        return;
+    }
     let defer = {
         let mut records = lifecycle_records().lock().unwrap();
         match records.get_mut(session_id) {
@@ -1646,6 +1695,7 @@ fn end_session_with_reason(session_id: &str, reason: SessionEndReason) {
             _ => false,
         }
     };
+    drop(protections);
     if defer {
         return;
     }
@@ -1653,7 +1703,17 @@ fn end_session_with_reason(session_id: &str, reason: SessionEndReason) {
 }
 
 fn finish_session_end(session_id: &str, reason: SessionEndReason) {
-    let first_fire = mark_session_ended(session_id, None, reason);
+    let first_fire = if reason == SessionEndReason::IdleTimeout {
+        // Serialize the final idle decision with resource acquisition. Release
+        // this lock BEFORE cleanup hooks, which may drop resource guards.
+        let protections = idle_protections().lock().unwrap();
+        if protections.contains_key(session_id) {
+            return;
+        }
+        mark_session_ended(session_id, None, reason)
+    } else {
+        mark_session_ended(session_id, None, reason)
+    };
     let mut cursor_readers = CURSOR_OUTCOME_READERS
         .get()
         .map(|readers| {
@@ -1692,8 +1752,9 @@ fn finish_session_end(session_id: &str, reason: SessionEndReason) {
 /// ended. This is the idle-TTL sweep the daemon runs periodically: a
 /// caller-declared session is no longer tied to a connection's lifetime, so a
 /// run that finishes (or crashes) without calling `end_session` is reclaimed
-/// here instead of leaking its cursor / recording. Sessions touched within the
-/// TTL are left untouched.
+/// here instead of leaking its cursor. Sessions touched within the TTL and
+/// exact owners of live recordings are left untouched; the latter still end
+/// through explicit lifecycle teardown.
 pub fn evict_idle(ttl: Duration) -> Vec<String> {
     let now = Instant::now();
     let lifecycle = lifecycle_records()
@@ -1703,11 +1764,14 @@ pub fn evict_idle(ttl: Duration) -> Vec<String> {
         .map(|(id, record)| (id.clone(), (record.in_flight, record.idle_ttl)))
         .collect::<HashMap<_, _>>();
     let stale: Vec<String> = {
+        let protections = idle_protections().lock().unwrap();
         let map = activity().lock().unwrap();
         map.iter()
             .filter(|(id, last)| {
                 let (in_flight, session_ttl) = lifecycle.get(*id).copied().unwrap_or_default();
-                now.duration_since(**last) >= session_ttl.unwrap_or(ttl) && in_flight == 0
+                !protections.contains_key(*id)
+                    && now.duration_since(**last) >= session_ttl.unwrap_or(ttl)
+                    && in_flight == 0
             })
             .map(|(id, _)| id.clone())
             .collect()
@@ -1729,11 +1793,13 @@ pub fn evict_idle_with_prefix(ttl: Duration, prefix: &str) -> Vec<String> {
         .map(|(id, record)| (id.clone(), (record.in_flight, record.idle_ttl)))
         .collect::<HashMap<_, _>>();
     let stale: Vec<String> = {
+        let protections = idle_protections().lock().unwrap();
         let map = activity().lock().unwrap();
         map.iter()
             .filter(|(id, last)| {
                 let (in_flight, session_ttl) = lifecycle.get(*id).copied().unwrap_or_default();
                 id.starts_with(prefix)
+                    && !protections.contains_key(*id)
                     && now.duration_since(**last) >= session_ttl.unwrap_or(ttl)
                     && in_flight == 0
             })
@@ -1756,6 +1822,31 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn recording_idle_protection_cancels_racing_idle_end_but_never_explicit_end() {
+        let sid = "recording-idle-protection-race";
+        let dispatch = begin_session_dispatch(
+            sid,
+            Some(sid),
+            sid,
+            false,
+            SessionTransport::Daemon,
+            SessionClientKind::Direct,
+        )
+        .unwrap();
+        end_session_with_reason(sid, SessionEndReason::IdleTimeout);
+        assert!(is_session_ending(sid));
+        let protection = protect_from_idle(sid);
+        assert!(!is_session_ending(sid));
+        end_session_with_reason(sid, SessionEndReason::IdleTimeout);
+        assert!(!is_session_ending(sid));
+        end_session(sid);
+        assert!(is_session_ending(sid));
+        drop(dispatch);
+        assert!(is_session_ended(sid));
+        drop(protection);
+    }
 
     #[derive(Default)]
     struct ProbeObserver {

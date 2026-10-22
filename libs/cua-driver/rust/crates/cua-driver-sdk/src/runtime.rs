@@ -536,9 +536,10 @@ fn spawn_lifecycle_maintenance(runtime: &Arc<DriverRuntime>) -> LifecycleMainten
             );
         }
         let idle = now_unix_secs().saturating_sub(runtime.last_activity.load(Ordering::Relaxed));
-        if idle >= recording_ttl && runtime.registry.recording.current_state().enabled {
-            tracing::warn!("recording idle {idle}s ≥ {recording_ttl}s TTL; auto-stopping");
-            let _ = runtime.registry.recording.stop_owner(None);
+        if idle >= recording_ttl {
+            // Owned recordings end through their exact session's explicit
+            // teardown, not through a global traffic clock.
+            let _ = runtime.registry.recording.stop_ownerless_if_idle();
         }
     });
     LifecycleMaintenance { shutdown, thread }
@@ -852,7 +853,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_eviction_finalizes_the_owning_runtime_recording() {
+    async fn live_recording_protects_only_its_owner_until_explicit_stop() {
         let _runtime_test = TEST_RUNTIME_LOCK.lock().await;
         let runtime = DriverRuntime::create(standard_options()).unwrap();
         let public = "runtime-recording-idle";
@@ -883,18 +884,73 @@ mod tests {
         assert_ne!(started.is_error, Some(true));
         assert!(runtime.registry.recording.current_state().enabled);
 
+        let unrelated = "runtime-recording-idle-other";
+        runtime
+            .invoke("start_session", serde_json::json!({"session": unrelated}))
+            .await
+            .unwrap();
+        let evicted = cua_driver_core::session::evict_idle_with_prefix(Duration::ZERO, &prefix);
+        assert!(!evicted.contains(&internal));
+        assert!(evicted.contains(&runtime.compatibility_context.runtime_session_key(unrelated)));
+        runtime.registry.recording.stop_ownerless_if_idle().unwrap();
+        assert!(runtime.registry.recording.current_state().enabled);
+        assert!(!cua_driver_core::session::is_session_ended(&internal));
+
+        runtime
+            .invoke("end_session", serde_json::json!({"session": public}))
+            .await
+            .unwrap();
+        assert!(!runtime.registry.recording.current_state().enabled);
+        let finalized: Value =
+            serde_json::from_slice(&std::fs::read(output.path().join("session.json")).unwrap())
+                .unwrap();
+        assert_eq!(finalized["end_reason"], "session_end");
+
+        // An explicit restart is a new episode; a manually stopped recorder
+        // must release the idle protection rather than pinning the session.
+        runtime
+            .invoke("start_session", serde_json::json!({"session": public}))
+            .await
+            .unwrap();
+        let started = runtime
+            .invoke(
+                "start_recording",
+                serde_json::json!({
+                    "session": public, "output_dir": output.path(), "record_video": false,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_ne!(started.is_error, Some(true));
+        let stopped = runtime
+            .invoke("stop_recording", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_ne!(stopped.is_error, Some(true));
+        let finalized: Value =
+            serde_json::from_slice(&std::fs::read(output.path().join("session.json")).unwrap())
+                .unwrap();
+        assert_eq!(finalized["end_reason"], "manual");
         let evicted = cua_driver_core::session::evict_idle_with_prefix(Duration::ZERO, &prefix);
         assert!(evicted.contains(&internal));
-        for _ in 0..100 {
-            if !runtime.registry.recording.current_state().enabled {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            !runtime.registry.recording.current_state().enabled,
-            "session-end hook must finalize recording after idle eviction"
-        );
+
+        // Anonymous recordings still have a backstop; neither a live state
+        // nor a later idempotent manual stop mislabels the finalization.
+        runtime
+            .registry
+            .recording
+            .start(output.path().to_str().unwrap(), false, None)
+            .unwrap();
+        let live: Value =
+            serde_json::from_slice(&std::fs::read(output.path().join("session.json")).unwrap())
+                .unwrap();
+        assert!(live.get("end_reason").is_none());
+        runtime.registry.recording.stop_ownerless_if_idle().unwrap();
+        runtime.registry.recording.stop_owner(None).unwrap();
+        let finalized: Value =
+            serde_json::from_slice(&std::fs::read(output.path().join("session.json")).unwrap())
+                .unwrap();
+        assert_eq!(finalized["end_reason"], "idle_ttl");
 
         runtime.shutdown().await;
     }

@@ -493,6 +493,7 @@ struct RecordingInner {
     /// #1775 generation token: a session id is a stable owner identity rather
     /// than a monotonic counter, and it doubles as the config-override key.
     owner: Option<String>,
+    idle_protection: Option<crate::session::SessionIdleProtection>,
     output_dir: Option<PathBuf>,
     /// Per-turn application-state budget, or `None` when the caller disabled
     /// state capture with `include_accessibility_tree: false`.
@@ -542,6 +543,24 @@ pub struct RecordingState {
     pub owner: Option<String>,
 }
 
+/// Reason written only when a trajectory has actually been finalized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordingEndReason {
+    Manual,
+    SessionEnd,
+    IdleTtl,
+}
+
+impl RecordingEndReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::SessionEnd => "session_end",
+            Self::IdleTtl => "idle_ttl",
+        }
+    }
+}
+
 impl RecordingSession {
     pub fn new() -> Self {
         Self {
@@ -550,6 +569,7 @@ impl RecordingSession {
                 enabled: false,
                 generation: 0,
                 owner: None,
+                idle_protection: None,
                 output_dir: None,
                 state_budget: Some(StateCaptureBudget::default()),
                 next_turn: 1,
@@ -618,6 +638,9 @@ impl RecordingSession {
         state_budget: Option<StateCaptureBudget>,
     ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        // Acquire before checking the tombstone: idle termination either won
+        // already (and is refused below), or cannot end this owner until stop.
+        let idle_protection = owner.map(crate::session::protect_from_idle);
         // Write-boundary resurrection guard — checked INSIDE the lock so the
         // is_session_ended test is atomic with the enabled/owner write below.
         // An in-flight start_recording that lands after its owning session ended
@@ -705,6 +728,7 @@ impl RecordingSession {
         // the daemon-global recorder is a singleton, so the latest start() owns
         // it. The previous owner's disconnect then no-ops in stop_owner().
         inner.owner = owner.map(str::to_owned);
+        inner.idle_protection = idle_protection;
         inner.generation = inner.generation.wrapping_add(1);
         inner.enabled = true;
         inner.output_dir = Some(dir);
@@ -737,8 +761,39 @@ impl RecordingSession {
     /// The guard lives inside the lock so it is race-free against a concurrent
     /// `start()`. Supersedes the #1775 generation-token `stop()`.
     pub fn stop_owner(&self, requester: Option<&str>) -> anyhow::Result<()> {
+        self.stop_owner_with_reason(
+            requester,
+            if requester.is_some() {
+                RecordingEndReason::SessionEnd
+            } else {
+                RecordingEndReason::Manual
+            },
+        )
+    }
+
+    pub fn stop_owner_with_reason(
+        &self,
+        requester: Option<&str>,
+        reason: RecordingEndReason,
+    ) -> anyhow::Result<()> {
+        self.stop_matching(requester, reason, false)
+    }
+
+    /// The idle backstop may finalize only an ownerless recording. Check under
+    /// the same lock as start/stop so a newly owned recording cannot be stopped
+    /// using a stale `current_state()` snapshot.
+    pub fn stop_ownerless_if_idle(&self) -> anyhow::Result<()> {
+        self.stop_matching(None, RecordingEndReason::IdleTtl, true)
+    }
+
+    fn stop_matching(
+        &self,
+        requester: Option<&str>,
+        reason: RecordingEndReason,
+        ownerless_only: bool,
+    ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        if !inner.enabled {
+        if !inner.enabled || (ownerless_only && inner.owner.is_some()) {
             return Ok(());
         }
         if let Some(req) = requester {
@@ -764,6 +819,7 @@ impl RecordingSession {
         let cursor_samples = inner.cursor.take().map(|c| c.stop()).unwrap_or(0);
 
         inner.enabled = false;
+        inner.idle_protection = None;
         inner.output_dir = None;
         inner.next_turn = 1;
         inner.session_start_ms = 0;
@@ -789,6 +845,7 @@ impl RecordingSession {
             let session_payload = serde_json::json!({
                 "schema_version": 1,
                 "started_at_monotonic_ms": started_at_ms,
+                "end_reason": reason.as_str(),
                 "video": video_block,
                 "cursor": { "present": cursor_samples > 0, "sample_count": cursor_samples }
             });
