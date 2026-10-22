@@ -48,7 +48,7 @@ def generate(repo, tooling_revision, profile_path, source_archive, output):
     stem = verify.source_stem(profile)
     manifest = verify.verify_archive(source_archive, profile)
     provenance = {"schema": 1, "tooling_revision": tooling_revision, "profile_sha256": verify.sha256(profile_data),
-                  "source": profile["source"], "cmake_options": verify.OPTIONS, "native_certified": False,
+                  "source": profile["source"], "cmake_options": verify.build_options(profile), "native_certified": False,
                   "tooling_files": {name: verify.sha256(data) for name, data in payload.items()}}
     payload["PROFILE.json"] = profile_data
     payload["KIT-PROVENANCE.json"] = verify.json_bytes(provenance)

@@ -289,7 +289,7 @@
    "read_only": true
   },
   {
-   "description": "Launch a Linux app in the background. Provide launch_path (preferred — round-trip the value from list_apps), name (tried as a direct command, then matched against installed .desktop applications, then handed to xdg-open if it is a URL or existing file path), bundle_id (ignored on Linux), or urls (list of URLs to open). Resolution precedence: launch_path > name > bundle_id. Errors when the name resolves to nothing launchable.",
+   "description": "Launch a Linux app in the background. Provide launch_path (preferred — round-trip the value from list_apps), name (tried as a direct command, then matched against installed .desktop applications, then handed to xdg-open if it is a URL or existing file path), bundle_id (ignored on Linux), or urls (list of URLs to open). Resolution precedence: launch_path > name > bundle_id. Errors when the name resolves to nothing launchable. On native Hyprland, executable launches use hidden special:cua with a process-lifetime placement guard; URL activation and unproven single-instance handoffs are not silently launched on the visible workspace. An unconfirmed launch must not be repeated blindly.",
    "destructive": false,
    "idempotent": false,
    "input_schema": {
@@ -902,6 +902,10 @@
       ],
       "type": "string"
      },
+     "capture_id": {
+      "description": "Bind the press to the original desktop capture. Held phases retain this admission.",
+      "type": "string"
+     },
      "coordinate_frame": {
       "description": "Frame of x/y (and from_x/from_y/to_x/to_y). Default \"window\": window-local screenshot pixels as returned by get_window_state. \"desktop\": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:\"desktop\" together with pid/window_id means the same thing.",
       "enum": [
@@ -912,6 +916,15 @@
      },
      "cursor_id": {
       "description": "Optional multi-cursor instance id. Default: 'default'.",
+      "type": "string"
+     },
+     "delivery_mode": {
+      "default": "background",
+      "description": "Input delivery mode. 'background' (default) never activates or raises the target window. On X11 it injects via XTEST / the XInput2 master pointer (no focus steal). On Wayland it goes through libei + xdg-desktop-portal, which injects to the compositor's input focus — Wayland's security model has no per-window background targeting, so a specific non-focused window cannot be aimed at; when no libei backend is available the tool returns a structured background_unavailable error. 'foreground' is the explicit escalation: activate the target (X11 _NET_ACTIVE_WINDOW; Wayland compositor activate), inject, then restore the prior active window — a brief focus swap unless the target was already active. Matches the macOS / Windows delivery_mode surface.",
+      "enum": [
+       "background",
+       "foreground"
+      ],
       "type": "string"
      },
      "from_zoom": {
@@ -957,8 +970,25 @@
    "input_schema": {
     "additionalProperties": false,
     "properties": {
+     "coordinate_frame": {
+      "description": "Frame of x/y (and from_x/from_y/to_x/to_y). Default \"window\": window-local screenshot pixels as returned by get_window_state. \"desktop\": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:\"desktop\" together with pid/window_id means the same thing.",
+      "enum": [
+       "window",
+       "desktop"
+      ],
+      "type": "string"
+     },
      "cursor_id": {
       "description": "Optional multi-cursor instance id. Default: 'default'.",
+      "type": "string"
+     },
+     "delivery_mode": {
+      "default": "background",
+      "description": "Input delivery mode. 'background' (default) never activates or raises the target window. On X11 it injects via XTEST / the XInput2 master pointer (no focus steal). On Wayland it goes through libei + xdg-desktop-portal, which injects to the compositor's input focus — Wayland's security model has no per-window background targeting, so a specific non-focused window cannot be aimed at; when no libei backend is available the tool returns a structured background_unavailable error. 'foreground' is the explicit escalation: activate the target (X11 _NET_ACTIVE_WINDOW; Wayland compositor activate), inject, then restore the prior active window — a brief focus swap unless the target was already active. Matches the macOS / Windows delivery_mode surface.",
+      "enum": [
+       "background",
+       "foreground"
+      ],
       "type": "string"
      },
      "duration_ms": {

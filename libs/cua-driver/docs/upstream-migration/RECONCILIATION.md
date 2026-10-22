@@ -1,4 +1,4 @@
-# Larger candidate reconciliation — incomplete, not qualification
+# Larger candidate reconciliation — implementation and native gates
 
 Comparison inputs are the immutable commits in [the ledger](README.md).
 The final candidate's `hyprland-plugin/docs/window-source-guard.md`, not its
@@ -19,7 +19,7 @@ tests include `screen_report_describes_the_same_snapshot_as_its_frame` and
 frame construction, not continuity of an old capture ID through same-sized
 topology changes. #4387's recorded gap explicitly distinguishes these contracts.
 
-The private source binds the original compositor/connection epoch, complete
+The adapted private source binds the original compositor/connection epoch, complete
 topology generation, root/client nonce, full PID/address, fractional geometry and
 revision. Reconcile publication, admission, waits and each dispatch phase as one
 contract; a later fresh observation is not proof of the original capture.
@@ -36,9 +36,10 @@ current tests: `foreground_partial_unknown_keeps_only_proven_acknowledgements`,
 Do not replace these with old candidate implementations solely to get matching
 file layouts.
 
-Neither release owner negotiates `source_guard_version:1` or
-`held_phase_version:1`. Therefore the release's finite-input/drag contracts do
-not establish the candidate's cross-call HOLD contract. The private extension
+The selected release did not negotiate `source_guard_version:1` or
+`held_phase_version:1`. These extensions are now ported to the matching Driver
+and plugin; release finite-input/drag contracts alone did not establish them.
+The retained extension
 requires original-connection, coordinate-free release/abort, irreversible
 retirement, route-separated debt and quarantine without successor TARGET
 acquisition. Missing extension must be `window_source_guard_unavailable` on a
@@ -53,8 +54,10 @@ need independent native postconditions. Preserve debt after unconfirmed cleanup.
 
 Release owners: Linux `atspi/native.rs`, snapshot/token resolution and
 `tools/impl_.rs`; core `batch_tools.rs` owns foreground retry at batch level.
-#5574 actively owns uncertain AT-SPI outcomes and batch no-replay. Preserve its
-contributor history if integrating it rather than implementing a competing copy.
+#5574's ten commits are integrated, preserving Victor Vogel's linked author
+identity. Its `InputMayHaveLanded` is the single uncertain semantic-effect type;
+the private source-authority API re-exports it rather than creating a parallel
+error that token fallback or batch replay could miss.
 
 The private source separately binds an immutable AT-SPI unique owner/node/frame
 and bounded live ancestry. Plain point-free activation is not a compositor root
@@ -71,8 +74,19 @@ owners while pairing before/after frames, action/cursor markers and native
 capture provenance to one immutable turn geometry. The focused unique-window
 fix does not establish that larger contract.
 
-Hidden-workspace launch remains required: port its splash/child/late-modal
-lifetime guard into current Hyprland launch/plugin owners, without stealing the
-human workspace. Native dual-display fixtures belong in `cua-driver-e2e` and
-canonical runners, not as a parallel unselected acceptance script. Neither this
-mapping nor the passing hermetic suites qualifies these still-unported paths.
+Hidden launch is ported, but the first native tests rejected the Lua callback
+adaptation: current Lua `window.open` is openLate, its payload is the Window
+itself, and a move/setprop dispatcher can disturb primary focus even before
+layout. The retained invariant now belongs to native plugin `openEarly` plus
+pre-focus `open`, checking the exact same-user process instance and inherited
+token. It assigns the workspace before layout registration and suppresses only
+the map's initial-focus flag. It does not install a lasting no-focus rule or
+restore focus after stealing it. Driver correlation requires this advertised
+production capability and never repeats an uncertain exec.
+
+The native launch fixture journals splash/main/child/late-modal windows, closes
+the launching Driver before later maps, and checks unchanged workspaces,
+ordered compositor focus events and independent sentinel GTK focus-out events.
+It and the retained dual-display suite are selected as whole binaries by the
+canonical Linux native/all runner on an explicitly prepared disposable desktop.
+Passing hermetic suites and compiling these fixtures are not native acceptance.

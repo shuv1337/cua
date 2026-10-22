@@ -39,7 +39,7 @@ def owner_versions(paths):
     return {name: verify.run("pacman", "-Q", name).split(" ", 1)[1] for name in sorted(owners)}
 
 
-def measure(profile_id, kit_version, package_release, source, archive, cxx):
+def measure(profile_id, kit_version, package_release, source, archive, cxx, *, ime_popup_guard=False):
     """Return a candidate schema-2 profile measured from this host."""
     verify.require(set(source) == set(SOURCE_FIELDS), "source must name " + ", ".join(SOURCE_FIELDS))
     verify.require(not any(key.startswith("LD_") for key in os.environ),
@@ -66,6 +66,9 @@ def measure(profile_id, kit_version, package_release, source, archive, cxx):
         "runtime": {"basename": runtime.name, "sha256": verify.digest(runtime),
                     "packages": owner_versions(set(libraries.values()))},
     }
+    if ime_popup_guard:
+        profile["schema"] = 3
+        profile["extensions"] = {"ime_popup_guard": True}
     verify.validate_profile(profile)
     verify.verify_archive(archive, profile)
     # Self-consistency only: proves the profile matches this host, not that it is qualified.
@@ -84,6 +87,8 @@ def reuse_decision(reviewed, candidate):
     verify.validate_profile(reviewed)
     verify.validate_profile(candidate)
     reasons = [f"{name} differs" for name in SECTIONS if reviewed[name] != candidate[name]]
+    if verify.build_options(reviewed) != verify.build_options(candidate):
+        reasons.append("build options differ")
     if reasons:
         return "rebuild", reasons
     reasons = [f"{name} differs" for name in LABELS if reviewed[name] != candidate[name]]
@@ -108,6 +113,7 @@ def main():
     m.add_argument("--manifest-sha256", required=True, help="independently reviewed manifest digest")
     m.add_argument("--cxx", required=True, type=Path)
     m.add_argument("--output", required=True, type=Path, help="new profile file")
+    m.add_argument("--ime-popup-guard", action="store_true", help="schema-3 profile retaining the Omarchy IME guard")
     r = sub.add_parser("reuse", help="classify whether reviewed evidence survives a candidate profile")
     r.add_argument("--reviewed", required=True, type=Path)
     r.add_argument("--candidate", required=True, type=Path)
@@ -116,7 +122,8 @@ def main():
         if args.command == "measure":
             source = {"revision": args.revision, "driver_version": args.driver_version,
                       "archive_sha256": args.archive_sha256, "manifest_sha256": args.manifest_sha256}
-            profile = measure(args.profile_id, args.kit_version, args.package_release, source, args.archive, args.cxx)
+            profile = measure(args.profile_id, args.kit_version, args.package_release, source, args.archive, args.cxx,
+                              ime_popup_guard=args.ime_popup_guard)
             with args.output.open("xb") as handle:
                 handle.write(verify.json_bytes(profile))
             print(f"Wrote candidate {args.output}; review it. It is not native certification.")

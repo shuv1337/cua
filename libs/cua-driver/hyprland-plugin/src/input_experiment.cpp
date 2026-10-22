@@ -4,6 +4,7 @@
 #include "drag_geometry.hpp"
 #include "held_phase.hpp"
 #include "held_pointer_journal.hpp"
+#include "hidden_launch_guard.hpp"
 #include "input_grant.hpp"
 #include "input_client_deadline.hpp"
 #include "passive_pointer_target.hpp"
@@ -1776,12 +1777,16 @@ struct InputExperiment::DesktopListeners {
         CHyprSignalListener dpms, mode;
     };
     InputExperiment& owner;
+    std::unique_ptr<HiddenLaunchGuard> hidden_launch;
     std::vector<MonitorListeners> monitors;
     CHyprSignalListener lock, unlock, active, layout, added, removed, destroyed;
     CHyprSignalListener keyboard_layout, pointer_focus, keyboard_focus;
     CHyprSignalListener mouse_move, mouse_button, mouse_axis, keyboard_key, touch_down, tablet_tip;
 
     explicit DesktopListeners(InputExperiment& input) : owner(input) {
+        hidden_launch = std::make_unique<HiddenLaunchGuard>([this] {
+            return kProduction && !owner.lanes_[0]->suspended && !owner.lanes_[1]->suspended;
+        });
         lock = g_pSessionLockManager->m_events.lock.listen([this] { changed(); });
         unlock = g_pSessionLockManager->m_events.unlock.listen([this] { changed(); });
         if (g_pCompositor->m_aqBackend->hasSession())
@@ -1887,7 +1892,7 @@ std::string InputExperiment::status_json() const {
             lane->held_button, lane->held_keys.size(), lane->drag.has_value(), pointer_focus, keyboard_focus, lane->held_status_fields());
     }
     // Aggregate legacy fields remain available to existing test probes.
-    return std::format(R"({{"protocol":{},"test_only":{},"source_guard_version":{},"held_phase_version":{},"seat_lifetime":"compositor","upgrade":"desktop_restart","transport_ready":{},"epoch":"{}","lease_active":{},"seat_resources":{},"pointer_resources":{},"keyboard_resources":{},"dispatches":{},"lanes":[{}]}})",
+    return std::format(R"({{"protocol":{},"test_only":{},"source_guard_version":{},"held_phase_version":{},"hidden_launch_version":1,"seat_lifetime":"compositor","upgrade":"desktop_restart","transport_ready":{},"epoch":"{}","lease_active":{},"seat_resources":{},"pointer_resources":{},"keyboard_resources":{},"dispatches":{},"lanes":[{}]}})",
         kProduction ? 3 : 0, !kProduction, kProduction ? 1 : 0, kProduction && lanes_[0]->held_logger && lanes_[1]->held_logger ? 1 : 0, !lanes_[0]->suspended && !lanes_[1]->suspended, lanes_[0]->epoch, lanes_[0]->lease != nullptr || lanes_[1]->lease != nullptr,
         lanes_[0]->seats.size() + lanes_[1]->seats.size(), lanes_[0]->pointers.size() + lanes_[1]->pointers.size(),
         lanes_[0]->keyboards.size() + lanes_[1]->keyboards.size(), lanes_[0]->dispatches + lanes_[1]->dispatches, states);

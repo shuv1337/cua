@@ -250,6 +250,12 @@ fn assert_tools_list_schema_shape(mut d: RawDriver) {
         // macOS set_value has no delivery ladder.
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         "set_value",
+        // Linux guarded cross-call holds select independent or primary-seat
+        // ownership at DOWN, then preserve that original route through DRAG/UP.
+        #[cfg(target_os = "linux")]
+        "mouse_button_down",
+        #[cfg(target_os = "linux")]
+        "mouse_drag",
     ];
     for tool in DELIVERY_MODE_TOOLS {
         let delivery = &properties(tool)["delivery_mode"];

@@ -69,8 +69,15 @@ def hash_value(value):
 
 
 def validate_profile(profile):
-    keys(profile, "schema profile_id kit_version package_release source architecture hyprland compiler runtime", "profile")
-    require(type(profile["schema"]) is int and profile["schema"] in (1, 2), "unsupported profile schema")
+    require(isinstance(profile, dict), "invalid profile")
+    require(type(profile.get("schema")) is int and profile["schema"] in (1, 2, 3), "unsupported profile schema")
+    fields = "schema profile_id kit_version package_release source architecture hyprland compiler runtime"
+    if profile["schema"] == 3:
+        fields += " extensions"
+    keys(profile, fields, "profile")
+    if profile["schema"] == 3:
+        keys(profile["extensions"], "ime_popup_guard", "profile extensions")
+        require(type(profile["extensions"]["ime_popup_guard"]) is bool, "IME popup guard must be a boolean")
     require(len(profile["profile_id"]) <= 32 and re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", profile["profile_id"]), "invalid profile ID")
     require(len(profile["kit_version"]) <= 20 and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", profile["kit_version"]), "invalid kit version")
     require(type(profile["package_release"]) is int and profile["package_release"] >= 2, "profile package release must be >=2")
@@ -108,6 +115,13 @@ def validate_profile(profile):
     return profile
 
 
+def build_options(profile):
+    validate_profile(profile)
+    if profile["schema"] != 3:
+        return dict(OPTIONS)
+    return dict(OPTIONS, CUA_HYPRLAND_IME_POPUP_GUARD=("ON" if profile["extensions"]["ime_popup_guard"] else "OFF"))
+
+
 def source_stem(profile):
     source = validate_profile(profile)["source"]
     return f"cua-hyprland-plugin-{source['driver_version']}-{source['revision']}"
@@ -126,6 +140,8 @@ def source_manifest(data, profile):
     for key, value in expected.items():
         require(type(manifest[key]) is type(value) and manifest[key] == value, f"historical source provenance mismatch: {key}")
     require(isinstance(manifest["files"], dict) and {"CMakeLists.txt", "LICENSE.md", "verify.py"} <= set(manifest["files"]), "invalid source inventory")
+    if profile["schema"] == 3:
+        require({"src/ime_popup_guard.cpp", "src/ime_popup_guard.hpp"} <= set(manifest["files"]), "selected source lacks the reviewed IME popup guard")
     for name, checksum in manifest["files"].items():
         path = PurePosixPath(name)
         require(not path.is_absolute() and path.as_posix() == name and ".." not in path.parts and "\\" not in name and name != "SOURCE-PROVENANCE.json", "unsafe source inventory path")
@@ -175,7 +191,7 @@ def verify_kit(kit, expected_sha, *, complete=False):
     require(provenance_path.is_file() and not provenance_path.is_symlink() and digest(provenance_path) == expected_sha, "kit provenance checksum mismatch")
     provenance = read_json(provenance_path.read_bytes())
     keys(provenance, "schema tooling_revision profile_sha256 source cmake_options native_certified tooling_files", "kit provenance")
-    require(provenance["schema"] == 1 and provenance["native_certified"] is False and provenance["cmake_options"] == OPTIONS, "invalid kit contract")
+    require(provenance["schema"] == 1 and provenance["native_certified"] is False, "invalid kit contract")
     require(re.fullmatch(r"[0-9a-f]{40}", provenance["tooling_revision"]), "invalid tooling revision")
     require(set(provenance["tooling_files"]) == set(TOOLING), "tooling inventory mismatch")
     for checksum in provenance["tooling_files"].values():
@@ -183,6 +199,7 @@ def verify_kit(kit, expected_sha, *, complete=False):
     profile_path = kit / "PROFILE.json"
     require(profile_path.is_file() and not profile_path.is_symlink() and digest(profile_path) == provenance["profile_sha256"], "profile checksum mismatch")
     profile = validate_profile(read_json(profile_path.read_bytes()))
+    require(provenance["cmake_options"] == build_options(profile), "kit build options differ from reviewed profile")
     require(provenance["source"] == profile["source"], "kit source identity mismatch")
     required = TOOLING if complete else ("profile_verify.py",)
     for name in required:
@@ -204,7 +221,9 @@ def render_recipe(template, profile, provenance):
                     "ARCHIVE_SHA256": profile["source"]["archive_sha256"],
                     "PROFILE_SHA256": provenance["profile_sha256"],
                     "KIT_SHA256": sha256(json_bytes(provenance)),
-                    "VERIFIER_SHA256": provenance["tooling_files"]["profile_verify.py"]}
+                     "VERIFIER_SHA256": provenance["tooling_files"]["profile_verify.py"]}
+    replacements["PROFILE_BUILD_OPTIONS"] = ("-DCUA_HYPRLAND_IME_POPUP_GUARD=" +
+        build_options(profile)["CUA_HYPRLAND_IME_POPUP_GUARD"]) if profile["schema"] == 3 else ""
     for key, value in replacements.items():
         template = template.replace(f"@{key}@", value)
     require(not re.search(r"@[A-Z_]+@", template), "unresolved recipe placeholder")
@@ -374,7 +393,7 @@ def verify_build(build, source, cxx, profile):
         if match:
             require(match[1] not in cache, "duplicate CMake cache entry")
             cache[match[1]] = match[2]
-    expected = dict(OPTIONS, BUILD_TESTING="ON", CUA_HYPRLAND_BUILD_PLUGIN="ON", CMAKE_BUILD_TYPE="Release",
+    expected = dict(build_options(profile), BUILD_TESTING="ON", CUA_HYPRLAND_BUILD_PLUGIN="ON", CMAKE_BUILD_TYPE="Release",
                     CMAKE_GENERATOR="Ninja",
                     PKG_CONFIG_EXECUTABLE=str(PKGCONF), PKG_CONFIG_ARGN="", PKG_CONFIG_USE_CMAKE_PREFIX_PATH="OFF",
                     HYPRLAND_VERSION=profile["hyprland"]["header_version"],
@@ -387,6 +406,8 @@ def verify_build(build, source, cxx, profile):
                     CMAKE_HOME_DIRECTORY=str(source.resolve()))
     for name, value in expected.items():
         require(cache.get(name) == value, f"build configuration mismatch: {name}")
+    if profile["schema"] != 3:
+        require(cache.get("CUA_HYPRLAND_IME_POPUP_GUARD", "OFF") == "OFF", "unreviewed IME popup guard option")
     for name in EMPTY_CMAKE_ROUTING:
         require(not cache.get(name), f"CMake routing override refused: {name}")
     for name, value in cache.items():

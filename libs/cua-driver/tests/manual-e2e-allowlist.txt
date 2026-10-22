@@ -16,8 +16,6 @@ hyprland_foreground_test::foreground_action_refused_while_independent_virtual_po
 hyprland_foreground_test::foreground_drag_focus_loss_does_not_release_into_successor | Manual native-Hyprland gate: needs a live Hyprland compositor with the Cua plugin; RFC 3550 drag focus-loss safety
 hyprland_foreground_test::foreground_drag_focus_loss_does_not_release_into_same_client_sibling | Manual native-Hyprland gate: needs a live Hyprland compositor with the Cua plugin; RFC 3550 drag focus-loss safety
 hyprland_native_observation_test::native_window_capture_and_background_ax_keep_exact_identity | Manual native-Hyprland gate: needs a live Hyprland compositor; exact-identity capture and owner-mismatch refusals
-hyprland_dual_display_test::native_dual_output_capture_and_desktop_input | Manual supplemental supporting evidence: native Hyprland DP-2/DP-1 3840x2160 at 1.5x, parent-prepared disposable workspaces 91/92, GTK3 and grim; no host reconfiguration or replacement of canonical gates
-hyprland_dual_display_test::native_dual_output_window_foreground_plugin_input | Manual supplemental supporting evidence: same guarded disposable workspaces plus explicit candidate foreground-plugin gate; never enables/reloads plugin or broadens background admission
 
 # Optional external-app suite: the canonical Windows image has no LibreOffice.
 harness_libreoffice_test::harness_lo_vcl_font_color_expand_opens_picker | Optional Windows suite that needs LibreOffice Writer installed; under review in the lane-3 prune (#4094)

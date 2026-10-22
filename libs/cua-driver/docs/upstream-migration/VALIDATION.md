@@ -1,8 +1,9 @@
-# Migration checkpoint — October 22, 2026 (PDT)
+# Migration validation — October 22, 2026 (PDT)
 
 **Not deployment-ready.** Phase 1 preservation is complete. The five focused
 Phase 2 fixes are implemented and pass local hermetic/contract validation.
-Phase 3 reconciliation, target-package qualification and cutover remain open.
+Phase 3 ports and disposable native development checks have since progressed
+below. Target-package certification and cutover remain open.
 
 ## Implemented behavior
 
@@ -26,7 +27,7 @@ Phase 3 reconciliation, target-package qualification and cutover remain open.
   from another connection produce unavailable evidence, never first-window
   capture. Full-output Wayland capture is still explicitly full-output.
 
-## Evidence collected
+## Phase 2 checkpoint evidence (historical, not current certification)
 
 Logs are under `~/.cache/cua-upstream-migration-20261022/evidence/`.
 
@@ -34,7 +35,8 @@ Production source tested:
 `564a509071ccfea237facca34573929506b7eed7`. Subsequent
 `98d99ac639f0959015bdd20aaf6ef08b456a197a` only synchronizes nine existing
 canonical skill texts into the SDK bundle; the final checkpoint adds only
-migration documentation. No production Rust changes follow the tested source.
+migration documentation. No production Rust changes followed that checkpoint
+before Phase 3 resumed.
 
 - `full-hermetic-tests.log`: complete core, SDK and CLI crates passed, including
   their default integration tests and doctests; ignored desktop tests remain
@@ -100,12 +102,53 @@ lifecycle run, complete desktop matrix, hyprutils 0.14.3 qualification, fresh
 session cutover or full-environment rollback has been claimed. Linux timing
 tests and source-level coverage do not qualify native input or cleanup.
 
+## Phase 3 development evidence (not stable-candidate certification)
+
+The larger ports now include capture topology/source authority, original-resource
+held cleanup, immutable recording frames and ordered observation publication.
+Current semantic routing retains contributor-owned #5574, with the original
+linked Victor Vogel authorship. Private uncertain-source errors share upstream's
+`InputMayHaveLanded` type so they cannot bypass token/batch no-replay checks.
+
+- `phase3-held-tests.log`: whole core library 1,113 passed / 1 ignored; whole
+  Linux library 792 passed / 10 ignored. These are implementation iterations,
+  not the complete post-integration native matrix.
+- `phase3-profile-tests-final.log`: 139 packaging/profile/recipe tests passed,
+  including schema-3 typed IME extension binding and source/kit-option refusal.
+- `arch-plugin-native-launch-build.log`: the production plugin and all 23 CTests
+  passed inside a fully updated disposable Arch container with Hyprland
+  0.56.2-4 and hyprutils 0.14.3-1. Build used input ON, test input/trace OFF,
+  and retained IME guard ON. This working-source smoke is not package certification.
+- `phase3-native-hidden-smoke.log` and `...hidden-smoke-early-map.log`: retained
+  **failures**. The first Lua adaptation allowed the main window onto workspace
+  5; an early move/setprop adaptation also lost primary focus. These tests did
+  not pass, and their actions were never replayed to manufacture a pass.
+- `phase3-native-hidden-plugin-smoke.log`: the replacement synchronous native
+  guard passed the strengthened fixture. Splash, main, token-inheriting child
+  and a modal 12 seconds later stayed hidden, even after the launching Driver
+  exited. Independent GTK focus-out, ordered compositor focus events and
+  monitor workspace snapshots remained unchanged. Only test-owned processes
+  were killed; pidfds bound cleanup to their inspected process incarnation.
+
+The disposable parent is rootless Sway on headless outputs with NVIDIA CDI,
+not the home compositor. Its xdg-shell global uses wlroots' real v6 support
+because Aquamarine unconditionally requests v6 while Sway requests v5. This
+parent-only adapter and the startup capability-event workaround are preserved
+under `arch/`, alongside exact container/image and package identities. Target
+Hyprland, hyprutils and the tested plugin are not protocol-shimmed. This is an
+environment limitation/provenance fact, not permission to alter the live host.
+
+Both native fixture binaries are integrated into the canonical Linux native/all
+runner on an explicitly prepared disposable dual-output desktop. They are no
+longer manual-only inventory exceptions. Stable-candidate execution still needs
+the complete required input/capture/recording/cleanup/IME matrix and artifact
+hashes, followed by package transaction, restart and rollback qualification.
+
 ## Next gate
 
-Resolve/account for the source-baseline limitations above, then reconcile the
-active upstream ownership listed in [the patch ledger](README.md). Required
-private capture/source/held-input invariants, immutable recording turn geometry,
-hidden-workspace launch lifetime guards and native fixtures are not yet ported.
-Do not install this branch as a replacement for the matching private
-Driver/plugin pair. Preserve the installed rollback set until the complete
-target environment has passed the plan's qualification and rollback gates.
+Finish post-integration drift/lint checks and review the exact source candidate;
+then certify its exact built artifacts and complete target environment. Do not
+install a development smoke as the default CLI/MCP/plugin pair or relabel the
+preserved rollback bytes as a tested environment. Fresh-session cutover and
+rollback remain gated; no upstream PR or completion notification is authorized
+by a passing development row alone.

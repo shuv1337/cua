@@ -202,7 +202,7 @@ Returns the launched app's pid, bundle_id, name, and a `windows` array (same sha
 </Tab>
 <Tab value="Linux">
 
-Launch a Linux app in the background. Provide launch_path (preferred: round-trip the value from list_apps), name (tried as a direct command, then matched against installed .desktop applications, then handed to xdg-open if it is a URL or existing file path), bundle_id (ignored on Linux), or urls (list of URLs to open). Resolution precedence: launch_path &gt; name &gt; bundle_id. Errors when the name resolves to nothing launchable.
+Launch a Linux app in the background. Provide launch_path (preferred: round-trip the value from list_apps), name (tried as a direct command, then matched against installed .desktop applications, then handed to xdg-open if it is a URL or existing file path), bundle_id (ignored on Linux), or urls (list of URLs to open). Resolution precedence: launch_path &gt; name &gt; bundle_id. Errors when the name resolves to nothing launchable. On native Hyprland, executable launches use hidden special:cua with a process-lifetime placement guard; URL activation and unproven single-instance handoffs are not silently launched on the visible workspace. An unconfirmed launch must not be repeated blindly.
 
 **Linux parameters**
 

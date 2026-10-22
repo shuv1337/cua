@@ -7,8 +7,9 @@ upstream contribution or a deployment approval.
 See the [validation checkpoint](VALIDATION.md) for implemented scope, test
 results, limitations and remaining gates.
 The [larger-behavior reconciliation](RECONCILIATION.md) maps retained private
-invariants to current upstream owners and existing tests; it is not a completed
-port or native acceptance result.
+invariants to current upstream owners and existing tests. Ports are now being
+exercised in disposable Arch; neither this ledger nor build success is native
+certification or cutover approval.
 
 ## Immutable inputs
 
@@ -78,22 +79,33 @@ adapted commits credit the source author rather than copying a whole branch.
   old implementations in favor of upstream #4305 / #4244. Do not overwrite
   `platform-linux/src/wayland/hyprland.rs` with the candidate's old owner.
 - **Capture/semantic/held-input invariants** — sources `ccfb84ea7` through
-  `21aeb1a86` and `af6900a22` on the private candidate. Still require reconciliation
-  against upstream `wayland/hyprland.rs`, input/AT-SPI/snapshot owners and plugin
-  `src/`. Required source/held capabilities must refuse when absent; stock
-  plugin is not an equivalent. **Deployment gate: not yet ported/qualified.**
+  `21aeb1a86` and `af6900a22` on the private candidate. Adapted onto current
+  `wayland/hyprland.rs`, input/AT-SPI/snapshot owners and plugin `src/`; retain
+  upstream's explicit cursor `placed` state, rotation/DPMS policy and semantic
+  versus capture-only publication distinction. Required source/held capabilities
+  refuse when absent. Stock plugin is not equivalent. **Native qualification pending.**
 - **Recording immutable turn geometry** — sources `803ef40f3`, `559d0e7e0`,
   `6a73e190d`, `f2947a84a`. Map core recording hooks and platform capture
-  preparation rather than re-observing topology after dispatch.
-  **Deployment gate: not yet ported/qualified.**
+  preparation rather than re-observing topology after dispatch. Ports and current
+  hermetic owner suites pass; native frame/overlay evidence is still required.
 - **Hidden-workspace launch** — sources `1c3c5c889`, `d4199a971`, `811c82a24`,
   `70f360855`, `ec42f733c` (including child/late-window lifetime guard).
-  Destination: current Hyprland launch and plugin window lifetime owners.
-  **Required, not retired; not yet ported/qualified.**
+  Destination: `platform-linux/.../hyprland/launch.rs` and plugin
+  `hidden_launch_guard.cpp`. Initial native tests caught a visible main window
+  and focus loss in the Lua/sweep adaptation. Replace that failed approach with
+  exact token/PID-starttime ownership at native `openEarly` and pre-focus `open`
+  boundaries, without pointer/focus dispatch or lasting no-focus overrides.
+  The Driver requires `input.hidden_launch_version:1` from the enabled matching
+  plugin; absence is `hidden_launch_guard_unavailable`, not ordinary exec.
+  **Native splash/child/late-modal and Driver-exit proof in progress.**
 - **Native fixtures** — sources `e9f911da6`, `e6301d389`, `a66415798`,
   `1a1492b81`, `9acd3f6bb`, `275afbfc6`, `19ad9978c`.
   Destination: `cua-driver-e2e`, native GTK fixtures, canonical Linux runners.
-  Keep independent pixels/native-event oracles. **Integration pending.**
+  Independent pixels/native-event fixtures are integrated. The canonical Linux
+  native/all runner selects both whole binaries when the explicitly prepared
+  disposable dual-output flag is set. New hidden-launch acceptance additionally
+  checks GTK focus-out, ordered compositor focus events, and a modal after the
+  launching Driver has exited. **Full stable-candidate execution pending.**
 - **Omarchy keymap / IME** — recovered installed package's `downstream.patch`
   and all provenance/profile files into `rollback/distro-package/` in the local
   evidence directory. Patch SHA-256:
@@ -101,7 +113,10 @@ adapted commits credit the source author rather than copying a whole branch.
   its recorded upstream revision is `c82d32e3e1adbc6578a148962002ddf6e3e8a15a`.
   It admits text-equivalent remaps while retaining per-chord refusal and hooks
   the exact 0.56.2 input-popup surface lifetime. Separate from private
-  source-guard patches. **Port and native evidence pending.**
+  source-guard patches. Text-chord equivalence is retained with its expanded
+  negative controls. The exact-symbol IME hook is an explicit build option;
+  schema-3 profiles bind that option to source, recipe, kit and CMake provenance.
+  Old profile schemas cannot silently enable it. **Native IME proof pending.**
 - **Historical headless-X / KRDP** — exclude; no current headless-X availability
   claim, no KRDP sidecar dependency in the target deployment.
 
@@ -110,12 +125,16 @@ adapted commits credit the source author rather than copying a whole branch.
 ### Active upstream ownership discovered during implementation
 
 Do not reimplement these contributions to bypass their history or readiness
-gates. Reconcile the private candidate with the selected upstream work before
-continuing Phase 3:
+gates. The following immutable contributions were compared during Phase 3:
 
 - [#5574](https://github.com/trycua/cua/pull/5574), head
   `a26674e3223a9b25ca46baa6f5fd67800b5ce286`: preserves uncertain AT-SPI outcomes
   and prevents batch foreground replay; salvages Victor Vogel's #5454.
+  Its ten commits are integrated with Victor's original linked authorship and
+  source references. Token/semantic-source changes were adapted onto those
+  outcomes, not used to replace his implementation. Private uncertain semantic
+  errors share upstream's `InputMayHaveLanded` owner. No source-contributor ship
+  notification is appropriate until the work actually ships.
 - [#4387](https://github.com/trycua/cua/pull/4387), draft head
   `59d53d7d05b9b47ded5e2a252d259c05865112be`: qualified monitor snapshots and
   signed cursor placement, retaining CARLOSDAVID33 and Iann29's contributions.
@@ -126,7 +145,8 @@ continuing Phase 3:
   and clipped pixels, salvaged from lorenzozanee's #3887 via #4386.
 
 Also keep recording scope work (#3667) and native Wayland identity work (#3448)
-in view. None of these unmerged PRs is silently included in this branch.
+in view. #4387/#5604 are comparison inputs, not silently included whole branches;
+the selected release's generic Wayland behavior remains the baseline.
 
 ### Native qualification
 

@@ -2458,7 +2458,10 @@ impl Tool for LaunchAppTool {
                 matched against installed .desktop applications, then handed to xdg-open if it \
                 is a URL or existing file path), bundle_id (ignored on Linux), or urls (list of \
                 URLs to open). Resolution precedence: launch_path > name > bundle_id. Errors \
-                when the name resolves to nothing launchable.".into(),
+                when the name resolves to nothing launchable. On native Hyprland, executable \
+                launches use hidden special:cua with a process-lifetime placement guard; \
+                URL activation and unproven single-instance handoffs are not silently launched \
+                on the visible workspace. An unconfirmed launch must not be repeated blindly.".into(),
             input_schema: json!({"type":"object","properties":{
                 "launch_path":{"type":"string","description":"Round-trip the `launch_path` returned by `list_apps` — the Exec= command from the .desktop file with XDG field codes already stripped. Highest precedence on Linux; spawned directly via the system shell."},
                 "name":{"type":"string","description":"App name or command to launch. Tried as a direct command first, then matched against installed .desktop applications (exact display name, desktop-file id, or Exec basename; else an unambiguous display-name substring)."},
@@ -2543,6 +2546,8 @@ impl Tool for LaunchAppTool {
             return match result {
                 Ok(Ok(window)) => ToolResult::text("Launched on hidden workspace special:cua; process-lifetime placement guard is active.")
                     .with_structured(json!({"pid":window.pid,"name":launch_name,"running":true,"active":false,"workspace":"special:cua","windows":[window_record_json(&window)]})),
+                Ok(Err(error)) if error.is::<crate::wayland::hyprland::launch::GuardUnavailable>() =>
+                    ToolResult::error(error.to_string()).with_structured(json!({"code":"hidden_launch_guard_unavailable","effect":"none"})),
                 Ok(Err(error)) => ToolResult::error(format!("Hidden launch not confirmed: {error:#}. Inspect state before another launch; no visible-workspace fallback was attempted."))
                     .with_structured(json!({"code":"background_launch_unconfirmed","effect":"unknown"})),
                 Err(error) => ToolResult::error(format!("Hidden launch worker outcome unknown: {error}"))

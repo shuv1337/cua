@@ -3,6 +3,14 @@
 This kit builds the plugin source selected in `PROFILE.json` for one explicitly
 reviewed native profile. Schema 1 selects the original Driver 0.24.0 source;
 schema 2 can select a separately reviewed source revision and Driver version.
+Schema 3 additionally binds `extensions: {"ime_popup_guard": true|false}` to
+the kit, CMake cache and build provenance. `profile_measure.py measure
+--ime-popup-guard` selects it. This requires source containing the explicitly
+reviewed Hyprland-0.56.2 guard; it cannot silently add a hook to historical
+source. Old profiles still require the guard disabled. Changing the extension
+requires rebuilding and requalification, including IME surface destruction and
+the loaded `ime_popup_guard` status. A successful hook install is not itself
+native certification.
 The selected archive and its embedded manifest and verifier retain their
 original bytes. The recipe uses `profile_verify.py` from this kit. It does not
 invoke the embedded verifier or rewrite source files.

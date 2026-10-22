@@ -321,6 +321,10 @@ if [[ "${SUITE}" == native || "${SUITE}" == all ]]; then
         cargo test -p cua-driver-e2e --manifest-path "${RUST_ROOT}/Cargo.toml" \
           --test hyprland_dual_display_test -- \
           --ignored --nocapture --test-threads=1
+      run_test hyprland-hidden-launch \
+        cargo test -p cua-driver-e2e --manifest-path "${RUST_ROOT}/Cargo.toml" \
+          --test hyprland_hidden_launch_test -- \
+          --ignored --nocapture --test-threads=1
     fi
     run_test wayland-overlay-idle-no-overlay \
       cargo test -p cua-driver-e2e "${CARGO_DRIVER_FEATURE_ARGS[@]}" \

@@ -25,6 +25,13 @@ include/cua_hyprland/session.hpp
 include/cua_hyprland/status.hpp
 src/drag_geometry.hpp
 src/foreground_route.hpp
+src/held_phase.hpp
+src/held_pointer_journal.hpp
+src/hidden_launch_guard.cpp
+src/hidden_launch_guard.hpp
+src/hidden_launch_identity.hpp
+src/ime_popup_guard.cpp
+src/ime_popup_guard.hpp
 src/inject_server.cpp
 src/inject_server.hpp
 src/input_client_deadline.hpp
@@ -49,6 +56,13 @@ tests/desktop_fault_policy_test.py
 tests/drag_geometry_test.cpp
 tests/foreground_route_test.cpp
 tests/foreground_modifiers_test.py
+tests/foreground_owned_release_fixture.cpp
+tests/held_cleanup_policy_fixture.cpp
+tests/held_cleanup_policy_test.py
+tests/held_logger_queue_fault_fixture.cpp
+tests/held_phase_test.cpp
+tests/held_pointer_journal_fixture.cpp
+tests/hidden_launch_identity_test.cpp
 tests/input_grant_test.cpp
 tests/input_client_deadline_test.cpp
 tests/keyboard_layout_test.cpp

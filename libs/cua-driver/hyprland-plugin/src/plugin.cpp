@@ -2,6 +2,9 @@
 #if defined(CUA_HYPRLAND_TEST_INPUT) || defined(CUA_HYPRLAND_INPUT)
 #include "input_experiment.hpp"
 #endif
+#ifdef CUA_HYPRLAND_IME_POPUP_GUARD
+#include "ime_popup_guard.hpp"
+#endif
 
 #include "cua_hyprland/protocol.hpp"
 #include "cua_hyprland/status.hpp"
@@ -230,6 +233,10 @@ std::string status_output(bool json) {
         result.pop_back();
         result += R"(,"keyboard_layout_independent":true,"foreground_numlock_compatible":true})";
 #endif
+#ifdef CUA_HYPRLAND_IME_POPUP_GUARD
+        result.pop_back();
+        result += cua::hyprland::ime_popup_guard_active() ? R"(,"ime_popup_guard":true})" : R"(,"ime_popup_guard":false})";
+#endif
 #if defined(CUA_HYPRLAND_TEST_INPUT) || defined(CUA_HYPRLAND_INPUT)
         if (g_experiment) {
 #ifdef CUA_HYPRLAND_INPUT
@@ -341,6 +348,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         }
     });
 
+    // Match the distro behavior: report hook failure explicitly rather than
+    // claiming protection. A deployment selecting this option must require the
+    // loaded status flag and native IME lifetime evidence before cutover.
+#ifdef CUA_HYPRLAND_IME_POPUP_GUARD
+    static_cast<void>(cua::hyprland::install_ime_popup_guard(handle));
+#endif
     return {
         "cua-hyprland-plugin",
         "Discovery foundation for isolated background computer use",
@@ -350,6 +363,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
+#ifdef CUA_HYPRLAND_IME_POPUP_GUARD
+    cua::hyprland::remove_ime_popup_guard();
+#endif
     g_config_listener.reset();
 #if defined(CUA_HYPRLAND_TEST_INPUT) || defined(CUA_HYPRLAND_INPUT)
     // Retire input directly so an in-flight action receives plugin_shutdown,

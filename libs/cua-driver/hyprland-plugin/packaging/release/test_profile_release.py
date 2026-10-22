@@ -92,6 +92,42 @@ class ProfileTest(unittest.TestCase):
         self.assertNotEqual(next(first.glob("*.tar.gz")).name, next(second.glob("*.tar.gz")).name)
         self.assertEqual((kit / self.archive.name).read_bytes(), (other / self.archive.name).read_bytes())
 
+    def test_ime_extension_binds_source_recipe_and_kit_options(self):
+        self.profile["schema"] = 3
+        self.profile["extensions"] = {"ime_popup_guard": True}
+        with self.assertRaisesRegex(ValueError, "source lacks.*IME"):
+            verify.verify_archive(self.archive, self.profile)
+        for name in ("src/ime_popup_guard.cpp", "src/ime_popup_guard.hpp"):
+            self.files[name] = b"// reviewed synthetic IME source\n"
+            self.manifest["files"][name] = verify.sha256(self.files[name])
+        self.files["SOURCE-PROVENANCE.json"] = verify.json_bytes(self.manifest)
+        self.archive.write_bytes(bundle.deterministic_archive({self.stem + "/" + name: data for name, data in self.files.items()}))
+        self.profile["source"]["archive_sha256"] = verify.digest(self.archive)
+        self.profile["source"]["manifest_sha256"] = verify.sha256(self.files["SOURCE-PROVENANCE.json"])
+        self.profile_path.write_bytes(verify.json_bytes(self.profile))
+        _, kit, metadata = self.generate()
+        self.assertEqual(metadata["cmake_options"]["CUA_HYPRLAND_IME_POPUP_GUARD"], "ON")
+        self.assertIn("-DCUA_HYPRLAND_IME_POPUP_GUARD=ON", (kit / "PKGBUILD").read_text())
+        verify.verify_kit(kit, verify.digest(kit / "KIT-PROVENANCE.json"), complete=True)
+        metadata["cmake_options"]["CUA_HYPRLAND_IME_POPUP_GUARD"] = "OFF"
+        (kit / "KIT-PROVENANCE.json").write_bytes(verify.json_bytes(metadata))
+        with self.assertRaisesRegex(ValueError, "build options differ"):
+            verify.verify_kit(kit, verify.digest(kit / "KIT-PROVENANCE.json"))
+
+    def test_ime_extension_is_typed_closed_and_changes_rebuild_identity(self):
+        import profile_measure
+        candidate = copy.deepcopy(self.profile)
+        candidate.update(schema=3, extensions={"ime_popup_guard": True})
+        self.assertEqual(profile_measure.reuse_decision(self.profile, candidate)[0], "rebuild")
+        for value in ("ON", 1, None, {"ime_popup_guard": True, "extra": True}):
+            broken = copy.deepcopy(candidate)
+            broken["extensions"] = value if isinstance(value, dict) else {"ime_popup_guard": value}
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                verify.validate_profile(broken)
+        candidate["extensions"]["ime_popup_guard"] = False
+        self.assertEqual(verify.build_options(candidate)["CUA_HYPRLAND_IME_POPUP_GUARD"], "OFF")
+        self.assertNotIn("CUA_HYPRLAND_IME_POPUP_GUARD", verify.build_options(self.profile))
+
     def test_generation_refuses_wrong_source_dirty_tooling_and_existing_output(self):
         self.generate()
         with mock.patch.object(bundle, "committed_file", side_effect=lambda repo, sha, name: (HERE / name).read_bytes()), mock.patch.object(bundle.subprocess, "check_output", return_value=self.tooling_sha + "\n"):
