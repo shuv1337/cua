@@ -4,6 +4,12 @@ Started October 22, 2026 (PDT), following `CUA_UPSTREAM_MIGRATION_PLAN.md`
 in the original checkout. This is a private downstream integration, not an
 upstream contribution or a deployment approval.
 
+See the [validation checkpoint](VALIDATION.md) for implemented scope, test
+results, limitations and remaining gates.
+The [larger-behavior reconciliation](RECONCILIATION.md) maps retained private
+invariants to current upstream owners and existing tests; it is not a completed
+port or native acceptance result.
+
 ## Immutable inputs
 
 - Release: `cua-driver-rs-v0.38.0`, `85e2b1318bd77ccf3cfa88ccdf875a4bb7eaed19`.
@@ -11,6 +17,10 @@ upstream contribution or a deployment approval.
 - Fork main: `0d5c2dd3065fef7d0f09099fbd6071ad698ffbb1`.
 - Private Driver/plugin: `19ad9978ccf4b3afa1de91413862c69680649f81`.
 - Work branch: `work/cua-upstream-migration-038`, isolated plain-Git worktree.
+
+All four inputs are also retained under local `refs/cua-migration/20261022/`
+refs (`release`, `upstream-main`, `fork-main`, `installed-candidate`) so a later
+remote ref refresh cannot make their objects unreachable.
 
 Local evidence and byte-for-byte rollback copies are retained under
 `~/.cache/cua-upstream-migration-20261022/`. `baseline.json` records resolved
