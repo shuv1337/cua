@@ -312,6 +312,16 @@ fi
 
 if [[ "${SUITE}" == native || "${SUITE}" == all ]]; then
   if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    if [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" && -z "${DISPLAY:-}" \
+      && "${CUA_TEST_DUAL_DISPLAY_PREPARED:-0}" == 1 ]]; then
+      # Explicitly prepared, empty disposable two-output desktop only. Select
+      # the whole binary so future ignored tests cannot silently go unselected.
+      # This supplements, not replaces, the ordinary native matrix below.
+      run_test hyprland-dual-display \
+        cargo test -p cua-driver-e2e --manifest-path "${RUST_ROOT}/Cargo.toml" \
+          --test hyprland_dual_display_test -- \
+          --ignored --nocapture --test-threads=1
+    fi
     run_test wayland-overlay-idle-no-overlay \
       cargo test -p cua-driver-e2e "${CARGO_DRIVER_FEATURE_ARGS[@]}" \
         --test wayland_overlay_idle_test -- \
