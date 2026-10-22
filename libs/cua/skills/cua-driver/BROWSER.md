@@ -109,7 +109,13 @@ title looks close.
 `get_browser_state` is strictly read-only. It never launches a browser,
 changes a profile, enables remote debugging, or accepts a consent prompt. If
 it returns `browser_requires_setup` or `browser_consent_required`, choose one
-explicit preparation flow. A standalone consumer browser cannot bind through
+explicit preparation flow. For the user's running Chrome, Edge or Brave the
+refusal's `detail.next_call` is the exact `browser_prepare` call to make next
+(`pid`, `window_id`, `session`, `strategy:{"kind":"existing_profile"}`). It is
+the driver's own setup step, not a question for the user: make the call, and it
+attaches or refuses with nothing changed and says why. Do not fall back to
+desktop-target pointer tools for the page; they move the user's real pointer,
+and over a background window they refuse. A standalone consumer browser cannot bind through
 a DevTools listener merely because the listener belongs to that process.
 
 ### Driver-owned isolated profile
@@ -152,6 +158,18 @@ profile. Preparation launches a separate browser and never copies, modifies,
 or terminates an existing personal profile. The result returns a
 `prepared_pid`; list that process's windows and bind the new `(pid,
 window_id)`.
+
+The result's optional `lifecycle` object describes how long the browser
+process lives: `owner` is `session`, `idle_expires_in_seconds` is how long the
+session may stay idle after this call before it and the browser end,
+`process_ends_with_session` is `true`, and
+`profile_persists_after_session` is `true` only for `isolated_named`. The
+value is advisory, not a lease. `get_session` reports the remaining time later
+but does not keep the browser alive, and explicit `end_session`, disconnect,
+revocation, or shutdown ends the browser earlier. A named profile keeps its
+files, not the process or its open pages. Attachments to an existing profile
+or endpoint the driver did not launch, and sessions already ending, have no
+`lifecycle`.
 
 ### Existing profile
 
@@ -202,6 +220,15 @@ authorize generic pixel interaction.
 On macOS this attachment cannot stay in the background. Chrome brings itself
 to the front to show its "Allow remote debugging?" prompt for every new
 DevTools connection, and turning remote debugging on needs Chrome in front.
+Chrome does not prompt again for tabs or targets reached over a connection it
+already allowed, so the driver keeps one approved connection per running
+Chrome and every session for that Chrome shares it: a second session, or a new
+session after the previous one ended, attaches without another prompt. Each
+session still needs its own `browser_prepare` approval from the driver, and
+only sees the targets it bound. The shared connection closes after 30 minutes
+without a session, 8 hours after the prompt that opened it, when the daemon
+restarts, on `cua-driver revoke --all`, or when the driver turns remote
+debugging back off; the next session after that prompts once again.
 When the Chrome window is on another Space than the user's, the attach runs in
 the background: the driver turns remote debugging on without bringing Chrome
 forward, and reverts Chrome's own brief activations (its consent window opens

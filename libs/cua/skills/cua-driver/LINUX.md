@@ -77,7 +77,7 @@ sentence naming the call that targets each one
 (`get_window_state(pid, window_id=<that id>)`). When one overlaps the window
 the screenshot is taken from the screen (`screenshot_composited:true`) so the
 menu or dialog is visible; the window's own drawable never shows them. The
-payload states its frame (`coordinate_frame:"window"`, `frame_note`): `x`/`y`
+payload states its frame (`coordinate_frame:"window"`, plus `frame_note` with `verbose:true`): `x`/`y`
 of the pointer tools are pixels of THIS screenshot. Closed menus are listed
 with a `description` ("closed menu with N items…") and are not walked;
 click the menu (a real press) and read the popup by its window_id.
@@ -94,6 +94,30 @@ stays in screen coordinates, as on every platform); `frame_scale` < 1 and
 `screenshot_original_width` report the downsizing, and the driver scales your
 pixels back to the window.
 An explicit per-call `max_image_dimension` (0 = native) replaces this cap.
+
+**Budget the pixels before you aim.** The cap is a pixel budget, so on a
+high-resolution window the delivered image is a small fraction of native and
+fine controls stop being readable. Measured on a 3840x2342 window: `frame_scale`
+0.357, so a 24px toolbar icon arrives at ~8.6px and a 1px border at ~0.36px:
+sub-pixel for any reader, sighted or not. Check `frame_scale` in the
+`get_window_state` payload and, when a target is smaller than roughly 30px, frame
+it with `zoom` before choosing a coordinate. Zooming a 196x728 window-px region
+returned a 235x873 image (about 1.2x native), which restores a 24px icon to
+~29px. `zoom` takes screenshot pixels and the follow-up action needs
+`from_zoom: true`. It also requires a screenshot-owning snapshot from the same
+session first, and refuses with `screenshot_context_missing` otherwise, so
+`get_window_state` with a screenshot must precede the first `zoom`.
+
+**When the active model takes no images.** Some clients drop image content
+entirely, so `get_window_state` and `zoom` return an image the reader never sees.
+The loop still closes for most questions, and none of this needs a vision model:
+`verify_state` proves state and returns a real `satisfied` / `unsatisfied` /
+`unknown` verdict; an out-of-band read such as
+`xprop -root _NET_ACTIVE_WINDOW` proves which window holds focus; and scanning the
+written capture for colour transitions (PIL or equivalent) proves coarse layout.
+What none of them prove is that a specific small control was activated. For that
+use the `cua-perception` extension (see `VISUAL.md`) or an app that exposes a
+usable accessibility tree.
 
 **Windows without `_NET_WM_PID`.** Tk, many Java/AWT builds, Wine, and legacy
 Xlib/Xt clients do not publish `_NET_WM_PID`. On X11, `list_windows` then asks
@@ -187,6 +211,12 @@ doctor` now probes `org.a11y.Bus` for real (not just "is there a bus?")
    session-process environ and the `/run/user/<uid>/bus` socket). Running the
    daemon as root against a user session is the Linux analogue of the Windows
    "Session 0" isolation problem.
+
+`get_window_state` returns one compact markdown tree capped at 250 actionable
+nodes by default (`full_output:true` restores 5 000 nodes and both forms), and
+`since:<snapshot_id>` returns only added/changed/removed rows. The focused
+element is not reported on Linux yet, so an unchanged read says only
+`no change since …`.
 
 An empty AT-SPI walk is now surfaced honestly: `get_window_state` sets
 `degraded: true` + a `degraded_reason` (instead of a bare `elements: []`) so a
@@ -330,9 +360,9 @@ uninstrumented module hash are unchanged at
 `1133a06e4f205cf80188a7ac9e41102f37611fea`. The proof covers recorded actions
 and observation intervals, not every application operation or release package.
 Portable tests and historical experiments do not replace complete native
-harness acceptance. Compatible release artifacts and final image packaging
-and lifecycle validation require separate evidence. Physical Omarchy parity
-requires separate acceptance; it is not a gate for publishing a validated
+harness acceptance. Compatible release artifacts and final image
+packaging and lifecycle validation require separate evidence. Physical Omarchy
+parity requires separate acceptance; it is not a gate for publishing a validated
 image.
 
 ## Quick triage
