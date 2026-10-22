@@ -31,6 +31,13 @@ connections, including one-shot `cua-driver <tool>` processes, and
 `cua-driver recording start` has no owning session and records every
 session's actions.
 
+The exact owner of a live recording is protected from session idle eviction;
+unrelated sessions still expire. Explicit session end, disconnect and runtime
+shutdown still tear down owned recordings. Only ownerless recordings use the
+global recording idle backstop. Finalized `session.json` files include
+`end_reason`: `manual`, `session_end` or `idle_ttl`. A live recording has no
+end reason; absence alone does not distinguish a live recorder from a crash.
+
 There is still one recorder per runtime. Manual `stop_recording` stops
 whichever recording is active, regardless of its starting session. Do not
 start over or stop another run's recording. If a recorder is already active,
@@ -45,6 +52,9 @@ or correctly scoped recording.
 CLI `recording start|status|stop` commands also exist, but do not form a
 session-preserving action loop by themselves. Inspect their help rather than
 assuming the convenience command supports every raw-tool argument.
+`recording start <dir> --video` opts into video. Render accepts
+`recording render <dir> <out.mp4> [--no-zoom] [--scale N]`; options may precede,
+separate or follow the paths, and `N` must be finite and positive.
 
 ## Platform boundaries
 
@@ -55,6 +65,10 @@ assuming the convenience command supports every raw-tool argument.
 - Linux X11 video uses ffmpeg `x11grab`. Native Wayland needs a supported
   compositor-specific recorder and any portal grant; see [LINUX.md](LINUX.md).
   A successful desktop PNG does not establish video availability.
+  PID-only per-window evidence requires a unique window. Exact IDs from a
+  connection-local foreign-toplevel observation cannot be reused by a later
+  capture connection; unavailable identity is omitted, not replaced with the
+  first window of the process.
 
 ## What each turn folder contains
 
