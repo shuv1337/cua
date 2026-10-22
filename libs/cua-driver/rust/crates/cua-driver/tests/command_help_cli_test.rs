@@ -62,9 +62,10 @@ fn command_help_prints_the_named_commands_reference() {
     // A word that is not a subcommand (here the <output-dir> value) stops the walk.
     let start = help(home.path(), &["recording", "start", "mydir", "--help"]);
     assert!(
-        start.contains("Usage: cua-driver recording start <output-dir>"),
+        start.contains("Usage: cua-driver recording start [OPTIONS] <output-dir>"),
         "{start}"
     );
+    assert!(start.contains("--video"), "{start}");
 
     // An unknown command keeps the top-level help.
     assert_eq!(help(home.path(), &["bogus", "--help"]), top);

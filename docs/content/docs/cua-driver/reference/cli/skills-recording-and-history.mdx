@@ -433,13 +433,19 @@ cua-driver recording
 
 Start trajectory recording to a directory.
 
+Video capture is opt-in. Options may appear before or after the directory.
+
 ```text output
-cua-driver recording start <output-dir>
+cua-driver recording start [OPTIONS] <output-dir>
 ```
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
 | `<output-dir>` | path | required | Directory to write turn folders into. |
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| <span id="cua-driver-recording-start--video"></span>`--video` | boolean | `false` | Also record display video. |
 
 **Examples**
 

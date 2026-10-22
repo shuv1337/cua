@@ -311,6 +311,55 @@ fn positional_args(args: &[String]) -> Vec<&str> {
     positionals
 }
 
+/// Preserve recording-owned flags instead of feeding the tail through the
+/// global positional filter. Only the first positional after the verb is the
+/// subcommand: a directory named `start` or `render` remains a directory.
+fn split_recording_args(args: &[String]) -> Result<(String, Vec<String>), String> {
+    let mut index = 0;
+    while index < args.len() {
+        if VALUE_FLAGS.contains(&args[index].as_str()) {
+            if args[index] == "--socket"
+                && args
+                    .get(index + 1)
+                    .is_none_or(|v| v.is_empty() || v.starts_with('-'))
+            {
+                return Err("--socket requires a path".into());
+            }
+            index += 2;
+        } else if args[index].starts_with('-') {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    let mut tail = Vec::new();
+    index += 1; // recording verb
+    let mut literal = false;
+    while index < args.len() {
+        let arg = &args[index];
+        if !literal && arg == "--socket" {
+            if args
+                .get(index + 1)
+                .is_none_or(|v| v.is_empty() || v.starts_with('-'))
+            {
+                return Err("--socket requires a path".into());
+            }
+            index += 2;
+            continue;
+        }
+        literal |= arg == "--";
+        tail.push(arg.clone());
+        index += 1;
+    }
+    if tail.first().is_none_or(|arg| arg.starts_with('-')) {
+        if tail.is_empty() {
+            return Ok(("status".into(), tail));
+        }
+        return Err("recording requires a subcommand before its options".into());
+    }
+    Ok((tail.remove(0), tail))
+}
+
 /// True when argv runs a long-lived transport rather than a finite command:
 /// `mcp`, `serve`, or a bare invocation (which runs MCP). `--help` and
 /// `--version` always print and exit, so they are finite.
@@ -904,8 +953,10 @@ pub fn parse_command() -> Command {
             }
         }
         Some("recording") => {
-            let subcommand = pos.next().unwrap_or("status").to_string();
-            let rest: Vec<String> = pos.map(str::to_owned).collect();
+            let (subcommand, rest) = split_recording_args(&args).unwrap_or_else(|error| {
+                eprintln!("{error}");
+                process::exit(64);
+            });
             Command::Recording {
                 subcommand,
                 args: rest,
@@ -3029,6 +3080,23 @@ pub fn run_recording_cmd(subcommand: &str, args: &[String], socket: Option<&str>
         return;
     }
 
+    // Validate before probing the daemon or creating any output directory.
+    let start = match subcommand {
+        "start" => Some(parse_recording_start_args(args).unwrap_or_else(|error| {
+            eprintln!("{error}");
+            process::exit(64);
+        })),
+        "stop" | "status" | "" if args.is_empty() => None,
+        "stop" | "status" | "" => {
+            eprintln!("recording {subcommand} accepts no arguments");
+            process::exit(64);
+        }
+        other => {
+            eprintln!("Unknown recording subcommand '{other}'. Valid: start <dir> [--video], stop, status, render <dir> <out.mp4> [--no-zoom] [--scale N]");
+            process::exit(64);
+        }
+    };
+
     let socket_path = socket
         .map(str::to_owned)
         .unwrap_or_else(crate::serve::default_socket_path);
@@ -3044,19 +3112,15 @@ pub fn run_recording_cmd(subcommand: &str, args: &[String], socket: Option<&str>
 
     match subcommand {
         "start" => {
-            let output_dir = match args.first() {
-                Some(d) => {
-                    // Expand ~ manually.
-                    if d.starts_with('~') {
-                        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-                        d.replacen('~', &home, 1)
-                    } else {
-                        d.clone()
-                    }
-                }
-                None => {
-                    eprintln!("Usage: cua-driver recording start <output-dir>");
-                    process::exit(64);
+            let (directory, record_video) = start.expect("validated recording start");
+            let output_dir = {
+                let d = &directory;
+                // Expand ~ manually.
+                if d.starts_with('~') {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+                    d.replacen('~', &home, 1)
+                } else {
+                    d.clone()
                 }
             };
 
@@ -3070,7 +3134,8 @@ pub fn run_recording_cmd(subcommand: &str, args: &[String], socket: Option<&str>
                 method: "call".into(),
                 name: Some("start_recording".into()),
                 args: Some(serde_json::json!({
-                    "output_dir": output_dir
+                    "output_dir": output_dir,
+                    "record_video": record_video
                 })),
                 // CLI `recording start` is anonymous — the recording is owned by
                 // nobody, so only an unconditional stop (CLI / manual) reaps it.
@@ -3187,7 +3252,7 @@ pub fn run_recording_cmd(subcommand: &str, args: &[String], socket: Option<&str>
         }
 
         other => {
-            eprintln!("Unknown recording subcommand '{other}'. Valid: start <dir>, stop, status, render <dir> --output <out.mp4>");
+            eprintln!("Unknown recording subcommand '{other}'. Valid: start <dir>, stop, status, render <dir> <out.mp4>");
             process::exit(64);
         }
     }
@@ -3196,50 +3261,83 @@ pub fn run_recording_cmd(subcommand: &str, args: &[String], socket: Option<&str>
 /// `cua-driver recording render <input-dir> <out.mp4> [--no-zoom] [--scale N]`
 /// Pure file-to-file work — does NOT go through the daemon.
 ///
-/// Note on flag parsing: the global cua-driver CLI parser strips
-/// recognised flags before this subcommand sees them, leaving only
-/// positionals. So instead of `--output <out>` (which the parser
-/// would consume and lose) we accept the output path as the second
-/// positional. `--no-zoom` and `--scale N` survive because their
-/// values are inline (no separate value token).
-fn run_recording_render(args: &[String]) {
-    // First positional = input dir, second positional = output mp4.
-    let positionals: Vec<&String> = args.iter().filter(|s| !s.starts_with("--")).collect();
-    let input_dir = match positionals.first() {
-        Some(s) if !s.is_empty() => std::path::PathBuf::from(s),
-        _ => {
-            eprintln!(
-                "Usage: cua-driver recording render <input-dir> <out.mp4> [--no-zoom] [--scale N]"
-            );
-            process::exit(64);
+/// Recording options reach this handler intact. Consume value-taking flags
+/// once so their values can never become input or output paths.
+#[derive(Debug, PartialEq)]
+struct RenderInvocation {
+    input_dir: std::path::PathBuf,
+    output_path: std::path::PathBuf,
+    no_zoom: bool,
+    scale: f64,
+}
+
+fn parse_recording_start_args(args: &[String]) -> Result<(String, bool), String> {
+    let mut video = false;
+    let mut paths = Vec::new();
+    let mut literal = false;
+    for arg in args {
+        match arg.as_str() {
+            "--" if !literal => literal = true,
+            "--video" if !literal => video = true,
+            option if !literal && option.starts_with('-') => {
+                return Err(format!("Unknown recording start option '{option}'"));
+            }
+            _ => paths.push(arg),
         }
-    };
-    let output_path = match positionals.get(1) {
-        Some(s) if !s.is_empty() => std::path::PathBuf::from(s),
-        _ => {
-            eprintln!(
-                "Usage: cua-driver recording render <input-dir> <out.mp4> [--no-zoom] [--scale N]"
-            );
-            eprintln!("(second positional argument is the output path)");
-            process::exit(64);
-        }
-    };
+    }
+    if paths.len() != 1 || paths[0].is_empty() {
+        return Err("Usage: cua-driver recording start <output-dir> [--video]".into());
+    }
+    Ok((paths[0].clone(), video))
+}
+
+fn parse_render_args(args: &[String]) -> Result<RenderInvocation, String> {
+    let mut paths = Vec::new();
     let mut no_zoom = false;
     let mut scale: f64 = 2.0;
+    let mut literal = false;
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
         match a.as_str() {
-            "--no-zoom" => no_zoom = true,
-            "--scale" => {
-                if let Some(v) = iter.next() {
-                    if let Ok(f) = v.parse::<f64>() {
-                        scale = f;
-                    }
-                }
+            "--" if !literal => literal = true,
+            "--no-zoom" if !literal => no_zoom = true,
+            "--scale" if !literal => {
+                scale = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|v: &f64| v.is_finite() && *v > 0.0)
+                    .ok_or("--scale requires a finite positive number")?;
             }
-            _ => {}
+            option if !literal && option.starts_with('-') => {
+                return Err(format!("Unknown recording render option '{option}'"));
+            }
+            _ => paths.push(a),
         }
     }
+    if paths.len() != 2 || paths.iter().any(|path| path.is_empty()) {
+        return Err(
+            "Usage: cua-driver recording render <input-dir> <out.mp4> [--no-zoom] [--scale N]"
+                .into(),
+        );
+    }
+    Ok(RenderInvocation {
+        input_dir: paths[0].into(),
+        output_path: paths[1].into(),
+        no_zoom,
+        scale,
+    })
+}
+
+fn run_recording_render(args: &[String]) {
+    let RenderInvocation {
+        input_dir,
+        output_path,
+        no_zoom,
+        scale,
+    } = parse_render_args(args).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        process::exit(64);
+    });
 
     let opts = cua_driver_core::recording_render::RenderOptions {
         no_zoom,
@@ -4546,10 +4644,10 @@ fn cli_docs_literal() -> serde_json::Value {
                     {
                         "name":"start",
                         "abstract":"Start trajectory recording to a directory.",
-                        "discussion":"",
+                        "discussion":"Video capture is opt-in. Options may appear before or after the directory.",
                         "arguments":[{"name":"output-dir","help":"Directory to write turn folders into.","type":"Path","is_optional":false}],
                         "options":[],
-                        "flags":[],
+                        "flags":[{"name":"video","short_name":null,"help":"Also record display video.","default_value":false}],
                         "subcommands":[]
                     },
                     {
@@ -5667,6 +5765,84 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn recording_flags_and_values_survive_the_full_argv_split() {
+        let expected = RenderInvocation {
+            input_dir: "start".into(),
+            output_path: "out.mp4".into(),
+            no_zoom: true,
+            scale: 1.5,
+        };
+        for tail in [
+            args(&["--scale", "1.5", "start", "out.mp4", "--no-zoom"]),
+            args(&["start", "--no-zoom", "--scale", "1.5", "out.mp4"]),
+            args(&["start", "out.mp4", "--scale", "1.5", "--no-zoom"]),
+        ] {
+            for socket_at in [0, 1, 2, tail.len() + 2] {
+                let mut argv = args(&["recording", "render"]);
+                argv.extend(tail.clone());
+                argv.splice(socket_at..socket_at, args(&["--socket", "stop"]));
+                let (subcommand, rest) = split_recording_args(&argv).unwrap();
+                assert_eq!(subcommand, "render");
+                assert_eq!(parse_render_args(&rest).unwrap(), expected);
+            }
+        }
+        for tail in [args(&["--video", "render"]), args(&["render", "--video"])] {
+            let mut argv = args(&["recording", "start"]);
+            argv.extend(tail);
+            let (command, rest) = split_recording_args(&argv).unwrap();
+            assert_eq!(command, "start");
+            assert_eq!(
+                parse_recording_start_args(&rest).unwrap(),
+                ("render".into(), true)
+            );
+        }
+        assert_eq!(
+            split_recording_args(&args(&["recording"])).unwrap(),
+            ("status".into(), vec![])
+        );
+    }
+
+    #[test]
+    fn recording_rejects_invalid_arguments_instead_of_treating_them_as_paths() {
+        for value in ["x", "NaN", "inf", "0", "-1"] {
+            assert_eq!(
+                parse_render_args(&args(&["in", "out", "--scale", value])).unwrap_err(),
+                "--scale requires a finite positive number"
+            );
+        }
+        assert_eq!(
+            parse_render_args(&args(&["in", "out", "--scale"])).unwrap_err(),
+            "--scale requires a finite positive number"
+        );
+        assert_eq!(
+            parse_render_args(&args(&["in", "out", "--output"])).unwrap_err(),
+            "Unknown recording render option '--output'"
+        );
+        assert_eq!(
+            parse_recording_start_args(&args(&["--bogus", "out"])).unwrap_err(),
+            "Unknown recording start option '--bogus'"
+        );
+        for argv in [
+            args(&["recording", "render", "--socket"]),
+            args(&["--socket", "--video", "recording", "start", "out"]),
+        ] {
+            assert_eq!(
+                split_recording_args(&argv).unwrap_err(),
+                "--socket requires a path"
+            );
+        }
+        let usage =
+            "Usage: cua-driver recording render <input-dir> <out.mp4> [--no-zoom] [--scale N]";
+        for tail in [
+            args(&["in"]),
+            args(&["in", "out", "extra"]),
+            args(&["", "out"]),
+        ] {
+            assert_eq!(parse_render_args(&tail).unwrap_err(), usage);
+        }
     }
 
     #[test]

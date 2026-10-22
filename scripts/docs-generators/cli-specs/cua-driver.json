@@ -855,14 +855,21 @@
        "type": "Path"
       }
      ],
-     "discussion": "",
+     "discussion": "Video capture is opt-in. Options may appear before or after the directory.",
      "examples": [
       {
        "command": "cua-driver recording start ~/cua-trajectories/demo1",
        "description": "Record turns into a directory"
       }
      ],
-     "flags": [],
+     "flags": [
+      {
+       "default_value": false,
+       "help": "Also record display video.",
+       "name": "video",
+       "short_name": null
+      }
+     ],
      "name": "start",
      "options": [],
      "subcommands": []
