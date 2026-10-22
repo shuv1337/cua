@@ -82,10 +82,8 @@ pub fn screenshot_for_recording(window_id: Option<u64>, pid: Option<i64>) -> Opt
     if let Some(window_id) = window_id {
         crate::wayland::screenshot_dispatch(window_id).ok()
     } else if let Some(pid) = pid.and_then(|pid| u32::try_from(pid).ok()) {
-        let windows = crate::wayland::list_windows_dispatch(Some(pid));
-        windows
-            .first()
-            .and_then(|window| crate::wayland::screenshot_dispatch(window.xid).ok())
+        let window = resolve_window_for_recording(pid, None)?;
+        crate::wayland::screenshot_dispatch(window.xid).ok()
     } else {
         crate::capture::screenshot_display_bytes().ok()
     }
@@ -208,22 +206,28 @@ fn resolve_window_for_recording(
     window_id: Option<u64>,
 ) -> Option<crate::x11::WindowInfo> {
     let windows = crate::wayland::list_windows_dispatch(Some(pid));
-    if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
-        return match window_id {
-            Some(id) => windows.into_iter().find(|window| window.xid == id),
-            None if windows.len() == 1 => windows.into_iter().next(),
-            _ => None,
-        };
-    }
-    if crate::wayland::is_wayland() {
-        // Foreign-toplevel protocol object ids are scoped to one Wayland
-        // connection. Recording hooks open a fresh connection, so re-resolve
-        // the target by pid instead of comparing an id from the action call.
-        windows.into_iter().next()
-    } else if let Some(window_id) = window_id {
-        windows.into_iter().find(|window| window.xid == window_id)
+    let stable_ids = !crate::wayland::is_wayland() || crate::wayland::hyprland::is_session();
+    select_recording_window(windows, pid, window_id, stable_ids)
+}
+
+#[cfg(target_os = "linux")]
+fn select_recording_window(
+    windows: Vec<crate::x11::WindowInfo>,
+    pid: u32,
+    window_id: Option<u64>,
+    stable_ids: bool,
+) -> Option<crate::x11::WindowInfo> {
+    let mut windows = windows.into_iter().filter(|window| window.pid == Some(pid));
+    if let Some(id) = window_id {
+        // Foreign-toplevel object ids are scoped to the observation connection.
+        // A new hook connection cannot prove the action's exact window even if
+        // the process now has only one window. Omit evidence instead of guessing.
+        stable_ids
+            .then(|| windows.find(|window| window.xid == id))
+            .flatten()
     } else {
-        windows.into_iter().next()
+        let only = windows.next()?;
+        windows.next().is_none().then_some(only)
     }
 }
 
@@ -253,6 +257,43 @@ pub fn element_window_local_xy(
 #[cfg(test)]
 mod tests {
     use super::{hyprland_output_point, hyprland_recording_point};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recording_window_requires_exact_or_unique_process_identity() {
+        fn window(xid: u64, pid: u32) -> crate::x11::WindowInfo {
+            crate::x11::WindowInfo {
+                xid,
+                pid: Some(pid),
+                app_name: String::new(),
+                title: String::new(),
+                is_on_screen: true,
+                z_index: None,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }
+        }
+        let select = |ids: &[u64], requested, stable| {
+            super::select_recording_window(
+                ids.iter().map(|id| window(*id, 42)).collect(),
+                42,
+                requested,
+                stable,
+            )
+            .map(|w| w.xid)
+        };
+        assert_eq!(select(&[10, 20], Some(20), true), Some(20));
+        assert_eq!(select(&[10, 20], None, true), None);
+        assert_eq!(select(&[10, 20], None, false), None);
+        assert_eq!(select(&[10], None, true), Some(10));
+        assert_eq!(select(&[10], None, false), Some(10));
+        assert_eq!(select(&[10], Some(20), true), None);
+        assert_eq!(select(&[20], Some(20), false), None);
+        assert_eq!(select(&[], None, true), None);
+        assert!(super::select_recording_window(vec![window(20, 99)], 42, Some(20), true).is_none());
+    }
 
     #[test]
     fn hyprland_marker_uses_retained_output_coordinates() {
