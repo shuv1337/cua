@@ -62,6 +62,7 @@ rquickjs = { version = "0.14", default-features = false, features = ["std"], opt
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+socket2 = "0.6"
 
 # Used by `cursor_sampler::sample_cursor` to poll the OS mouse position
 # during video recording, and by `perception_client::containment` for the

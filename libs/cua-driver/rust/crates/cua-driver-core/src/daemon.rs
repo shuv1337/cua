@@ -212,6 +212,65 @@ const DAEMON_OVERHEAD_ALLOWANCE: Duration = Duration::from_secs(30);
 pub const REPLY_DEADLINE: Duration = Duration::from_millis(crate::tool_schema::TIMEOUT_MS_MAX)
     .saturating_add(DAEMON_OVERHEAD_ALLOWANCE);
 
+#[cfg(unix)]
+const CONNECT_DEADLINE: Duration = Duration::from_millis(1500);
+
+/// Retry only connection establishment. Never reconnect after writing any
+/// request bytes: an unknown tool result is not permission to replay input.
+#[cfg(unix)]
+fn connect_unix(socket_path: &str) -> std::io::Result<std::os::unix::net::UnixStream> {
+    let address = socket2::SockAddr::unix(socket_path)?;
+    retry_connect_until(std::time::Instant::now() + CONNECT_DEADLINE, |remaining| {
+        let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+        // Linux AF_UNIX returns EAGAIN for a full listen backlog rather than
+        // starting an EINPROGRESS connection. Do not poll that unconnected fd
+        // as though SO_ERROR==0 established it. Retry with a fresh socket.
+        #[cfg(target_os = "linux")]
+        {
+            let _ = remaining;
+            socket.set_nonblocking(true)?;
+            socket.connect(&address)?;
+            socket.set_nonblocking(false)?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        socket.connect_timeout(&address, remaining)?;
+        Ok(socket.into())
+    })
+}
+
+#[cfg(unix)]
+fn retry_connect_until<T>(
+    deadline: std::time::Instant,
+    mut connect: impl FnMut(Duration) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "daemon connect deadline exceeded",
+            ));
+        }
+        match connect(remaining) {
+            Ok(stream) => return Ok(stream),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::TimedOut
+                ) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(
+                    Duration::from_millis(25)
+                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Send one newline-delimited request and read one response.
 ///
 /// Unix reads and writes retry transient timeouts until [`REPLY_DEADLINE`] so
@@ -219,13 +278,14 @@ pub const REPLY_DEADLINE: Duration = Duration::from_millis(crate::tool_schema::T
 #[cfg(unix)]
 pub fn send_request(socket_path: &str, request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
     use std::io::Read;
-    use std::os::unix::net::UnixStream;
     use std::time::Instant;
 
     const READ_POLL: Duration = Duration::from_secs(10);
 
-    let mut stream = UnixStream::connect(socket_path)
-        .map_err(|error| anyhow::anyhow!("connect to {socket_path}: {error}"))?;
+    let mut stream = connect_unix(socket_path).map_err(|error| {
+        let message = format!("connect to {socket_path}: {error}");
+        anyhow::Error::new(error).context(message)
+    })?;
     // macOS rejects setsockopt with EINVAL once the peer has closed its end,
     // even when the peer's reply is still buffered for us to read. Treat that
     // as "peer already gone": the read below still drains buffered data and
@@ -326,6 +386,169 @@ mod tests {
         DaemonResponse, ToolObservationOrigin, DAEMON_OVERHEAD_ALLOWANCE, REPLY_DEADLINE,
     };
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_retry_is_bounded_and_only_retries_transient_errors() {
+        use std::io::{Error, ErrorKind};
+        use std::time::Instant;
+        let mut attempts = 0;
+        let recovered = super::retry_connect_until(Instant::now() + Duration::from_secs(1), |_| {
+            attempts += 1;
+            match attempts {
+                1 => Err(Error::from(ErrorKind::Interrupted)),
+                2 => Err(Error::from(ErrorKind::WouldBlock)),
+                3 => Err(Error::from(ErrorKind::TimedOut)),
+                _ => Ok(42),
+            }
+        })
+        .unwrap();
+        assert_eq!((recovered, attempts), (42, 4));
+
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+            ErrorKind::ConnectionRefused,
+        ] {
+            let mut attempts = 0;
+            let error =
+                super::retry_connect_until::<()>(Instant::now() + Duration::from_secs(1), |_| {
+                    attempts += 1;
+                    Err(Error::from(kind))
+                })
+                .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(attempts, 1);
+        }
+        let start = Instant::now();
+        let error = super::retry_connect_until::<()>(start + Duration::from_millis(75), |_| {
+            Err(Error::from(ErrorKind::WouldBlock))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lost_reply_never_reconnects_or_replays_the_request() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).unwrap();
+            assert_eq!(
+                serde_json::from_str::<DaemonRequest>(&line).unwrap().method,
+                "call"
+            );
+            listener
+        });
+        let error = super::send_request(
+            path.to_str().unwrap(),
+            &DaemonRequest {
+                method: "call".into(),
+                name: Some("click".into()),
+                args: None,
+                session_id: None,
+                observation_origin: None,
+                client_kind: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "daemon closed connection without response"
+        );
+        let listener = server.join().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_unix_backlog_recovers_before_dispatch_without_replaying_the_request() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.sock");
+        let address = socket2::SockAddr::unix(&path).unwrap();
+        let listener =
+            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        listener.bind(&address).unwrap();
+        listener.listen(1).unwrap();
+        let listener: UnixListener = listener.into();
+        let mut fillers = Vec::new();
+        loop {
+            let stream =
+                socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+            stream.set_nonblocking(true).unwrap();
+            match stream.connect(&address) {
+                Ok(()) => fillers.push(stream),
+                Err(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+                    break;
+                }
+            }
+            assert!(fillers.len() < 32, "listen backlog did not fill");
+        }
+        let count = fillers.len();
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            for _ in 0..count {
+                drop(listener.accept().unwrap());
+            }
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let request: DaemonRequest = serde_json::from_str(&request).unwrap();
+            assert_eq!(request.method, "call");
+            assert_eq!(request.name.as_deref(), Some("start_recording"));
+            stream.write_all(b"{\"ok\":true,\"result\":").unwrap();
+            std::thread::sleep(Duration::from_millis(25));
+            stream.write_all(b"{\"once\":true}}\n").unwrap();
+            assert_eq!(reader.read_line(&mut String::new()).unwrap(), 0);
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        });
+        let response = super::send_request(
+            path.to_str().unwrap(),
+            &DaemonRequest {
+                method: "call".into(),
+                name: Some("start_recording".into()),
+                args: None,
+                session_id: None,
+                observation_origin: None,
+                client_kind: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(response.result.unwrap()["once"], true);
+        server.join().unwrap();
+        drop(fillers);
+
+        let start = std::time::Instant::now();
+        let missing =
+            super::connect_unix(dir.path().join("missing.sock").to_str().unwrap()).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
 
     #[test]
     fn the_reply_deadline_outlasts_every_tool_budget() {
