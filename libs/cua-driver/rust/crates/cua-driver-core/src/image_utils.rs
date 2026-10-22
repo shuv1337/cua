@@ -113,6 +113,13 @@ pub fn resize_png_if_needed(png_bytes: &[u8], max_dim: u32) -> Result<Vec<u8>> {
         ColorType::Rgb8 => DynamicImage::ImageRgb8(
             ImageBuffer::from_raw(w, h, buf).ok_or_else(|| anyhow!("invalid RGB buffer"))?,
         ),
+        // Capture backends may optimize gray windows into L8/La8 PNGs.
+        ColorType::L8 => DynamicImage::ImageLuma8(
+            ImageBuffer::from_raw(w, h, buf).ok_or_else(|| anyhow!("invalid L8 buffer"))?,
+        ),
+        ColorType::La8 => DynamicImage::ImageLumaA8(
+            ImageBuffer::from_raw(w, h, buf).ok_or_else(|| anyhow!("invalid La8 buffer"))?,
+        ),
         _ => bail!("unsupported color type for resize: {color:?}"),
     };
 
@@ -392,13 +399,26 @@ mod tests {
 
     #[test]
     fn resize_downscales_to_long_edge() {
-        // 200x100 → max_dim=50 → 50x25 (long edge dictates).
-        let rgba = vec![0u8; 200 * 100 * 4];
-        let png = encode_rgba_to_png(&rgba, 200, 100).unwrap();
-        let resized = resize_png_if_needed(&png, 50).unwrap();
-        let (w, h) = png_dimensions(&resized).unwrap();
-        assert_eq!(w, 50);
-        assert_eq!(h, 25);
+        use image::ImageEncoder;
+
+        for (color, pixel) in [
+            (ColorType::L8, vec![83]),
+            (ColorType::La8, vec![83, 177]),
+            (ColorType::Rgb8, vec![83, 111, 149]),
+            (ColorType::Rgba8, vec![83, 111, 149, 177]),
+        ] {
+            let mut png = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(&pixel.repeat(200 * 100), 200, 100, color.into())
+                .unwrap();
+            let resized = resize_png_if_needed(&png, 50).unwrap();
+            let decoded = image::load_from_memory(&resized).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (50, 25), "{color:?}");
+            assert_eq!(decoded.color(), color);
+            for actual in decoded.as_bytes().chunks_exact(pixel.len()) {
+                assert_eq!(actual, pixel, "{color:?}");
+            }
+        }
     }
 
     #[test]
