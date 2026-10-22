@@ -2344,6 +2344,23 @@ fn spawn_launch_command(cmd: &str, additional_arguments: &[String]) -> std::io::
     Ok(pid)
 }
 
+fn launch_command_exists(command: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(program) = command.split_whitespace().next() else {
+        return false;
+    };
+    let executable = |path: std::path::PathBuf| {
+        path.metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    };
+    if program.contains('/') {
+        return executable(program.into());
+    }
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|path| executable(path.join(program)))
+    })
+}
+
 /// Collect a launched child's exit status in the background.
 ///
 /// `std::process::Child` does not reap on drop and the driver never waits on
@@ -2478,6 +2495,59 @@ impl Tool for LaunchAppTool {
 
         if launch_path_opt.is_none() && name_opt.is_none() && urls.is_empty() {
             return ToolResult::error("Provide at least one of: launch_path, name, or urls.");
+        }
+
+        if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+            // Never let an uncertain compositor launch fall through to ordinary
+            // exec/xdg-open on the human's workspace. Existing single-instance
+            // services cannot be isolated by an inherited launch token.
+            if !urls.is_empty() {
+                return ToolResult::error("Hidden Hyprland launch requires an executable launch_path; URL activation of an existing service cannot prove background isolation.")
+                    .with_structured(json!({"code":"background_launch_unavailable","effect":"none"}));
+            }
+            let command = launch_path_opt
+                .or(name_opt)
+                .expect("validated launch command");
+            let launch_name = command.clone();
+            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let resolved = if launch_command_exists(&command) {
+                    command.clone()
+                } else {
+                    let installed = crate::installed_apps::list_installed_apps();
+                    match_installed_app(&installed, &command)
+                        .map(|app| app.launch_path.clone())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("No executable or installed app matches '{command}'")
+                        })?
+                };
+                let mut argv: Vec<String> =
+                    resolved.split_whitespace().map(str::to_owned).collect();
+                argv.extend(additional_arguments);
+                if argv
+                    .first()
+                    .is_some_and(|program| chromium_family_program(program))
+                {
+                    for flag in [
+                        "--force-renderer-accessibility",
+                        "--disable-backgrounding-occluded-windows",
+                        "--disable-renderer-backgrounding",
+                    ] {
+                        if !argv.iter().any(|arg| arg == flag) {
+                            argv.push(flag.into());
+                        }
+                    }
+                }
+                crate::wayland::hyprland::launch::launch(&argv)
+            })
+            .await;
+            return match result {
+                Ok(Ok(window)) => ToolResult::text("Launched on hidden workspace special:cua; process-lifetime placement guard is active.")
+                    .with_structured(json!({"pid":window.pid,"name":launch_name,"running":true,"active":false,"workspace":"special:cua","windows":[window_record_json(&window)]})),
+                Ok(Err(error)) => ToolResult::error(format!("Hidden launch not confirmed: {error:#}. Inspect state before another launch; no visible-workspace fallback was attempted."))
+                    .with_structured(json!({"code":"background_launch_unconfirmed","effect":"unknown"})),
+                Err(error) => ToolResult::error(format!("Hidden launch worker outcome unknown: {error}"))
+                    .with_structured(json!({"code":"background_launch_unconfirmed","effect":"unknown"})),
+            };
         }
 
         // Snapshot the top-levels before spawning so a window created by an

@@ -19,6 +19,8 @@ const QUERY_MAX_ATTEMPTS: usize = 2;
 const MAX_REPLY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LOGICAL_PIXELS: u64 = 64 * 1024 * 1024;
 
+pub(crate) mod launch;
+
 #[derive(Debug, thiserror::Error)]
 #[error("unsupported_display_transform: Hyprland display identity requires unrotated outputs ({output} has transform {transform}{standby})")]
 pub struct UnsupportedDisplayTransform {
